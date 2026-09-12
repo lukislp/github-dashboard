@@ -9,12 +9,14 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.infrastructure.settings import Settings
 from app.web import routes_api, routes_auth, routes_pages
 from app.web.container import Container
+from app.web.deps import CrossSiteRequest
 from app.web.security import SecurityHeadersMiddleware
 
 log = logging.getLogger(__name__)
@@ -42,6 +44,7 @@ def create_app(container: Container | None = None) -> FastAPI:
 
     app = FastAPI(title="GitHub Dashboard", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.add_middleware(SecurityHeadersMiddleware)
+    app.add_exception_handler(CrossSiteRequest, _cross_site_handler)
     app.mount(
         "/static", StaticFiles(directory=str(Path(__file__).parent / "web" / "static")), "static"
     )
@@ -49,6 +52,10 @@ def create_app(container: Container | None = None) -> FastAPI:
     app.include_router(routes_auth.router)
     app.include_router(routes_api.router)
     return app
+
+
+def _cross_site_handler(request: Request, exc: CrossSiteRequest) -> JSONResponse:
+    return JSONResponse({"error": "cross_site"}, status_code=403)
 
 
 async def _purge_loop(container: Container) -> None:

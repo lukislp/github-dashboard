@@ -345,3 +345,82 @@ class Overview:
     inbox: Inbox
     notifications: tuple[Notification, ...]
     notifications_available: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RepoGroup:
+    """A user-defined named group of repositories, referenced by full name."""
+
+    name: str
+    repos: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Preferences:
+    """Per-user dashboard preferences: custom repository groups and favourites.
+
+    Keyed by GitHub user id, not by session; they survive logout and re-login.
+    """
+
+    groups: tuple[RepoGroup, ...] = ()
+    favorites: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class Snapshot:
+    """What the viewer had already seen as of `taken_at`, kept to diff a later Overview.
+
+    Keys: pull requests and issues as `"owner/repo#number"`, failed runs by their id,
+    inbox items as `"kind:owner/repo#number"` (kind is the `AttentionKind` value, since the
+    same PR can appear under more than one reason), notifications by their id, and alert
+    repos by full name (repositories with `security.total > 0`).
+    """
+
+    taken_at: datetime
+    prs: frozenset[str]
+    issues: frozenset[str]
+    failed_runs: frozenset[int]
+    inbox: frozenset[str]
+    notifications: frozenset[str]
+    alert_repos: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class ChangedItem:
+    """One pull request or issue that is new since the viewer's last recorded Snapshot."""
+
+    repo_full_name: str
+    number: int
+    title: str
+    url: str
+    author: str | None
+    updated_at: datetime
+    is_pull_request: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Changes:
+    """What is new in an Overview compared to the viewer's last Snapshot.
+
+    Depends on the viewer's own history, not on GitHub data, so `Overview` never stores
+    this itself: the web layer computes it from the current Overview and a stored Snapshot.
+    """
+
+    since: datetime | None
+    new_prs: tuple[ChangedItem, ...]
+    new_issues: tuple[ChangedItem, ...]
+    new_failed_runs: tuple[FailedRun, ...]
+    new_inbox: tuple[AttentionItem, ...]
+    new_notifications: tuple[Notification, ...]
+    new_alert_repos: tuple[str, ...]
+
+    @property
+    def total(self) -> int:
+        return (
+            len(self.new_prs)
+            + len(self.new_issues)
+            + len(self.new_failed_runs)
+            + len(self.new_inbox)
+            + len(self.new_notifications)
+            + len(self.new_alert_repos)
+        )

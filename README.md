@@ -108,15 +108,30 @@ only writable paths. `/healthz` is the liveness probe, `/readyz` touches the ses
   release), on top of the batched GraphQL query. Set `SECURITY_ALERTS=false` to skip the two
   security REST calls per repository if that cost is too high for a large account.
 
+## Per-user state
+
+The dashboard remembers two things per signed-in GitHub account, independent of any session:
+
+- **Preferences**: your custom repository groups and favourites (`GET`/`PUT /api/preferences`).
+- **Snapshot**: the identity of everything you had already seen (open PRs/issues, failed runs,
+  inbox items, notifications, repositories with open security alerts) as of your last
+  `POST /api/seen`. Every `GET /api/overview` diffs the current data against it and returns the
+  result as `changes`, so the UI can highlight what is new since your last visit.
+
+Both are keyed by GitHub user ID, stored in the same place as sessions (the SQLite file, or Redis
+when `REDIS_URL` is set), and **survive logout and re-login** — they are wiped only if you delete
+the underlying store.
+
 ## Architecture
 
 ```
 app/
-  domain/          models, aggregation (build_overview), JSON codec   — pure, no I/O
-  application/     use cases (CompleteLogin, GetOverview, Logout…) and ports (Protocols)
-  infrastructure/  adapters: GitHub HTTP (GraphQL + REST), SQLite/Redis sessions,
+  domain/          models, aggregation (build_overview), snapshot/diff, JSON codec — pure, no I/O
+  application/     use cases (CompleteLogin, GetOverview, GetChanges, SavePreferences…) and ports
+  infrastructure/  adapters: GitHub HTTP (GraphQL + REST), SQLite/Redis sessions and user state,
                    memory/Redis cache, Fernet cipher, settings from env
-  web/             FastAPI routers, composition root (container.py), templates, static assets
+  web/             FastAPI routers (incl. /api/preferences, /api/seen), composition root
+                   (container.py), templates, static assets
 tests/
   unit/            domain + use cases with in-memory fakes
   integration/     adapters (respx-mocked GitHub, SQLite, fakeredis) and HTTP routes

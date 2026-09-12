@@ -11,10 +11,12 @@ from app.domain.models import (
     Inbox,
     Notification,
     Overview,
+    Preferences,
     RateLimit,
     ReleaseInfo,
     Repository,
     SeverityCounts,
+    Snapshot,
     User,
     WorkflowRun,
 )
@@ -119,3 +121,18 @@ class TokenCipher(Protocol):
     def encrypt(self, plaintext: str) -> str: ...
 
     def decrypt(self, ciphertext: str) -> str: ...
+
+
+class UserStateRepository(Protocol):
+    """Per-user state that survives logout: repo groups/favourites and the last Snapshot.
+
+    Keyed by GitHub user id, not by session id.
+    """
+
+    async def get_preferences(self, user_id: int) -> Preferences: ...
+
+    async def set_preferences(self, user_id: int, prefs: Preferences) -> None: ...
+
+    async def get_snapshot(self, user_id: int) -> Snapshot | None: ...
+
+    async def set_snapshot(self, user_id: int, snapshot: Snapshot) -> None: ...

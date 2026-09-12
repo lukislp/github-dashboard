@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -24,15 +25,19 @@ from app.application.ports import (
     SessionRecord,
     SessionRepository,
     TokenCipher,
+    UserStateRepository,
 )
 from app.domain.models import (
+    Changes,
     Inbox,
     Notification,
     Overview,
+    Preferences,
     ReleaseInfo,
     RepoCi,
     RepoSecurity,
     Repository,
+    Snapshot,
 )
 from app.domain.overview import (
     DEFAULT_LONG_RUN_AFTER,
@@ -41,6 +46,12 @@ from app.domain.overview import (
     classify_ci,
     skipped_ci,
 )
+from app.domain.snapshot import diff_since, snapshot_of
+
+_MAX_GROUPS = 30
+_MAX_GROUP_NAME_LEN = 40
+_MAX_REPOS_TOTAL = 500
+_REPO_NAME_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
 log = logging.getLogger(__name__)
 
@@ -279,3 +290,74 @@ class GetOverview:
             long_run_after=self.long_run_after,
             now=self.clock(),
         )
+
+
+def validate_preferences(prefs: Preferences) -> None:
+    """Raise ValueError when `prefs` violates a stored-state limit.
+
+    Limits: at most 30 groups, group names non-empty/at most 40 chars/unique
+    case-insensitively, at most 500 repository names in total (groups plus favourites), and
+    every repository name must look like `owner/repo`.
+    """
+    if len(prefs.groups) > _MAX_GROUPS:
+        raise ValueError(f"a maximum of {_MAX_GROUPS} groups is allowed")
+
+    seen_names: set[str] = set()
+    total_repos = len(prefs.favorites)
+    for group in prefs.groups:
+        if not group.name.strip():
+            raise ValueError("group name must not be empty")
+        if len(group.name) > _MAX_GROUP_NAME_LEN:
+            raise ValueError(f"group name too long: {group.name!r}")
+        key = group.name.casefold()
+        if key in seen_names:
+            raise ValueError(f"duplicate group name: {group.name!r}")
+        seen_names.add(key)
+        total_repos += len(group.repos)
+
+    if total_repos > _MAX_REPOS_TOTAL:
+        raise ValueError(f"a maximum of {_MAX_REPOS_TOTAL} repositories is allowed")
+
+    all_repos = (*prefs.favorites, *(repo for group in prefs.groups for repo in group.repos))
+    for repo_name in all_repos:
+        if not _REPO_NAME_RE.match(repo_name):
+            raise ValueError(f"invalid repository name: {repo_name!r}")
+
+
+@dataclass(slots=True)
+class GetPreferences:
+    user_state: UserStateRepository
+
+    async def __call__(self, session: SessionRecord) -> Preferences:
+        return await self.user_state.get_preferences(session.user.id)
+
+
+@dataclass(slots=True)
+class SavePreferences:
+    user_state: UserStateRepository
+
+    async def __call__(self, session: SessionRecord, prefs: Preferences) -> None:
+        validate_preferences(prefs)
+        await self.user_state.set_preferences(session.user.id, prefs)
+
+
+@dataclass(slots=True)
+class MarkSeen:
+    """Records what the viewer has now seen, for a later `GetChanges` to diff against."""
+
+    user_state: UserStateRepository
+    clock: Clock = utc_now
+
+    async def __call__(self, session: SessionRecord, overview: Overview) -> Snapshot:
+        snapshot = snapshot_of(overview, self.clock())
+        await self.user_state.set_snapshot(session.user.id, snapshot)
+        return snapshot
+
+
+@dataclass(slots=True)
+class GetChanges:
+    user_state: UserStateRepository
+
+    async def __call__(self, session: SessionRecord, overview: Overview) -> Changes:
+        snapshot = await self.user_state.get_snapshot(session.user.id)
+        return diff_since(overview, snapshot)

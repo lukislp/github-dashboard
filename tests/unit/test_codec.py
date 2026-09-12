@@ -1,21 +1,36 @@
 import dataclasses
 import json
 
-from app.domain.codec import overview_from_dict, overview_to_dict
+from app.domain.codec import (
+    changes_from_dict,
+    changes_to_dict,
+    overview_from_dict,
+    overview_to_dict,
+    preferences_from_dict,
+    preferences_to_dict,
+    snapshot_from_dict,
+    snapshot_to_dict,
+)
 from app.domain.models import (
     AttentionItem,
     AttentionKind,
+    ChangedItem,
+    Changes,
     ChecksState,
+    FailedRun,
     Inbox,
     LastCommit,
     Mergeable,
     Notification,
+    Preferences,
     RateLimit,
     ReleaseInfo,
+    RepoGroup,
     RepoSecurity,
     ReviewDecision,
     RunStatus,
     SeverityCounts,
+    Snapshot,
 )
 from app.domain.overview import build_overview, classify_ci
 from app.domain.pull_requests import PrState
@@ -283,3 +298,100 @@ def test_notification_dict_round_trips():
     assert payload["notifications"][0]["reason"] == "mention"
     restored = overview_from_dict(json.loads(json.dumps(payload)))
     assert restored.notifications == (notification,)
+
+
+def test_preferences_roundtrip_through_json():
+    prefs = Preferences(
+        groups=(
+            RepoGroup("Backend", ("octocat/a", "octocat/b")),
+            RepoGroup("Frontend", ()),
+        ),
+        favorites=("octocat/a", "octocat/c"),
+    )
+
+    restored = preferences_from_dict(json.loads(json.dumps(preferences_to_dict(prefs))))
+
+    assert restored == prefs
+
+
+def test_preferences_from_dict_defaults_missing_fields():
+    assert preferences_from_dict({}) == Preferences()
+
+
+def test_snapshot_roundtrip_through_json():
+    snapshot = Snapshot(
+        taken_at=NOW,
+        prs=frozenset({"octocat/a#1", "octocat/a#2"}),
+        issues=frozenset({"octocat/a#3"}),
+        failed_runs=frozenset({1, 2}),
+        inbox=frozenset({"review_requested:octocat/a#1"}),
+        notifications=frozenset({"n1"}),
+        alert_repos=frozenset({"octocat/a"}),
+    )
+
+    restored = snapshot_from_dict(json.loads(json.dumps(snapshot_to_dict(snapshot))))
+
+    assert restored == snapshot
+
+
+def test_changes_roundtrip_through_json():
+    changed_pr = ChangedItem(
+        repo_full_name="octocat/a",
+        number=1,
+        title="t",
+        url="u",
+        author="bob",
+        updated_at=NOW,
+        is_pull_request=True,
+    )
+    changed_issue = dataclasses.replace(changed_pr, number=2, is_pull_request=False)
+    failed_run = FailedRun("octocat/a", make_run(RunStatus.FAILURE, run_id=9))
+    inbox_item = AttentionItem(
+        kind=AttentionKind.MENTIONED,
+        is_pull_request=True,
+        repo_full_name="octocat/a",
+        number=1,
+        title="t",
+        url="u",
+        author="bob",
+        updated_at=NOW,
+        is_draft=False,
+    )
+    notification = Notification(
+        id="n1",
+        reason="mention",
+        subject_title="t",
+        subject_type="Issue",
+        subject_url="u",
+        repo_full_name="octocat/a",
+        updated_at=NOW,
+        unread=True,
+    )
+    changes = Changes(
+        since=NOW,
+        new_prs=(changed_pr,),
+        new_issues=(changed_issue,),
+        new_failed_runs=(failed_run,),
+        new_inbox=(inbox_item,),
+        new_notifications=(notification,),
+        new_alert_repos=("octocat/a",),
+    )
+
+    payload = changes_to_dict(changes)
+    assert payload["total"] == 6
+    restored = changes_from_dict(json.loads(json.dumps(payload)))
+
+    assert restored == changes
+
+
+def test_changes_from_dict_with_no_since_defaults_to_empty():
+    restored = changes_from_dict({"since": None})
+    assert restored == Changes(
+        since=None,
+        new_prs=(),
+        new_issues=(),
+        new_failed_runs=(),
+        new_inbox=(),
+        new_notifications=(),
+        new_alert_repos=(),
+    )
