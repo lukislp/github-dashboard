@@ -29,6 +29,7 @@ class Settings:
     github_api_url: str
     github_web_url: str
     log_level: str
+    security_alerts: bool
 
     @property
     def callback_url(self) -> str:
@@ -60,6 +61,16 @@ class Settings:
                 raise ConfigurationError(f"{key} must be >= {minimum}")
             return value
 
+        def boolean(key: str, default: bool) -> bool:
+            raw = env.get(key, "").strip().lower()
+            if not raw:
+                return default
+            if raw in ("true", "1"):
+                return True
+            if raw in ("false", "0"):
+                return False
+            raise ConfigurationError(f"{key} must be one of: true, false, 1, 0")
+
         secret_key = required("SECRET_KEY")
         if len(secret_key) < 32:
             raise ConfigurationError("SECRET_KEY must be at least 32 characters")
@@ -78,7 +89,10 @@ class Settings:
             github_client_secret=required("GITHUB_CLIENT_SECRET"),
             secret_key=secret_key,
             base_url=base_url,
-            github_scopes=env.get("GITHUB_SCOPES", "repo read:org").strip() or "repo read:org",
+            github_scopes=(
+                env.get("GITHUB_SCOPES", "").strip()
+                or "repo read:org security_events notifications"
+            ),
             allowed_logins=allowed,
             cache_ttl_seconds=integer("CACHE_TTL_SECONDS", 120, minimum=0),
             session_ttl_hours=integer("SESSION_TTL_HOURS", 168),
@@ -95,4 +109,5 @@ class Settings:
                 "/"
             ),
             log_level=env.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
+            security_alerts=boolean("SECURITY_ALERTS", True),
         )

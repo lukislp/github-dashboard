@@ -177,9 +177,82 @@ class RepoCi:
 
 
 @dataclass(frozen=True, slots=True)
+class SeverityCounts:
+    """Open alerts of one security feature, broken down by GitHub's severity levels."""
+
+    critical: int
+    high: int
+    moderate: int
+    low: int
+
+    @property
+    def total(self) -> int:
+        return self.critical + self.high + self.moderate + self.low
+
+
+@dataclass(frozen=True, slots=True)
+class RepoSecurity:
+    """Security alerts of one repository. `None` means unavailable, not zero.
+
+    Unavailable covers: the feature is disabled for the repository, the token lacks the
+    required scope/permission, or GitHub answered 403/404 for that part.
+    """
+
+    dependabot: SeverityCounts | None
+    dependabot_total: int | None
+    code_scanning: SeverityCounts | None
+    secret_scanning: int | None
+
+    @property
+    def total(self) -> int:
+        """Sum of the available parts. Secret-scanning alerts count as one each."""
+        parts = 0
+        if self.dependabot is not None:
+            parts += self.dependabot.total
+        if self.code_scanning is not None:
+            parts += self.code_scanning.total
+        if self.secret_scanning is not None:
+            parts += self.secret_scanning
+        return parts
+
+    @property
+    def has_critical(self) -> bool:
+        """True when any part reports a critical severity, or a secret is exposed."""
+        dependabot_critical = self.dependabot.critical if self.dependabot else 0
+        code_scanning_critical = self.code_scanning.critical if self.code_scanning else 0
+        return dependabot_critical > 0 or code_scanning_critical > 0 or bool(self.secret_scanning)
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseInfo:
+    tag: str
+    name: str | None
+    published_at: datetime | None
+    url: str
+    is_prerelease: bool
+    unreleased_commits: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class Notification:
+    """One unread GitHub notification for the viewer."""
+
+    id: str
+    reason: str
+    subject_title: str
+    subject_type: str
+    subject_url: str | None
+    repo_full_name: str
+    updated_at: datetime
+    unread: bool
+
+
+@dataclass(frozen=True, slots=True)
 class RepoOverview:
     repository: Repository
     ci: RepoCi
+    security: RepoSecurity
+    release: ReleaseInfo | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +316,15 @@ class Totals:
     prs_failing: int
     long_running_runs: int
     inbox_total: int
+    security_critical: int
+    security_high: int
+    security_total: int
+    repos_with_alerts: int
+    secret_alerts: int
+    repos_unreleased: int
+    unreleased_commits: int
+    notifications_unread: int
+    notifications_by_reason: dict[str, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,3 +343,5 @@ class Overview:
     failures: tuple[FailedRun, ...]
     rate_limit: RateLimit | None
     inbox: Inbox
+    notifications: tuple[Notification, ...]
+    notifications_available: bool

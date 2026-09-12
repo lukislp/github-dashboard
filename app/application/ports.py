@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
-from app.domain.models import Inbox, Overview, RateLimit, Repository, User, WorkflowRun
+from app.domain.models import (
+    Inbox,
+    Notification,
+    Overview,
+    RateLimit,
+    ReleaseInfo,
+    Repository,
+    SeverityCounts,
+    User,
+    WorkflowRun,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +35,14 @@ class SessionRecord:
 class RepositoryPage:
     repositories: tuple[Repository, ...]
     rate_limit: RateLimit | None
+    # The following two are populated from the same GraphQL query as `repositories`, keyed
+    # by full name. `dependabot_by_repo` holds (severity counts, GraphQL totalCount), or
+    # (None, None) when the field is unavailable for that repository. `release_by_repo` holds
+    # the release info without `unreleased_commits`, which is filled in by a later REST call.
+    dependabot_by_repo: Mapping[str, tuple[SeverityCounts | None, int | None]] = field(
+        default_factory=dict
+    )
+    release_by_repo: Mapping[str, ReleaseInfo | None] = field(default_factory=dict)
 
 
 class GitHubOAuth(Protocol):
@@ -54,6 +73,27 @@ class GitHubApi(Protocol):
     async def search_inbox(self, token: str) -> Inbox:
         """Pull requests and issues waiting on the viewer: review requests, changes
         requested on their own PRs, assignments and mentions."""
+        ...
+
+    async def fetch_security(
+        self, token: str, owner: str, name: str
+    ) -> tuple[SeverityCounts | None, int | None]:
+        """Open code-scanning alerts by severity, and the open secret-scanning alert count.
+
+        Either part is `None` when that feature is disabled or the token cannot see it
+        (GitHub answers 403/404)."""
+        ...
+
+    async def count_commits_since(
+        self, token: str, owner: str, name: str, base: str, head: str
+    ) -> int | None:
+        """Commits on `head` that are not yet in `base`. `None` when the comparison fails
+        (e.g. the base ref no longer exists)."""
+        ...
+
+    async def list_notifications(self, token: str) -> list[Notification] | None:
+        """Unread notifications for the viewer. `None` when the `notifications` scope is
+        missing (GitHub answers 403/404)."""
         ...
 
 

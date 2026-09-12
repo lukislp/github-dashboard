@@ -12,12 +12,15 @@ from app.domain.models import (
     Issue,
     LastCommit,
     Mergeable,
+    Notification,
     Overview,
     PullRequest,
     RateLimit,
+    ReleaseInfo,
     Repository,
     ReviewDecision,
     RunStatus,
+    SeverityCounts,
     User,
     WorkflowRun,
 )
@@ -165,23 +168,45 @@ class FakeApi:
         runs: dict[str, list[WorkflowRun]] | None = None,
         rate_limit: RateLimit | None = DEFAULT_RATE_LIMIT,
         inbox: Inbox | None = None,
+        dependabot_by_repo: dict[str, tuple[SeverityCounts | None, int | None]] | None = None,
+        release_by_repo: dict[str, ReleaseInfo | None] | None = None,
+        security: dict[str, tuple[SeverityCounts | None, int | None]] | None = None,
+        commits_since: dict[str, int | None] | None = None,
+        notifications: list[Notification] | None = None,
     ) -> None:
         self.repos = repos or []
         self.runs = runs or {}
         self.rate_limit = rate_limit
         self.inbox = inbox if inbox is not None else Inbox((), (), (), ())
+        self.dependabot_by_repo = dependabot_by_repo or {}
+        self.release_by_repo = release_by_repo or {}
+        self.security = security or {}
+        self.commits_since = commits_since or {}
+        # None means the `notifications` scope is missing, matching the real port method.
+        self.notifications = notifications
         self.unavailable: set[str] = set()
         self.calls = 0
         self.run_calls: list[str] = []
         self.inbox_calls = 0
+        self.security_calls: list[str] = []
+        self.commits_since_calls: list[str] = []
+        self.notifications_calls = 0
         self.token_valid = True
         self.inbox_error: Exception | None = None
+        self.security_error: Exception | None = None
+        self.commits_since_error: Exception | None = None
+        self.notifications_error: Exception | None = None
 
     async def list_repositories(self, token: str) -> RepositoryPage:
         self.calls += 1
         if not self.token_valid:
             raise AuthenticationError("revoked")
-        return RepositoryPage(tuple(self.repos), self.rate_limit)
+        return RepositoryPage(
+            tuple(self.repos),
+            self.rate_limit,
+            dict(self.dependabot_by_repo),
+            dict(self.release_by_repo),
+        )
 
     async def list_recent_runs(
         self, token: str, owner: str, name: str, limit: int
@@ -197,6 +222,30 @@ class FakeApi:
         if self.inbox_error is not None:
             raise self.inbox_error
         return self.inbox
+
+    async def fetch_security(
+        self, token: str, owner: str, name: str
+    ) -> tuple[SeverityCounts | None, int | None]:
+        full = f"{owner}/{name}"
+        self.security_calls.append(full)
+        if self.security_error is not None:
+            raise self.security_error
+        return self.security.get(full, (None, None))
+
+    async def count_commits_since(
+        self, token: str, owner: str, name: str, base: str, head: str
+    ) -> int | None:
+        full = f"{owner}/{name}"
+        self.commits_since_calls.append(full)
+        if self.commits_since_error is not None:
+            raise self.commits_since_error
+        return self.commits_since.get(full)
+
+    async def list_notifications(self, token: str) -> list[Notification] | None:
+        self.notifications_calls += 1
+        if self.notifications_error is not None:
+            raise self.notifications_error
+        return self.notifications
 
 
 class FakeSessions:

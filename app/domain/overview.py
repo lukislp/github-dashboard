@@ -10,10 +10,13 @@ from app.domain.models import (
     CiState,
     FailedRun,
     Inbox,
+    Notification,
     Overview,
     RateLimit,
+    ReleaseInfo,
     RepoCi,
     RepoOverview,
+    RepoSecurity,
     Repository,
     RunStatus,
     Totals,
@@ -22,6 +25,7 @@ from app.domain.models import (
 from app.domain.pull_requests import PrState, pr_state
 
 _EMPTY_INBOX = Inbox((), (), (), ())
+_EMPTY_SECURITY = RepoSecurity(None, None, None, None)
 DEFAULT_STALE_AFTER = timedelta(days=14)
 DEFAULT_LONG_RUN_AFTER = timedelta(minutes=30)
 
@@ -94,15 +98,23 @@ def build_overview(
     inbox: Inbox = _EMPTY_INBOX,
     stale_after: timedelta = DEFAULT_STALE_AFTER,
     long_run_after: timedelta = DEFAULT_LONG_RUN_AFTER,
+    security_by_repo: Mapping[str, RepoSecurity] | None = None,
+    release_by_repo: Mapping[str, ReleaseInfo | None] | None = None,
+    notifications: tuple[Notification, ...] = (),
+    notifications_available: bool = False,
 ) -> Overview:
     repos: list[RepoOverview] = []
     failures: list[FailedRun] = []
+    security_by_repo = security_by_repo or {}
+    release_by_repo = release_by_repo or {}
 
     for repo in repositories:
         repo = _mark_stale(repo, now=now, stale_after=stale_after)
         ci = ci_by_repo.get(repo.full_name) or classify_ci(())
         ci = _mark_long_running(ci, now=now, long_run_after=long_run_after)
-        repos.append(RepoOverview(repo, ci))
+        security = security_by_repo.get(repo.full_name) or _EMPTY_SECURITY
+        release = release_by_repo.get(repo.full_name)
+        repos.append(RepoOverview(repo, ci, security, release))
         failures.extend(FailedRun(repo.full_name, run) for run in ci.runs if run.failed)
 
     repos.sort(key=_repo_sort_key)
@@ -139,6 +151,25 @@ def build_overview(
         prs_failing=sum(1 for p in all_prs if pr_state(p) in (PrState.FAILING, PrState.CONFLICT)),
         long_running_runs=sum(r.ci.long_running_count for r in repos),
         inbox_total=inbox.total,
+        security_critical=sum(
+            (r.security.dependabot.critical if r.security.dependabot else 0)
+            + (r.security.code_scanning.critical if r.security.code_scanning else 0)
+            for r in repos
+        ),
+        security_high=sum(
+            (r.security.dependabot.high if r.security.dependabot else 0)
+            + (r.security.code_scanning.high if r.security.code_scanning else 0)
+            for r in repos
+        ),
+        security_total=sum(r.security.total for r in repos),
+        repos_with_alerts=sum(1 for r in repos if r.security.total > 0),
+        secret_alerts=sum(r.security.secret_scanning or 0 for r in repos),
+        repos_unreleased=sum(
+            1 for r in repos if r.release and (r.release.unreleased_commits or 0) > 0
+        ),
+        unreleased_commits=sum(r.release.unreleased_commits or 0 for r in repos if r.release),
+        notifications_unread=sum(1 for n in notifications if n.unread),
+        notifications_by_reason=_group_by_reason(notifications),
     )
     return Overview(
         viewer_login=viewer_login,
@@ -148,7 +179,16 @@ def build_overview(
         failures=tuple(failures),
         rate_limit=rate_limit,
         inbox=inbox,
+        notifications=notifications,
+        notifications_available=notifications_available,
     )
+
+
+def _group_by_reason(notifications: Iterable[Notification]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for notification in notifications:
+        counts[notification.reason] = counts.get(notification.reason, 0) + 1
+    return counts
 
 
 def _repo_sort_key(item: RepoOverview) -> tuple[int, float]:

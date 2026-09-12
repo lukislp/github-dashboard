@@ -10,7 +10,16 @@ from app.application.use_cases import (
     Logout,
     ResolveSession,
 )
-from app.domain.models import AttentionItem, AttentionKind, CiState, Inbox, RunStatus
+from app.domain.models import (
+    AttentionItem,
+    AttentionKind,
+    CiState,
+    Inbox,
+    Notification,
+    ReleaseInfo,
+    RunStatus,
+    SeverityCounts,
+)
 from tests.fakes import (
     NOW,
     FakeApi,
@@ -192,6 +201,206 @@ async def test_get_overview_falls_back_to_empty_inbox_on_github_unavailable():
 async def test_get_overview_propagates_authentication_error_from_inbox():
     api = FakeApi(repos=[make_repo("a")])
     api.inbox_error = AuthenticationError("revoked")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AuthenticationError):
+        await build_overview_uc(api, sessions, cache)(record)
+    assert sessions.records == {}
+
+
+async def test_get_overview_merges_graphql_dependabot_with_rest_security():
+    api = FakeApi(
+        repos=[make_repo("a")],
+        dependabot_by_repo={"octocat/a": (SeverityCounts(1, 0, 0, 0), 1)},
+        security={"octocat/a": (SeverityCounts(0, 1, 0, 0), 2)},
+    )
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    security = result.overview.repos[0].security
+    assert security.dependabot == SeverityCounts(1, 0, 0, 0)
+    assert security.dependabot_total == 1
+    assert security.code_scanning == SeverityCounts(0, 1, 0, 0)
+    assert security.secret_scanning == 2
+    assert api.security_calls == ["octocat/a"]
+
+
+async def test_get_overview_skips_rest_security_when_disabled():
+    api = FakeApi(
+        repos=[make_repo("a")],
+        dependabot_by_repo={"octocat/a": (SeverityCounts(1, 0, 0, 0), 1)},
+        security={"octocat/a": (SeverityCounts(0, 1, 0, 0), 2)},
+    )
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = GetOverview(
+        api=api,
+        sessions=sessions,
+        cipher=PlainCipher(),
+        cache=cache,
+        cache_ttl_seconds=60,
+        runs_per_repo=5,
+        max_concurrency=2,
+        security_alerts=False,
+        clock=clock,
+    )
+
+    result = await uc(record)
+
+    security = result.overview.repos[0].security
+    assert security.dependabot == SeverityCounts(1, 0, 0, 0)  # GraphQL part still runs
+    assert security.code_scanning is None
+    assert security.secret_scanning is None
+    assert api.security_calls == []
+
+
+async def test_get_overview_degrades_security_to_none_on_rate_limited_or_unavailable():
+    api = FakeApi(repos=[make_repo("a")])
+    api.security_error = RateLimited("code scanning")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    security = result.overview.repos[0].security
+    assert security.code_scanning is None
+    assert security.secret_scanning is None
+
+
+async def test_get_overview_propagates_authentication_error_from_security():
+    api = FakeApi(repos=[make_repo("a")])
+    api.security_error = AuthenticationError("revoked")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AuthenticationError):
+        await build_overview_uc(api, sessions, cache)(record)
+    assert sessions.records == {}
+
+
+async def test_get_overview_skips_security_rest_for_archived_repos():
+    api = FakeApi(
+        repos=[make_repo("dead", archived=True)],
+        dependabot_by_repo={"octocat/dead": (SeverityCounts(1, 0, 0, 0), 1)},
+        security={"octocat/dead": (SeverityCounts(0, 1, 0, 0), 2)},
+    )
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    security = result.overview.repos[0].security
+    assert security.dependabot == SeverityCounts(1, 0, 0, 0)
+    assert security.code_scanning is None
+    assert api.security_calls == []
+
+
+async def test_get_overview_fills_unreleased_commits_from_compare():
+    release = ReleaseInfo(
+        tag="v1.0.0",
+        name="v1",
+        published_at=NOW,
+        url="u",
+        is_prerelease=False,
+        unreleased_commits=None,
+    )
+    api = FakeApi(
+        repos=[make_repo("a")],
+        release_by_repo={"octocat/a": release},
+        commits_since={"octocat/a": 7},
+    )
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    fetched_release = result.overview.repos[0].release
+    assert fetched_release is not None
+    assert fetched_release.unreleased_commits == 7
+    assert api.commits_since_calls == ["octocat/a"]
+
+
+async def test_get_overview_skips_compare_when_no_release():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.repos[0].release is None
+    assert api.commits_since_calls == []
+
+
+async def test_get_overview_degrades_unreleased_commits_to_none_on_error():
+    release = ReleaseInfo(
+        tag="v1.0.0",
+        name="v1",
+        published_at=NOW,
+        url="u",
+        is_prerelease=False,
+        unreleased_commits=None,
+    )
+    api = FakeApi(repos=[make_repo("a")], release_by_repo={"octocat/a": release})
+    api.commits_since_error = GitHubUnavailable("compare down")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.repos[0].release.unreleased_commits is None
+
+
+async def test_get_overview_includes_notifications_when_available():
+    notification = Notification(
+        id="1",
+        reason="mention",
+        subject_title="t",
+        subject_type="Issue",
+        subject_url="u",
+        repo_full_name="octocat/a",
+        updated_at=NOW,
+        unread=True,
+    )
+    api = FakeApi(repos=[make_repo("a")], notifications=[notification])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.notifications == (notification,)
+    assert result.overview.notifications_available is True
+    assert api.notifications_calls == 1
+
+
+async def test_get_overview_notifications_unavailable_when_scope_missing():
+    api = FakeApi(repos=[make_repo("a")], notifications=None)
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.notifications == ()
+    assert result.overview.notifications_available is False
+
+
+async def test_get_overview_notifications_degrade_on_rate_limited():
+    api = FakeApi(repos=[make_repo("a")])
+    api.notifications_error = RateLimited("notifications")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.notifications == ()
+    assert result.overview.notifications_available is False
+
+
+async def test_get_overview_propagates_authentication_error_from_notifications():
+    api = FakeApi(repos=[make_repo("a")])
+    api.notifications_error = AuthenticationError("revoked")
     oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
     record = await build_login(oauth, sessions)("code")
 

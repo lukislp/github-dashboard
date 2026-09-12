@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import secrets
 from collections.abc import Callable
@@ -24,7 +25,15 @@ from app.application.ports import (
     SessionRepository,
     TokenCipher,
 )
-from app.domain.models import Inbox, Overview, RepoCi, Repository
+from app.domain.models import (
+    Inbox,
+    Notification,
+    Overview,
+    ReleaseInfo,
+    RepoCi,
+    RepoSecurity,
+    Repository,
+)
 from app.domain.overview import (
     DEFAULT_LONG_RUN_AFTER,
     DEFAULT_STALE_AFTER,
@@ -131,6 +140,7 @@ class GetOverview:
     max_concurrency: int
     stale_after: timedelta = DEFAULT_STALE_AFTER
     long_run_after: timedelta = DEFAULT_LONG_RUN_AFTER
+    security_alerts: bool = True
     clock: Clock = utc_now
     _locks: dict[int, asyncio.Lock] = field(default_factory=dict)
 
@@ -164,24 +174,64 @@ class GetOverview:
         page = await self.api.list_repositories(token)
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
-        async def ci_for(repo: Repository) -> tuple[str, RepoCi]:
+        async def worker(repo: Repository) -> tuple[str, RepoCi, RepoSecurity, ReleaseInfo | None]:
+            dependabot, dependabot_total = page.dependabot_by_repo.get(repo.full_name, (None, None))
+            partial_release = page.release_by_repo.get(repo.full_name)
+
             if repo.is_archived:
-                return repo.full_name, skipped_ci("archived")
+                security = RepoSecurity(dependabot, dependabot_total, None, None)
+                return repo.full_name, skipped_ci("archived"), security, partial_release
+
             async with semaphore:
                 try:
                     runs = await self.api.list_recent_runs(
                         token, repo.owner, repo.name, self.runs_per_repo
                     )
+                    ci = classify_ci(runs)
                 except AuthenticationError:
                     raise
                 except ActionsUnavailable as exc:
-                    return repo.full_name, classify_ci((), error=str(exc) or "unavailable")
+                    ci = classify_ci((), error=str(exc) or "unavailable")
                 except RateLimited:
-                    return repo.full_name, classify_ci((), error="rate_limited")
+                    ci = classify_ci((), error="rate_limited")
                 except GitHubUnavailable as exc:
                     log.warning("runs unavailable repo=%s: %s", repo.full_name, exc)
-                    return repo.full_name, classify_ci((), error="github_error")
-            return repo.full_name, classify_ci(runs)
+                    ci = classify_ci((), error="github_error")
+
+                if self.security_alerts:
+                    try:
+                        code_scanning, secret_scanning = await self.api.fetch_security(
+                            token, repo.owner, repo.name
+                        )
+                    except AuthenticationError:
+                        raise
+                    except (RateLimited, GitHubUnavailable) as exc:
+                        log.warning("security fetch failed repo=%s: %s", repo.full_name, exc)
+                        code_scanning, secret_scanning = None, None
+                else:
+                    code_scanning, secret_scanning = None, None
+                security = RepoSecurity(
+                    dependabot, dependabot_total, code_scanning, secret_scanning
+                )
+
+                release = partial_release
+                if partial_release is not None and repo.default_branch:
+                    try:
+                        ahead_by = await self.api.count_commits_since(
+                            token,
+                            repo.owner,
+                            repo.name,
+                            partial_release.tag,
+                            repo.default_branch,
+                        )
+                    except AuthenticationError:
+                        raise
+                    except (RateLimited, GitHubUnavailable) as exc:
+                        log.warning("release compare failed repo=%s: %s", repo.full_name, exc)
+                        ahead_by = None
+                    release = dataclasses.replace(partial_release, unreleased_commits=ahead_by)
+
+            return repo.full_name, ci, security, release
 
         async def inbox() -> Inbox:
             try:
@@ -190,15 +240,41 @@ class GetOverview:
                 log.warning("inbox search failed: %s", exc)
                 return Inbox((), (), (), ())
 
-        ci_results, inbox_result = await asyncio.gather(
-            asyncio.gather(*(ci_for(r) for r in page.repositories)), inbox()
+        async def notifications() -> tuple[tuple[Notification, ...], bool]:
+            try:
+                result = await self.api.list_notifications(token)
+            except (RateLimited, GitHubUnavailable) as exc:
+                log.warning("notifications fetch failed: %s", exc)
+                return (), False
+            if result is None:
+                return (), False
+            return tuple(result), True
+
+        (
+            worker_results,
+            inbox_result,
+            (notification_items, notifications_available),
+        ) = await asyncio.gather(
+            asyncio.gather(*(worker(r) for r in page.repositories)), inbox(), notifications()
         )
+        ci_by_repo: dict[str, RepoCi] = {}
+        security_by_repo: dict[str, RepoSecurity] = {}
+        release_by_repo: dict[str, ReleaseInfo | None] = {}
+        for full_name, ci, security, release in worker_results:
+            ci_by_repo[full_name] = ci
+            security_by_repo[full_name] = security
+            release_by_repo[full_name] = release
+
         return build_overview(
             viewer_login=session.user.login,
             repositories=page.repositories,
-            ci_by_repo=dict(ci_results),
+            ci_by_repo=ci_by_repo,
             rate_limit=page.rate_limit,
             inbox=inbox_result,
+            security_by_repo=security_by_repo,
+            release_by_repo=release_by_repo,
+            notifications=notification_items,
+            notifications_available=notifications_available,
             stale_after=self.stale_after,
             long_run_after=self.long_run_after,
             now=self.clock(),

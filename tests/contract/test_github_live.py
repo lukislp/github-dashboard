@@ -28,3 +28,26 @@ async def test_live_repositories_and_runs():
 
         inbox = await api.search_inbox(token)
         assert inbox.total >= 0
+
+        # Security and notifications scopes may or may not be granted on the local `gh` token;
+        # the point of this test is that these calls never raise for a merely missing scope
+        # (they degrade to `None`), not that the data is actually available.
+        code_scanning, secret_scanning = await api.fetch_security(
+            token, candidate.owner, candidate.name
+        )
+        assert code_scanning is None or code_scanning.total >= 0
+        assert secret_scanning is None or secret_scanning >= 0
+
+        release_candidate = page.release_by_repo.get(candidate.full_name)
+        if release_candidate is not None and candidate.default_branch:
+            commits = await api.count_commits_since(
+                token,
+                candidate.owner,
+                candidate.name,
+                release_candidate.tag,
+                candidate.default_branch,
+            )
+            assert commits is None or commits >= 0
+
+        notifications = await api.list_notifications(token)
+        assert notifications is None or isinstance(notifications, list)

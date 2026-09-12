@@ -24,11 +24,14 @@ from app.domain.models import (
     Issue,
     LastCommit,
     Mergeable,
+    Notification,
     PullRequest,
     RateLimit,
+    ReleaseInfo,
     Repository,
     ReviewDecision,
     RunStatus,
+    SeverityCounts,
     User,
     WorkflowRun,
 )
@@ -104,6 +107,17 @@ query Repositories($cursor: String, $pageSize: Int!, $prDetails: Int!, $issueDet
         ) {
           totalCount
           nodes { number title url updatedAt author { login } }
+        }
+        vulnerabilityAlerts(states: OPEN, first: 100) {
+          totalCount
+          nodes { securityVulnerability { severity } }
+        }
+        latestRelease {
+          tagName
+          name
+          publishedAt
+          url
+          isPrerelease
         }
       }
     }
@@ -184,16 +198,41 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
+def _is_rate_limited(response: httpx.Response) -> bool:
+    if response.status_code not in (403, 429):
+        return False
+    remaining = response.headers.get("x-ratelimit-remaining")
+    return remaining == "0" or "rate limit" in response.text.lower()
+
+
 def _raise_for_status(response: httpx.Response, *, context: str) -> None:
     status = response.status_code
     if status == 401:
         raise AuthenticationError(context)
-    if status in (403, 429):
-        remaining = response.headers.get("x-ratelimit-remaining")
-        if remaining == "0" or "rate limit" in response.text.lower():
-            raise RateLimited(context)
+    if _is_rate_limited(response):
+        raise RateLimited(context)
     if status >= 400:
         raise GitHubUnavailable(f"{context}: HTTP {status}")
+
+
+def _optional_or_raise(response: httpx.Response, *, context: str) -> bool:
+    """For endpoints where 403/404 mean "not available" rather than a real error.
+
+    Returns True when the caller should treat the response as unavailable (`None`).
+    Raises AuthenticationError/RateLimited/GitHubUnavailable for genuine failures.
+    """
+    status = response.status_code
+    if status == 401:
+        raise AuthenticationError(context)
+    if status == 404:
+        return True
+    if status == 403:
+        if _is_rate_limited(response):
+            raise RateLimited(context)
+        return True
+    if status >= 400:
+        raise GitHubUnavailable(f"{context}: HTTP {status}")
+    return False
 
 
 class GitHubHttpOAuth:
@@ -288,6 +327,8 @@ class GitHubHttpApi:
 
     async def list_repositories(self, token: str) -> RepositoryPage:
         repositories: list[Repository] = []
+        dependabot_by_repo: dict[str, tuple[SeverityCounts | None, int | None]] = {}
+        release_by_repo: dict[str, ReleaseInfo | None] = {}
         rate_limit: RateLimit | None = None
         cursor: str | None = None
         while True:
@@ -305,12 +346,83 @@ class GitHubHttpApi:
             if rl:
                 rate_limit = RateLimit(rl["remaining"], rl["limit"], _parse_dt(rl.get("resetAt")))
             connection = data["viewer"]["repositories"]
-            repositories.extend(_repository_from_node(n) for n in connection["nodes"] if n)
+            for node in connection["nodes"]:
+                if not node:
+                    continue
+                repo = _repository_from_node(node)
+                repositories.append(repo)
+                dependabot_by_repo[repo.full_name] = _dependabot_from_node(node)
+                release_by_repo[repo.full_name] = _release_from_node(node.get("latestRelease"))
             page = connection["pageInfo"]
             if not page["hasNextPage"]:
                 break
             cursor = page["endCursor"]
-        return RepositoryPage(tuple(repositories), rate_limit)
+        return RepositoryPage(tuple(repositories), rate_limit, dependabot_by_repo, release_by_repo)
+
+    async def fetch_security(
+        self, token: str, owner: str, name: str
+    ) -> tuple[SeverityCounts | None, int | None]:
+        code_scanning = await self._fetch_code_scanning(token, owner, name)
+        secret_scanning = await self._fetch_secret_scanning(token, owner, name)
+        return code_scanning, secret_scanning
+
+    async def _fetch_code_scanning(
+        self, token: str, owner: str, name: str
+    ) -> SeverityCounts | None:
+        context = f"code scanning {owner}/{name}"
+        try:
+            response = await self._client.get(
+                f"{self._api_url}/repos/{owner}/{name}/code-scanning/alerts",
+                params={"state": "open", "per_page": 100},
+                headers=_headers(token),
+            )
+        except httpx.HTTPError as exc:
+            raise GitHubUnavailable(context) from exc
+        if _optional_or_raise(response, context=context):
+            return None
+        return _severity_counts_from_code_scanning_alerts(response.json())
+
+    async def _fetch_secret_scanning(self, token: str, owner: str, name: str) -> int | None:
+        context = f"secret scanning {owner}/{name}"
+        try:
+            response = await self._client.get(
+                f"{self._api_url}/repos/{owner}/{name}/secret-scanning/alerts",
+                params={"state": "open", "per_page": 100},
+                headers=_headers(token),
+            )
+        except httpx.HTTPError as exc:
+            raise GitHubUnavailable(context) from exc
+        if _optional_or_raise(response, context=context):
+            return None
+        return len(response.json())
+
+    async def count_commits_since(
+        self, token: str, owner: str, name: str, base: str, head: str
+    ) -> int | None:
+        context = f"compare {owner}/{name}"
+        try:
+            response = await self._client.get(
+                f"{self._api_url}/repos/{owner}/{name}/compare/{base}...{head}",
+                headers=_headers(token),
+            )
+        except httpx.HTTPError as exc:
+            raise GitHubUnavailable(context) from exc
+        if _optional_or_raise(response, context=context):
+            return None
+        return int(response.json()["ahead_by"])
+
+    async def list_notifications(self, token: str) -> list[Notification] | None:
+        try:
+            response = await self._client.get(
+                f"{self._api_url}/notifications",
+                params={"per_page": 50},
+                headers=_headers(token),
+            )
+        except httpx.HTTPError as exc:
+            raise GitHubUnavailable("notifications") from exc
+        if _optional_or_raise(response, context="notifications"):
+            return None
+        return [_notification_from_json(n) for n in response.json()]
 
     async def list_recent_runs(
         self, token: str, owner: str, name: str, limit: int
@@ -387,6 +499,84 @@ def _pr_checks(node: dict[str, Any]) -> ChecksState | None:
     if not rollup:
         return None
     return _CHECKS_STATE_BY_ROLLUP.get(rollup.get("state"))
+
+
+_SEVERITY_LEVELS = ("critical", "high", "moderate", "low")
+_RULE_SEVERITY_FALLBACK = {"error": "high", "warning": "moderate", "note": "low"}
+
+
+def _dependabot_from_node(node: dict[str, Any]) -> tuple[SeverityCounts | None, int | None]:
+    """Dependabot severity counts from the repositories query's `vulnerabilityAlerts` field.
+
+    `None` when the field itself is null: the feature is disabled for the repository, or a
+    partial GraphQL error nulled it out (missing `security_events` scope, no permission)."""
+    alerts = node.get("vulnerabilityAlerts")
+    if alerts is None:
+        return None, None
+    counts = dict.fromkeys(_SEVERITY_LEVELS, 0)
+    for alert_node in alerts.get("nodes") or []:
+        severity = ((alert_node or {}).get("securityVulnerability") or {}).get("severity")
+        level = (severity or "").lower()
+        if level in counts:
+            counts[level] += 1
+    total = alerts.get("totalCount")
+    return SeverityCounts(**counts), (int(total) if total is not None else None)
+
+
+def _release_from_node(node: dict[str, Any] | None) -> ReleaseInfo | None:
+    if not node:
+        return None
+    return ReleaseInfo(
+        tag=node["tagName"],
+        name=node.get("name"),
+        published_at=_parse_dt(node.get("publishedAt")),
+        url=node.get("url", ""),
+        is_prerelease=bool(node.get("isPrerelease", False)),
+        unreleased_commits=None,
+    )
+
+
+def _severity_counts_from_code_scanning_alerts(alerts: list[dict[str, Any]]) -> SeverityCounts:
+    counts = dict.fromkeys(_SEVERITY_LEVELS, 0)
+    for alert in alerts:
+        rule = alert.get("rule") or {}
+        level = rule.get("security_severity_level") or _RULE_SEVERITY_FALLBACK.get(
+            rule.get("severity")
+        )
+        if level in counts:
+            counts[level] += 1
+    return SeverityCounts(**counts)
+
+
+def _subject_html_url(subject: dict[str, Any], repo_html_url: str) -> str | None:
+    """Convert a notification's API subject URL to the page a person can open.
+
+    Issues and pull requests translate cleanly from the REST API URL; every other subject
+    type (releases, discussions, check suites, ...) falls back to the repository page.
+    """
+    subject_type = subject.get("type")
+    url = subject.get("url")
+    if subject_type in ("Issue", "PullRequest") and url:
+        html_url = url.replace("https://api.github.com/repos/", "https://github.com/")
+        if subject_type == "PullRequest":
+            html_url = html_url.replace("/pulls/", "/pull/")
+        return html_url
+    return repo_html_url or None
+
+
+def _notification_from_json(data: dict[str, Any]) -> Notification:
+    subject = data.get("subject") or {}
+    repo = data.get("repository") or {}
+    return Notification(
+        id=str(data["id"]),
+        reason=data.get("reason", ""),
+        subject_title=subject.get("title", ""),
+        subject_type=subject.get("type", ""),
+        subject_url=_subject_html_url(subject, repo.get("html_url", "")),
+        repo_full_name=repo.get("full_name", ""),
+        updated_at=_parse_dt(data.get("updated_at")) or datetime.now(UTC),
+        unread=bool(data.get("unread", True)),
+    )
 
 
 def _last_commit_from_node(target: dict[str, Any] | None) -> LastCommit | None:
