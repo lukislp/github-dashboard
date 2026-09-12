@@ -120,6 +120,7 @@ class Container:
                 max_concurrency=settings.max_concurrency,
                 stale_after=timedelta(days=settings.stale_days),
                 long_run_after=timedelta(minutes=settings.long_run_minutes),
+                security_alerts=settings.security_alerts,
             ),
             _closables=[],
         )

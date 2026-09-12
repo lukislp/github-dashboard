@@ -9,9 +9,13 @@ from app.domain.models import (
     Inbox,
     LastCommit,
     Mergeable,
+    Notification,
     RateLimit,
+    ReleaseInfo,
+    RepoSecurity,
     ReviewDecision,
     RunStatus,
+    SeverityCounts,
 )
 from app.domain.overview import build_overview, classify_ci
 from app.domain.pull_requests import PrState
@@ -60,6 +64,38 @@ def test_overview_roundtrip_through_json():
         assigned=(),
         mentioned=(),
     )
+    security_by_repo = {
+        "octocat/a": RepoSecurity(
+            dependabot=SeverityCounts(1, 0, 0, 0),
+            dependabot_total=1,
+            code_scanning=SeverityCounts(0, 1, 0, 0),
+            secret_scanning=1,
+        ),
+        "octocat/b": RepoSecurity(None, None, None, None),
+    }
+    release_by_repo = {
+        "octocat/a": ReleaseInfo(
+            tag="v1.0.0",
+            name="First release",
+            published_at=NOW,
+            url="https://github.com/octocat/a/releases/tag/v1.0.0",
+            is_prerelease=False,
+            unreleased_commits=4,
+        ),
+        "octocat/b": None,
+    }
+    notifications = (
+        Notification(
+            id="1",
+            reason="review_requested",
+            subject_title="PR 1",
+            subject_type="PullRequest",
+            subject_url="https://github.com/octocat/a/pull/1",
+            repo_full_name="octocat/a",
+            updated_at=NOW,
+            unread=True,
+        ),
+    )
     original = build_overview(
         viewer_login="octocat",
         repositories=repos,
@@ -67,6 +103,10 @@ def test_overview_roundtrip_through_json():
         rate_limit=RateLimit(10, 5000, NOW),
         now=NOW,
         inbox=inbox,
+        security_by_repo=security_by_repo,
+        release_by_repo=release_by_repo,
+        notifications=notifications,
+        notifications_available=True,
     )
 
     restored = overview_from_dict(json.loads(json.dumps(overview_to_dict(original))))
@@ -138,3 +178,108 @@ def test_inbox_dict_round_trips_and_totals():
     assert payload["inbox"]["total"] == 1
     assert payload["inbox"]["assigned"][0]["number"] == 3
     assert payload["totals"]["inbox_total"] == 1
+
+
+def test_security_dict_exposes_derived_total_and_has_critical():
+    security_by_repo = {
+        "octocat/a": RepoSecurity(
+            dependabot=SeverityCounts(1, 0, 0, 0),
+            dependabot_total=1,
+            code_scanning=None,
+            secret_scanning=None,
+        )
+    }
+    payload = overview_to_dict(
+        build_overview(
+            viewer_login="o",
+            repositories=[make_repo("a")],
+            ci_by_repo={},
+            rate_limit=None,
+            now=NOW,
+            security_by_repo=security_by_repo,
+        )
+    )
+    security = payload["repos"][0]["security"]
+    assert security["dependabot"]["critical"] == 1
+    assert security["dependabot"]["total"] == 1
+    assert security["code_scanning"] is None
+    assert security["total"] == 1
+    assert security["has_critical"] is True
+
+
+def test_repo_security_missing_from_payload_defaults_to_fully_unavailable():
+    repo = overview_from_dict(
+        {
+            "viewer_login": "o",
+            "generated_at": NOW.isoformat(),
+            "totals": dataclasses.asdict(
+                build_overview(
+                    viewer_login="o",
+                    repositories=[make_repo("a")],
+                    ci_by_repo={},
+                    rate_limit=None,
+                    now=NOW,
+                ).totals
+            ),
+            "repos": [
+                {
+                    "repository": {
+                        "full_name": "octocat/a",
+                        "name": "a",
+                        "owner": "octocat",
+                        "url": "u",
+                        "description": None,
+                        "is_private": False,
+                        "is_archived": False,
+                        "is_fork": False,
+                        "has_issues": True,
+                        "stars": 0,
+                        "pushed_at": None,
+                        "language": None,
+                        "language_color": None,
+                        "default_branch": None,
+                        "open_pr_count": 0,
+                        "open_issue_count": 0,
+                    },
+                    "ci": {
+                        "state": "none",
+                        "runs": [],
+                        "failed_count": 0,
+                        "active_count": 0,
+                    },
+                }
+            ],
+            "failures": [],
+        }
+    ).repos[0]
+    assert repo.security == RepoSecurity(None, None, None, None)
+    assert repo.release is None
+
+
+def test_notification_dict_round_trips():
+    notification = Notification(
+        id="42",
+        reason="mention",
+        subject_title="Bug",
+        subject_type="Issue",
+        subject_url="https://github.com/octocat/a/issues/1",
+        repo_full_name="octocat/a",
+        updated_at=NOW,
+        unread=True,
+    )
+    payload = overview_to_dict(
+        build_overview(
+            viewer_login="o",
+            repositories=[make_repo("a")],
+            ci_by_repo={},
+            rate_limit=None,
+            now=NOW,
+            notifications=(notification,),
+            notifications_available=True,
+        )
+    )
+    assert payload["notifications_available"] is True
+    assert payload["notifications"][0]["id"] == "42"
+    assert payload["notifications"][0]["reason"] == "mention"
+    restored = overview_from_dict(json.loads(json.dumps(payload)))
+    assert restored.notifications == (notification,)

@@ -19,14 +19,18 @@ from app.domain.models import (
     Issue,
     LastCommit,
     Mergeable,
+    Notification,
     Overview,
     PullRequest,
     RateLimit,
+    ReleaseInfo,
     RepoCi,
     RepoOverview,
+    RepoSecurity,
     Repository,
     ReviewDecision,
     RunStatus,
+    SeverityCounts,
     Totals,
     User,
     WorkflowRun,
@@ -248,6 +252,100 @@ def ci_from_dict(d: dict[str, Any]) -> RepoCi:
     )
 
 
+def severity_counts_to_dict(counts: SeverityCounts | None) -> dict[str, Any] | None:
+    if counts is None:
+        return None
+    return {
+        "critical": counts.critical,
+        "high": counts.high,
+        "moderate": counts.moderate,
+        "low": counts.low,
+        "total": counts.total,
+    }
+
+
+def severity_counts_from_dict(d: dict[str, Any] | None) -> SeverityCounts | None:
+    if d is None:
+        return None
+    return SeverityCounts(
+        critical=d["critical"], high=d["high"], moderate=d["moderate"], low=d["low"]
+    )
+
+
+def repo_security_to_dict(security: RepoSecurity) -> dict[str, Any]:
+    return {
+        "dependabot": severity_counts_to_dict(security.dependabot),
+        "dependabot_total": security.dependabot_total,
+        "code_scanning": severity_counts_to_dict(security.code_scanning),
+        "secret_scanning": security.secret_scanning,
+        "total": security.total,
+        "has_critical": security.has_critical,
+    }
+
+
+def repo_security_from_dict(d: dict[str, Any] | None) -> RepoSecurity:
+    if d is None:
+        return RepoSecurity(None, None, None, None)
+    return RepoSecurity(
+        dependabot=severity_counts_from_dict(d.get("dependabot")),
+        dependabot_total=d.get("dependabot_total"),
+        code_scanning=severity_counts_from_dict(d.get("code_scanning")),
+        secret_scanning=d.get("secret_scanning"),
+    )
+
+
+def release_info_to_dict(release: ReleaseInfo | None) -> dict[str, Any] | None:
+    if release is None:
+        return None
+    return {
+        "tag": release.tag,
+        "name": release.name,
+        "published_at": _dt(release.published_at),
+        "url": release.url,
+        "is_prerelease": release.is_prerelease,
+        "unreleased_commits": release.unreleased_commits,
+    }
+
+
+def release_info_from_dict(d: dict[str, Any] | None) -> ReleaseInfo | None:
+    if d is None:
+        return None
+    return ReleaseInfo(
+        tag=d["tag"],
+        name=d.get("name"),
+        published_at=_parse_dt(d.get("published_at")),
+        url=d["url"],
+        is_prerelease=d["is_prerelease"],
+        unreleased_commits=d.get("unreleased_commits"),
+    )
+
+
+def notification_to_dict(notification: Notification) -> dict[str, Any]:
+    return {
+        "id": notification.id,
+        "reason": notification.reason,
+        "subject_title": notification.subject_title,
+        "subject_type": notification.subject_type,
+        "subject_url": notification.subject_url,
+        "repo_full_name": notification.repo_full_name,
+        "updated_at": _dt(notification.updated_at),
+        "unread": notification.unread,
+    }
+
+
+def notification_from_dict(d: dict[str, Any]) -> Notification:
+    return Notification(
+        id=d["id"],
+        reason=d["reason"],
+        subject_title=d["subject_title"],
+        subject_type=d["subject_type"],
+        subject_url=d.get("subject_url"),
+        repo_full_name=d["repo_full_name"],
+        updated_at=_require_dt(d["updated_at"]),
+        unread=d["unread"],
+    )
+
+
 def attention_item_to_dict(item: AttentionItem) -> dict[str, Any]:
     return {
         "kind": item.kind.value,
@@ -303,7 +401,12 @@ def overview_to_dict(overview: Overview) -> dict[str, Any]:
         "generated_at": _dt(overview.generated_at),
         "totals": asdict(overview.totals),
         "repos": [
-            {"repository": repository_to_dict(r.repository), "ci": ci_to_dict(r.ci)}
+            {
+                "repository": repository_to_dict(r.repository),
+                "ci": ci_to_dict(r.ci),
+                "security": repo_security_to_dict(r.security),
+                "release": release_info_to_dict(r.release),
+            }
             for r in overview.repos
         ],
         "failures": [
@@ -320,6 +423,8 @@ def overview_to_dict(overview: Overview) -> dict[str, Any]:
             else None
         ),
         "inbox": inbox_to_dict(overview.inbox),
+        "notifications": [notification_to_dict(n) for n in overview.notifications],
+        "notifications_available": overview.notifications_available,
     }
 
 
@@ -330,7 +435,12 @@ def overview_from_dict(d: dict[str, Any]) -> Overview:
         generated_at=_require_dt(d["generated_at"]),
         totals=Totals(**d["totals"]),
         repos=tuple(
-            RepoOverview(repository_from_dict(r["repository"]), ci_from_dict(r["ci"]))
+            RepoOverview(
+                repository_from_dict(r["repository"]),
+                ci_from_dict(r["ci"]),
+                repo_security_from_dict(r.get("security")),
+                release_info_from_dict(r.get("release")),
+            )
             for r in d["repos"]
         ),
         failures=tuple(
@@ -340,4 +450,6 @@ def overview_from_dict(d: dict[str, Any]) -> Overview:
             RateLimit(rl["remaining"], rl["limit"], _parse_dt(rl.get("reset_at"))) if rl else None
         ),
         inbox=inbox_from_dict(d.get("inbox", {})),
+        notifications=tuple(notification_from_dict(n) for n in d.get("notifications", [])),
+        notifications_available=d.get("notifications_available", False),
     )

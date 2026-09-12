@@ -5,7 +5,7 @@ import pytest
 import respx
 
 from app.application.errors import ActionsUnavailable, AuthenticationError, RateLimited
-from app.domain.models import ChecksState, Mergeable, ReviewDecision, RunStatus
+from app.domain.models import ChecksState, Mergeable, ReviewDecision, RunStatus, SeverityCounts
 from app.infrastructure.github_http import GitHubHttpApi, GitHubHttpOAuth
 
 API = "https://api.github.test"
@@ -220,6 +220,245 @@ async def test_last_commit_is_none_when_default_branch_ref_missing(client):
     page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
 
     assert page.repositories[0].last_commit is None
+
+
+@respx.mock
+async def test_dependabot_alerts_are_summed_by_severity(client):
+    node = repo_node("a")
+    node["vulnerabilityAlerts"] = {
+        "totalCount": 3,
+        "nodes": [
+            {"securityVulnerability": {"severity": "CRITICAL"}},
+            {"securityVulnerability": {"severity": "HIGH"}},
+            {"securityVulnerability": {"severity": "HIGH"}},
+        ],
+    }
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=graphql_page([node], has_next=False, cursor=None))
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    dependabot, total = page.dependabot_by_repo["octocat/a"]
+    assert dependabot == SeverityCounts(critical=1, high=2, moderate=0, low=0)
+    assert total == 3
+
+
+@respx.mock
+async def test_dependabot_alerts_unavailable_when_field_is_null(client):
+    node = repo_node("a")
+    node["vulnerabilityAlerts"] = None
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=graphql_page([node], has_next=False, cursor=None))
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    assert page.dependabot_by_repo["octocat/a"] == (None, None)
+
+
+@respx.mock
+async def test_latest_release_is_mapped(client):
+    node = repo_node("a")
+    node["latestRelease"] = {
+        "tagName": "v1.2.3",
+        "name": "v1.2.3",
+        "publishedAt": "2026-09-01T10:00:00Z",
+        "url": f"{WEB}/octocat/a/releases/tag/v1.2.3",
+        "isPrerelease": False,
+    }
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=graphql_page([node], has_next=False, cursor=None))
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    release = page.release_by_repo["octocat/a"]
+    assert release is not None
+    assert release.tag == "v1.2.3"
+    assert release.is_prerelease is False
+    assert release.unreleased_commits is None
+
+
+@respx.mock
+async def test_latest_release_is_none_when_repository_has_no_release(client):
+    node = repo_node("a")
+    node["latestRelease"] = None
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=graphql_page([node], has_next=False, cursor=None))
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    assert page.release_by_repo["octocat/a"] is None
+
+
+@respx.mock
+async def test_fetch_security_combines_code_and_secret_scanning(client):
+    respx.get(f"{API}/repos/octocat/a/code-scanning/alerts").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"rule": {"security_severity_level": "critical"}},
+                {"rule": {"severity": "warning"}},
+                {"rule": {"severity": "note"}},
+            ],
+        )
+    )
+    respx.get(f"{API}/repos/octocat/a/secret-scanning/alerts").mock(
+        return_value=httpx.Response(200, json=[{"number": 1}, {"number": 2}])
+    )
+
+    code_scanning, secret_scanning = await GitHubHttpApi(client, api_url=API).fetch_security(
+        "tok", "octocat", "a"
+    )
+
+    assert code_scanning == SeverityCounts(critical=1, high=0, moderate=1, low=1)
+    assert secret_scanning == 2
+
+
+@respx.mock
+async def test_fetch_security_returns_none_parts_on_404(client):
+    respx.get(f"{API}/repos/octocat/a/code-scanning/alerts").mock(return_value=httpx.Response(404))
+    respx.get(f"{API}/repos/octocat/a/secret-scanning/alerts").mock(
+        return_value=httpx.Response(404)
+    )
+
+    code_scanning, secret_scanning = await GitHubHttpApi(client, api_url=API).fetch_security(
+        "tok", "octocat", "a"
+    )
+
+    assert code_scanning is None
+    assert secret_scanning is None
+
+
+@respx.mock
+async def test_fetch_security_returns_none_on_403_without_permission(client):
+    respx.get(f"{API}/repos/octocat/a/code-scanning/alerts").mock(
+        return_value=httpx.Response(403, headers={"x-ratelimit-remaining": "500"}, text="Forbidden")
+    )
+    respx.get(f"{API}/repos/octocat/a/secret-scanning/alerts").mock(
+        return_value=httpx.Response(403, headers={"x-ratelimit-remaining": "500"}, text="Forbidden")
+    )
+
+    code_scanning, secret_scanning = await GitHubHttpApi(client, api_url=API).fetch_security(
+        "tok", "octocat", "a"
+    )
+
+    assert code_scanning is None
+    assert secret_scanning is None
+
+
+@respx.mock
+async def test_fetch_security_raises_rate_limited_on_exhausted_403(client):
+    respx.get(f"{API}/repos/octocat/a/code-scanning/alerts").mock(
+        return_value=httpx.Response(403, headers={"x-ratelimit-remaining": "0"})
+    )
+    with pytest.raises(RateLimited):
+        await GitHubHttpApi(client, api_url=API).fetch_security("tok", "octocat", "a")
+
+
+@respx.mock
+async def test_fetch_security_raises_authentication_error_on_401(client):
+    respx.get(f"{API}/repos/octocat/a/code-scanning/alerts").mock(return_value=httpx.Response(401))
+    with pytest.raises(AuthenticationError):
+        await GitHubHttpApi(client, api_url=API).fetch_security("tok", "octocat", "a")
+
+
+@respx.mock
+async def test_count_commits_since_returns_ahead_by(client):
+    respx.get(f"{API}/repos/octocat/a/compare/v1.0.0...main").mock(
+        return_value=httpx.Response(200, json={"ahead_by": 5})
+    )
+    count = await GitHubHttpApi(client, api_url=API).count_commits_since(
+        "tok", "octocat", "a", "v1.0.0", "main"
+    )
+    assert count == 5
+
+
+@respx.mock
+async def test_count_commits_since_returns_none_on_404(client):
+    respx.get(f"{API}/repos/octocat/a/compare/deleted-tag...main").mock(
+        return_value=httpx.Response(404)
+    )
+    count = await GitHubHttpApi(client, api_url=API).count_commits_since(
+        "tok", "octocat", "a", "deleted-tag", "main"
+    )
+    assert count is None
+
+
+@respx.mock
+async def test_list_notifications_converts_issue_and_pr_urls_and_falls_back_for_others(client):
+    respx.get(f"{API}/notifications").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "1",
+                    "reason": "review_requested",
+                    "subject": {
+                        "title": "Add feature",
+                        "type": "PullRequest",
+                        "url": "https://api.github.com/repos/octocat/a/pulls/7",
+                    },
+                    "repository": {
+                        "full_name": "octocat/a",
+                        "html_url": "https://github.com/octocat/a",
+                    },
+                    "updated_at": "2026-09-10T08:00:00Z",
+                    "unread": True,
+                },
+                {
+                    "id": "2",
+                    "reason": "mention",
+                    "subject": {
+                        "title": "Bug report",
+                        "type": "Issue",
+                        "url": "https://api.github.com/repos/octocat/a/issues/3",
+                    },
+                    "repository": {
+                        "full_name": "octocat/a",
+                        "html_url": "https://github.com/octocat/a",
+                    },
+                    "updated_at": "2026-09-10T09:00:00Z",
+                    "unread": True,
+                },
+                {
+                    "id": "3",
+                    "reason": "subscribed",
+                    "subject": {
+                        "title": "v1.0.0",
+                        "type": "Release",
+                        "url": "https://api.github.com/repos/octocat/a/releases/9",
+                    },
+                    "repository": {
+                        "full_name": "octocat/a",
+                        "html_url": "https://github.com/octocat/a",
+                    },
+                    "updated_at": "2026-09-10T10:00:00Z",
+                    "unread": True,
+                },
+            ],
+        )
+    )
+    notifications = await GitHubHttpApi(client, api_url=API).list_notifications("tok")
+
+    assert notifications is not None
+    by_id = {n.id: n for n in notifications}
+    assert by_id["1"].subject_url == "https://github.com/octocat/a/pull/7"
+    assert by_id["2"].subject_url == "https://github.com/octocat/a/issues/3"
+    assert by_id["3"].subject_url == "https://github.com/octocat/a"
+    assert by_id["3"].subject_type == "Release"
+
+
+@respx.mock
+async def test_list_notifications_returns_none_when_scope_missing(client):
+    respx.get(f"{API}/notifications").mock(return_value=httpx.Response(404))
+    notifications = await GitHubHttpApi(client, api_url=API).list_notifications("tok")
+    assert notifications is None
+
+
+@respx.mock
+async def test_list_notifications_raises_authentication_error_on_401(client):
+    respx.get(f"{API}/notifications").mock(return_value=httpx.Response(401))
+    with pytest.raises(AuthenticationError):
+        await GitHubHttpApi(client, api_url=API).list_notifications("tok")
 
 
 @respx.mock
