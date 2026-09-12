@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-dashboard
+  labels:
+    app.kubernetes.io/name: github-dashboard
+spec:
+  # SQLite on a ReadWriteOnce volume: exactly one replica, replaced (not rolled) on update.
+  # With REDIS_URL set you can switch to RollingUpdate and scale out.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: github-dashboard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: github-dashboard
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dashboard
+          image: ghcr.io/lukislp/github-dashboard:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: github-dashboard-secrets
+          env:
+            - name: DB_PATH
+              value: /data/sessions.db
+            - name: CACHE_TTL_SECONDS
+              value: "120"
+            - name: RUNS_PER_REPO
+              value: "5"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: github-dashboard-data
+        - name: tmp
+          emptyDir: {}

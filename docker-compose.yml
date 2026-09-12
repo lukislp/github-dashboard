@@ -1,0 +1,21 @@
+services:
+  dashboard:
+    build: .
+    image: github-dashboard:local
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - dashboard-data:/data
+    restart: unless-stopped
+
+  # Optional: multi-replica setup. Start with `docker compose --profile redis up`
+  # and set REDIS_URL=redis://redis:6379/0 in .env.
+  redis:
+    image: redis:7-alpine
+    profiles: ["redis"]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped
+
+volumes:
+  dashboard-data:
