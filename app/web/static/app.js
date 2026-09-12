@@ -9,15 +9,17 @@
   const state = {
     data: null,
     loading: false,
-    filters: { q: "", owner: "", attention: false, archived: false, forks: true },
+    filters: { q: "", owner: "", attention: false, archived: false, forks: true, bots: true },
     sort: { key: "default", dir: "asc" },
     expanded: new Set(),
+    inboxFilter: null,
   };
 
   const $ = (sel) => document.querySelector(sel);
   const els = {
     banner: $("#banner"),
     kpis: $("#kpis"),
+    inbox: $("#inbox"),
     rows: $("#repo-rows"),
     count: $("#repo-count"),
     failures: $("#failure-list"),
@@ -30,6 +32,7 @@
     attention: $("#filter-attention"),
     archived: $("#filter-archived"),
     forks: $("#filter-forks"),
+    bots: $("#filter-bots"),
   };
 
   // ---------- helpers ----------
@@ -50,6 +53,41 @@
     clock: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0Zm0 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM8 4a.75.75 0 0 1 .75.75v3.1l2 1.2a.75.75 0 1 1-.77 1.29l-2.36-1.42A.75.75 0 0 1 7.25 8.25V4.75A.75.75 0 0 1 8 4Z"/></svg>',
     dash: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 7.25h12v1.5H2z"/></svg>',
     chevron: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z"/></svg>',
+    eye: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.25c-3.6 0-6.5 3.1-7.4 4.4a.6.6 0 0 0 0 .7c.9 1.3 3.8 4.4 7.4 4.4s6.5-3.1 7.4-4.4a.6.6 0 0 0 0-.7c-.9-1.3-3.8-4.4-7.4-4.4Zm0 7.75a3.25 3.25 0 1 1 0-6.5 3.25 3.25 0 0 1 0 6.5Zm0-1.5a1.75 1.75 0 1 0 0-3.5 1.75 1.75 0 0 0 0 3.5Z"/></svg>',
+    pencil: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M11.01 1.43a1.75 1.75 0 0 1 2.47 0l1.09 1.09a1.75 1.75 0 0 1 0 2.47l-8.61 8.61a1.7 1.7 0 0 1-.76.44l-3.25.93a.75.75 0 0 1-.93-.93l.93-3.25c.08-.29.24-.55.44-.76ZM12.19 6.25 9.75 3.81l-6.29 6.29a.2.2 0 0 0-.06.1l-.56 1.96 1.96-.56a.2.2 0 0 0 .11-.06Zm1.24-3.76a.25.25 0 0 0-.35 0L11.81 3.75l1.44 1.44 1.26-1.26a.25.25 0 0 0 0-.35Z"/></svg>',
+    person: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M10.56 8.07a6 6 0 0 1 3.43 5.14.75.75 0 1 1-1.5.07 4.5 4.5 0 0 0-8.98 0 .75.75 0 0 1-1.5-.07 6 6 0 0 1 3.43-5.14 4 4 0 1 1 5.12 0ZM10.5 5a2.5 2.5 0 1 0-5 0 2.5 2.5 0 0 0 5 0Z"/></svg>',
+    comment: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.75 1A1.75 1.75 0 0 0 1 2.75v7.5c0 .966.784 1.75 1.75 1.75H6v2.19c0 .34.41.51.65.27L9.31 12h3.94A1.75 1.75 0 0 0 15 10.25v-7.5A1.75 1.75 0 0 0 13.25 1Z"/></svg>',
+    alert: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M6.46 1.05c.66-1.24 2.43-1.24 3.09 0l6.08 11.38A1.75 1.75 0 0 1 14.08 15H1.92a1.75 1.75 0 0 1-1.55-2.57Zm1.29 4.7v2.5a.75.75 0 0 0 1.5 0v-2.5a.75.75 0 0 0-1.5 0ZM9 11a1 1 0 1 0-2 0 1 1 0 0 0 2 0Z"/></svg>',
+  };
+
+  const STATE_ICON = {
+    conflict: ICONS.alert,
+    failing: ICONS.x,
+    changes_requested: ICONS.pencil,
+    draft: ICONS.dash,
+    pending_checks: ICONS.clock,
+    ready: ICONS.check,
+    awaiting_review: ICONS.eye,
+  };
+
+  const STATE_BUCKET = {
+    conflict: "critical",
+    failing: "critical",
+    changes_requested: "warning",
+    draft: "neutral",
+    pending_checks: "neutral",
+    ready: "good",
+    awaiting_review: "neutral",
+  };
+
+  const BUCKET_ORDER = ["critical", "warning", "good", "neutral"];
+
+  const INBOX_KINDS = ["review_requested", "changes_requested", "assigned", "mentioned"];
+  const INBOX_ICON = {
+    review_requested: ICONS.eye,
+    changes_requested: ICONS.pencil,
+    assigned: ICONS.person,
+    mentioned: ICONS.comment,
   };
 
   const CI_ICON = {
@@ -70,6 +108,50 @@
       item.repository.open_pr_count > 0 ||
       item.repository.open_issue_count > 0
     );
+  }
+
+  function visiblePrs(repo) {
+    return state.filters.bots ? repo.pull_requests : repo.pull_requests.filter((p) => !p.is_bot);
+  }
+
+  function displayedPrCount(repo) {
+    if (state.filters.bots) return repo.open_pr_count;
+    const bots = repo.pull_requests.filter((p) => p.is_bot).length;
+    return Math.max(0, repo.open_pr_count - bots);
+  }
+
+  function prDotsMarkup(prs) {
+    if (!prs.length) return "";
+    const counts = { critical: 0, warning: 0, good: 0, neutral: 0 };
+    const byState = {};
+    prs.forEach((p) => {
+      const bucket = STATE_BUCKET[p.state] || "neutral";
+      counts[bucket] += 1;
+      byState[p.state] = (byState[p.state] || 0) + 1;
+    });
+    const dots = BUCKET_ORDER.filter((b) => counts[b] > 0)
+      .slice(0, 3)
+      .map((b) => `<span class="pr-dot pr-dot--${b}"></span>`)
+      .join("");
+    if (!dots) return "";
+    const title = Object.keys(byState)
+      .map((s) => `${byState[s]} ${t("state_" + s)}`)
+      .join(" · ");
+    return `<span class="pr-dots" title="${esc(title)}">${dots}</span>`;
+  }
+
+  function stateChipMarkup(pr) {
+    const bucket = STATE_BUCKET[pr.state] || "neutral";
+    const icon = STATE_ICON[pr.state] || "";
+    return `<span class="state-chip state-chip--${bucket}">${icon}${esc(t("state_" + pr.state))}</span>`;
+  }
+
+  function staleTagMarkup() {
+    return `<span class="tag tag--stale">${ICONS.clock}${esc(t("stale_tag"))}</span>`;
+  }
+
+  function botTagMarkup() {
+    return `<span class="tag">${esc(t("bot_tag"))}</span>`;
   }
 
   function runsMarkup(runs, total) {
@@ -108,10 +190,12 @@
     const loading = !d;
     const totals = d ? d.totals : {};
     const runsPerRepo = d ? Math.max(0, ...d.repos.map((r) => r.ci.runs.length), 0) : 5;
-    const drafts = d
-      ? d.repos.reduce((n, r) => n + r.repository.pull_requests.filter((p) => p.is_draft).length, 0)
-      : 0;
     const reposWithIssues = d ? d.repos.filter((r) => r.repository.open_issue_count > 0).length : 0;
+
+    let prsSub = t("kpi_prs_sub", { human: totals.human_prs ?? 0, bots: totals.bot_prs ?? 0 });
+    if (totals.stale_prs > 0) prsSub += " · " + t("stale_suffix", { n: totals.stale_prs });
+    let issuesSub = t("kpi_issues_sub", { repos: reposWithIssues });
+    if (totals.stale_issues > 0) issuesSub += " · " + t("stale_suffix", { n: totals.stale_issues });
 
     const tiles = [
       {
@@ -120,12 +204,18 @@
         value: totals.repos,
         sub: t("kpi_repos_sub", { private: totals.private ?? 0, archived: totals.archived ?? 0 }),
       },
-      { key: "prs", label: t("kpi_prs"), value: totals.open_prs, sub: t("kpi_prs_sub", { drafts }), tone: "accent" },
+      {
+        key: "prs",
+        label: t("kpi_prs"),
+        value: state.filters.bots ? totals.open_prs : totals.human_prs,
+        sub: prsSub,
+        tone: "accent",
+      },
       {
         key: "issues",
         label: t("kpi_issues"),
         value: totals.open_issues,
-        sub: t("kpi_issues_sub", { repos: reposWithIssues }),
+        sub: issuesSub,
         tone: "accent",
       },
       {
@@ -165,6 +255,71 @@
       owners.map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join("");
     els.owner.value = owners.includes(current) ? current : "";
     state.filters.owner = els.owner.value;
+  }
+
+  function inboxItems(inbox) {
+    const items = [];
+    INBOX_KINDS.forEach((kind) => {
+      (inbox[kind] || []).forEach((item) => items.push(item));
+    });
+    return items;
+  }
+
+  function inboxItemMarkup(item) {
+    const kindLabel = t("inbox_kind_" + item.kind);
+    return `<li class="inbox-item">
+      <span class="inbox-item__kind">${INBOX_ICON[item.kind] || ""}${esc(kindLabel)}</span>
+      <span class="inbox-item__repo mono">${esc(item.repo_full_name)}</span>
+      <a class="inbox-item__title" href="${esc(item.url)}" target="_blank" rel="noopener" title="${esc(item.title)}">#${item.number} ${esc(item.title)}</a>
+      ${item.is_draft ? `<span class="tag">${esc(t("draft"))}</span>` : ""}
+      <span class="inbox-item__author">${esc(item.author || "")}</span>
+      <span class="inbox-item__time" title="${esc(I18N.formatDateTime(item.updated_at))}">${esc(I18N.formatRelative(item.updated_at))}</span>
+    </li>`;
+  }
+
+  function renderInbox() {
+    const d = state.data;
+    if (!d) {
+      els.inbox.innerHTML = "";
+      return;
+    }
+    const inbox = d.inbox;
+    if (!inbox || inbox.total === 0) {
+      els.inbox.innerHTML = `<p class="inbox-empty">${ICONS.check}${esc(t("inbox_empty"))}</p>`;
+      return;
+    }
+
+    const tiles = INBOX_KINDS.map((kind) => {
+      const count = (inbox[kind] || []).length;
+      const active = state.inboxFilter === kind;
+      return `<button type="button" class="inbox-tile ${active ? "is-active" : ""}" data-kind="${kind}" aria-pressed="${active}">
+        <span class="inbox-tile__label">${INBOX_ICON[kind] || ""}${esc(t("inbox_" + kind))}</span>
+        <span class="inbox-tile__value">${esc(I18N.formatNumber(count))}</span>
+      </button>`;
+    }).join("");
+
+    const items = state.inboxFilter
+      ? inbox[state.inboxFilter] || []
+      : inboxItems(inbox);
+    const list = items.length
+      ? items.map(inboxItemMarkup).join("")
+      : `<li class="inbox-empty-row">${esc(t("inbox_empty_list"))}</li>`;
+
+    els.inbox.innerHTML = `
+      <div class="section-head">
+        <h2>${esc(t("inbox_title"))}</h2>
+        <p class="section-sub">${esc(t("inbox_filter_hint"))}</p>
+      </div>
+      <div class="inbox__tiles">${tiles}</div>
+      <ul class="inbox__list">${list}</ul>`;
+
+    els.inbox.querySelectorAll(".inbox-tile").forEach((button) => {
+      button.addEventListener("click", () => {
+        const kind = button.dataset.kind;
+        state.inboxFilter = state.inboxFilter === kind ? null : kind;
+        renderInbox();
+      });
+    });
   }
 
   function visibleRepos() {
@@ -212,11 +367,22 @@
       ? `<span class="lang"><span class="lang__dot" data-color="${esc(repo.language_color || "")}"></span>${esc(repo.language)}</span>`
       : "";
     const stars = repo.stars ? `<span class="mono">★ ${esc(I18N.formatNumber(repo.stars))}</span>` : "";
-    const ciLabel =
-      ci.state === "failing" && ci.failed_count > 1
+    const longRunning = ci.long_running_count > 0;
+    const ciLabel = longRunning
+      ? t("ci_running_slow")
+      : ci.state === "failing" && ci.failed_count > 1
         ? `${t("ci_failing")} ×${ci.failed_count}`
         : t("ci_" + ci.state);
     const runsPerRepo = Math.max(ci.runs.length, state.data ? state.data.runs_per_repo || 5 : 5);
+
+    const prs = visiblePrs(repo);
+    const prCount = displayedPrCount(repo);
+    const dots = prDotsMarkup(prs);
+
+    const commit = repo.last_commit;
+    const commitLine = commit
+      ? `<a class="pushed__commit" href="${esc(commit.url)}" target="_blank" rel="noopener" title="${esc(commit.author_login || commit.author_name || "")} · ${esc(commit.headline)}">${esc(commit.author_login || commit.author_name || "")} · ${esc(commit.headline)}</a>`
+      : "";
 
     return `
       <tr class="repo-row ci--${esc(ci.state)} ${ci.state === "failing" ? "is-failing" : ""} ${open ? "is-open" : ""}" data-repo="${esc(repo.full_name)}">
@@ -228,15 +394,18 @@
           </div>
           <div class="repo-meta">${lang}${stars}</div>
         </td>
-        <td class="col-num"><span class="num ${repo.open_pr_count ? "is-hot" : "is-zero"}">${repo.open_pr_count}</span></td>
+        <td class="col-num"><span class="num-cell"><span class="num ${prCount ? "is-hot" : "is-zero"}">${prCount}</span>${dots}</span></td>
         <td class="col-num"><span class="num ${repo.open_issue_count ? "is-hot" : "is-zero"}">${repo.open_issue_count}</span></td>
         <td class="col-ci">
           <div class="ci ci--${esc(ci.state)}">
             ${ci.state === "skipped" ? "" : runsMarkup(ci.runs, runsPerRepo)}
-            <span class="ci__label">${CI_ICON[ci.state] || ""}${esc(ciLabel)}</span>
+            <span class="ci__label ${longRunning ? "ci__label--slow" : ""}">${longRunning ? ICONS.clock : CI_ICON[ci.state] || ""}${esc(ciLabel)}</span>
           </div>
         </td>
-        <td class="col-pushed" title="${esc(I18N.formatDateTime(repo.pushed_at))}">${esc(I18N.formatRelative(repo.pushed_at))}</td>
+        <td class="col-pushed" title="${esc(I18N.formatDateTime(repo.pushed_at))}">
+          <div class="pushed__time">${esc(I18N.formatRelative(repo.pushed_at))}</div>
+          ${commitLine}
+        </td>
         <td class="col-toggle">
           <button type="button" class="toggle" aria-expanded="${open}" aria-label="${esc(t(open ? "collapse" : "expand"))}">${ICONS.chevron}</button>
         </td>
@@ -248,19 +417,25 @@
     const repo = item.repository;
     const ci = item.ci;
 
-    const prList = repo.pull_requests.length
-      ? `<ul>${repo.pull_requests
+    const prs = visiblePrs(repo);
+    const prCount = displayedPrCount(repo);
+    const prList = prs.length
+      ? `<ul>${prs
           .map(
             (p) => `<li>
               <span class="id">#${p.number}</span>
               <a class="title" href="${esc(p.url)}" target="_blank" rel="noopener" title="${esc(p.title)}">${esc(p.title)}</a>
+              ${p.head_branch ? `<span class="branch mono">${esc(p.head_branch)}</span>` : ""}
+              ${stateChipMarkup(p)}
+              ${p.is_bot ? botTagMarkup() : ""}
+              ${p.stale ? staleTagMarkup() : ""}
               ${p.is_draft ? `<span class="tag">${esc(t("draft"))}</span>` : ""}
               <span class="by">${esc(p.author || "")}</span>
             </li>`
           )
           .join("")}</ul>` +
-        (repo.open_pr_count > repo.pull_requests.length
-          ? `<a class="more" href="${esc(repo.url)}/pulls" target="_blank" rel="noopener">${esc(t("more_on_github", { n: repo.open_pr_count - repo.pull_requests.length }))}</a>`
+        (prCount > prs.length
+          ? `<a class="more" href="${esc(repo.url)}/pulls" target="_blank" rel="noopener">${esc(t("more_on_github", { n: prCount - prs.length }))}</a>`
           : "")
       : `<p class="empty">${esc(t("none_open"))}</p>`;
 
@@ -270,6 +445,7 @@
             (i) => `<li>
               <span class="id">#${i.number}</span>
               <a class="title" href="${esc(i.url)}" target="_blank" rel="noopener" title="${esc(i.title)}">${esc(i.title)}</a>
+              ${i.stale ? staleTagMarkup() : ""}
               <span class="by">${esc(i.author || "")}</span>
             </li>`
           )
@@ -286,7 +462,7 @@
               <span class="run run--${esc(r.status)}"></span>
               <a class="title" href="${esc(r.url)}" target="_blank" rel="noopener" title="${esc(r.title)}">${esc(r.workflow_name)}</a>
               <span class="branch">${esc(r.branch || "")}</span>
-              <span class="status">${esc(t("run_" + r.status))} · ${esc(I18N.formatRelative(r.updated_at))}</span>
+              <span class="status">${esc(t("run_" + r.status))} · ${esc(I18N.formatRelative(r.updated_at))}${r.long_running ? " " + esc(t("run_long_running_suffix")) : ""}</span>
             </li>`
           )
           .join("")}</ul>` +
@@ -297,7 +473,7 @@
       <tr class="detail-row" data-detail="${esc(repo.full_name)}">
         <td colspan="6">
           <div class="details">
-            <div><h4>${esc(t("details_prs"))} · ${repo.open_pr_count}</h4>${prList}</div>
+            <div><h4>${esc(t("details_prs"))} · ${prCount}</h4>${prList}</div>
             <div><h4>${esc(t("details_issues"))} · ${repo.open_issue_count}</h4>${issueList}</div>
             <div><h4>${esc(t("details_runs"))}</h4>${runList}</div>
           </div>
@@ -377,6 +553,7 @@
 
   function renderAll() {
     renderKpis();
+    renderInbox();
     renderOwners();
     renderTable();
     renderFailures();
@@ -434,9 +611,15 @@
       state.filters.owner = els.owner.value;
       renderTable();
     });
-    for (const [key, el] of [["attention", els.attention], ["archived", els.archived], ["forks", els.forks]]) {
+    for (const [key, el] of [
+      ["attention", els.attention],
+      ["archived", els.archived],
+      ["forks", els.forks],
+      ["bots", els.bots],
+    ]) {
       el.addEventListener("change", () => {
         state.filters[key] = el.checked;
+        if (key === "bots") renderKpis();
         renderTable();
       });
     }
