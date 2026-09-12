@@ -12,6 +12,8 @@ from typing import Any
 from app.domain.models import (
     AttentionItem,
     AttentionKind,
+    ChangedItem,
+    Changes,
     ChecksState,
     CiState,
     FailedRun,
@@ -21,16 +23,19 @@ from app.domain.models import (
     Mergeable,
     Notification,
     Overview,
+    Preferences,
     PullRequest,
     RateLimit,
     ReleaseInfo,
     RepoCi,
+    RepoGroup,
     RepoOverview,
     RepoSecurity,
     Repository,
     ReviewDecision,
     RunStatus,
     SeverityCounts,
+    Snapshot,
     Totals,
     User,
     WorkflowRun,
@@ -452,4 +457,105 @@ def overview_from_dict(d: dict[str, Any]) -> Overview:
         inbox=inbox_from_dict(d.get("inbox", {})),
         notifications=tuple(notification_from_dict(n) for n in d.get("notifications", [])),
         notifications_available=d.get("notifications_available", False),
+    )
+
+
+def repo_group_to_dict(group: RepoGroup) -> dict[str, Any]:
+    return {"name": group.name, "repos": sorted(group.repos)}
+
+
+def repo_group_from_dict(d: dict[str, Any]) -> RepoGroup:
+    return RepoGroup(name=d.get("name", ""), repos=tuple(d.get("repos", [])))
+
+
+def preferences_to_dict(prefs: Preferences) -> dict[str, Any]:
+    return {
+        "groups": [repo_group_to_dict(g) for g in prefs.groups],
+        "favorites": sorted(prefs.favorites),
+    }
+
+
+def preferences_from_dict(d: dict[str, Any]) -> Preferences:
+    return Preferences(
+        groups=tuple(repo_group_from_dict(g) for g in d.get("groups", [])),
+        favorites=tuple(d.get("favorites", [])),
+    )
+
+
+def snapshot_to_dict(snapshot: Snapshot) -> dict[str, Any]:
+    return {
+        "taken_at": _dt(snapshot.taken_at),
+        "prs": sorted(snapshot.prs),
+        "issues": sorted(snapshot.issues),
+        "failed_runs": sorted(snapshot.failed_runs),
+        "inbox": sorted(snapshot.inbox),
+        "notifications": sorted(snapshot.notifications),
+        "alert_repos": sorted(snapshot.alert_repos),
+    }
+
+
+def snapshot_from_dict(d: dict[str, Any]) -> Snapshot:
+    return Snapshot(
+        taken_at=_require_dt(d["taken_at"]),
+        prs=frozenset(d.get("prs", [])),
+        issues=frozenset(d.get("issues", [])),
+        failed_runs=frozenset(d.get("failed_runs", [])),
+        inbox=frozenset(d.get("inbox", [])),
+        notifications=frozenset(d.get("notifications", [])),
+        alert_repos=frozenset(d.get("alert_repos", [])),
+    )
+
+
+def changed_item_to_dict(item: ChangedItem) -> dict[str, Any]:
+    return {
+        "repo_full_name": item.repo_full_name,
+        "number": item.number,
+        "title": item.title,
+        "url": item.url,
+        "author": item.author,
+        "updated_at": _dt(item.updated_at),
+        "is_pull_request": item.is_pull_request,
+    }
+
+
+def changed_item_from_dict(d: dict[str, Any]) -> ChangedItem:
+    return ChangedItem(
+        repo_full_name=d["repo_full_name"],
+        number=d["number"],
+        title=d["title"],
+        url=d["url"],
+        author=d.get("author"),
+        updated_at=_require_dt(d["updated_at"]),
+        is_pull_request=d["is_pull_request"],
+    )
+
+
+def changes_to_dict(changes: Changes) -> dict[str, Any]:
+    return {
+        "since": _dt(changes.since),
+        "new_prs": [changed_item_to_dict(i) for i in changes.new_prs],
+        "new_issues": [changed_item_to_dict(i) for i in changes.new_issues],
+        "new_failed_runs": [
+            {"repo_full_name": f.repo_full_name, "run": run_to_dict(f.run)}
+            for f in changes.new_failed_runs
+        ],
+        "new_inbox": [attention_item_to_dict(i) for i in changes.new_inbox],
+        "new_notifications": [notification_to_dict(n) for n in changes.new_notifications],
+        "new_alert_repos": list(changes.new_alert_repos),
+        "total": changes.total,
+    }
+
+
+def changes_from_dict(d: dict[str, Any]) -> Changes:
+    return Changes(
+        since=_parse_dt(d.get("since")),
+        new_prs=tuple(changed_item_from_dict(i) for i in d.get("new_prs", [])),
+        new_issues=tuple(changed_item_from_dict(i) for i in d.get("new_issues", [])),
+        new_failed_runs=tuple(
+            FailedRun(f["repo_full_name"], run_from_dict(f["run"]))
+            for f in d.get("new_failed_runs", [])
+        ),
+        new_inbox=tuple(attention_item_from_dict(i) for i in d.get("new_inbox", [])),
+        new_notifications=tuple(notification_from_dict(n) for n in d.get("new_notifications", [])),
+        new_alert_repos=tuple(d.get("new_alert_repos", [])),
     )

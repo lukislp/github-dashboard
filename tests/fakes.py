@@ -14,6 +14,7 @@ from app.domain.models import (
     Mergeable,
     Notification,
     Overview,
+    Preferences,
     PullRequest,
     RateLimit,
     ReleaseInfo,
@@ -21,6 +22,7 @@ from app.domain.models import (
     ReviewDecision,
     RunStatus,
     SeverityCounts,
+    Snapshot,
     User,
     WorkflowRun,
 )
@@ -288,3 +290,21 @@ class PlainCipher:
 
     def decrypt(self, ciphertext: str) -> str:
         return ciphertext.removeprefix("enc:")
+
+
+class FakeUserState:
+    def __init__(self) -> None:
+        self.preferences: dict[int, Preferences] = {}
+        self.snapshots: dict[int, Snapshot] = {}
+
+    async def get_preferences(self, user_id: int) -> Preferences:
+        return self.preferences.get(user_id, Preferences())
+
+    async def set_preferences(self, user_id: int, prefs: Preferences) -> None:
+        self.preferences[user_id] = prefs
+
+    async def get_snapshot(self, user_id: int) -> Snapshot | None:
+        return self.snapshots.get(user_id)
+
+    async def set_snapshot(self, user_id: int, snapshot: Snapshot) -> None:
+        self.snapshots[user_id] = snapshot

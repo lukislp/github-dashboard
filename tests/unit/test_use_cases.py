@@ -6,9 +6,14 @@ from app.application.errors import AccessDenied, AuthenticationError, GitHubUnav
 from app.application.use_cases import (
     AccessPolicy,
     CompleteLogin,
+    GetChanges,
     GetOverview,
+    GetPreferences,
     Logout,
+    MarkSeen,
     ResolveSession,
+    SavePreferences,
+    validate_preferences,
 )
 from app.domain.models import (
     AttentionItem,
@@ -16,7 +21,9 @@ from app.domain.models import (
     CiState,
     Inbox,
     Notification,
+    Preferences,
     ReleaseInfo,
+    RepoGroup,
     RunStatus,
     SeverityCounts,
 )
@@ -26,6 +33,7 @@ from tests.fakes import (
     FakeCache,
     FakeOAuth,
     FakeSessions,
+    FakeUserState,
     PlainCipher,
     make_repo,
     make_run,
@@ -407,3 +415,127 @@ async def test_get_overview_propagates_authentication_error_from_notifications()
     with pytest.raises(AuthenticationError):
         await build_overview_uc(api, sessions, cache)(record)
     assert sessions.records == {}
+
+
+# -- preferences validation ---------------------------------------------------------------
+
+
+def test_validate_preferences_accepts_within_limits():
+    prefs = Preferences(
+        groups=(RepoGroup("Backend", ("octocat/a", "octocat/b")),), favorites=("octocat/a",)
+    )
+    validate_preferences(prefs)  # does not raise
+
+
+def test_validate_preferences_rejects_too_many_groups():
+    prefs = Preferences(groups=tuple(RepoGroup(f"g{i}", ()) for i in range(31)))
+    with pytest.raises(ValueError, match="30 groups"):
+        validate_preferences(prefs)
+
+
+def test_validate_preferences_rejects_empty_group_name():
+    prefs = Preferences(groups=(RepoGroup("  ", ()),))
+    with pytest.raises(ValueError, match="empty"):
+        validate_preferences(prefs)
+
+
+def test_validate_preferences_rejects_group_name_too_long():
+    prefs = Preferences(groups=(RepoGroup("x" * 41, ()),))
+    with pytest.raises(ValueError, match="too long"):
+        validate_preferences(prefs)
+
+
+def test_validate_preferences_rejects_case_insensitive_duplicate_group_name():
+    prefs = Preferences(groups=(RepoGroup("Backend", ()), RepoGroup("backend", ())))
+    with pytest.raises(ValueError, match="duplicate"):
+        validate_preferences(prefs)
+
+
+def test_validate_preferences_rejects_too_many_repos_total():
+    group = RepoGroup("g", tuple(f"octocat/r{i}" for i in range(500)))
+    prefs = Preferences(groups=(group,), favorites=("octocat/extra",))
+    with pytest.raises(ValueError, match="500 repositories"):
+        validate_preferences(prefs)
+
+
+def test_validate_preferences_rejects_malformed_repo_name():
+    prefs = Preferences(favorites=("not-a-repo-name",))
+    with pytest.raises(ValueError, match="invalid repository name"):
+        validate_preferences(prefs)
+
+
+# -- per-user state use cases --------------------------------------------------------------
+
+
+async def build_login_record():
+    oauth, sessions = FakeOAuth(), FakeSessions()
+    return await build_login(oauth, sessions)("code")
+
+
+async def test_get_preferences_defaults_to_empty():
+    record = await build_login_record()
+    prefs = await GetPreferences(user_state=FakeUserState())(record)
+    assert prefs == Preferences()
+
+
+async def test_save_preferences_persists_and_get_preferences_returns_it():
+    record = await build_login_record()
+    user_state = FakeUserState()
+    prefs = Preferences(groups=(RepoGroup("Backend", ("octocat/a",)),), favorites=("octocat/a",))
+
+    await SavePreferences(user_state=user_state)(record, prefs)
+
+    assert await GetPreferences(user_state=user_state)(record) == prefs
+
+
+async def test_save_preferences_rejects_invalid_input_without_persisting():
+    record = await build_login_record()
+    user_state = FakeUserState()
+    invalid = Preferences(favorites=("not-a-repo-name",))
+
+    with pytest.raises(ValueError):
+        await SavePreferences(user_state=user_state)(record, invalid)
+    assert user_state.preferences == {}
+
+
+async def test_mark_seen_stores_snapshot_of_overview():
+    record = await build_login_record()
+    api = FakeApi(repos=[make_repo("a", prs=1)])
+    user_state = FakeUserState()
+    result = await build_overview_uc(api, FakeSessions(), FakeCache())(record)
+
+    snapshot = await MarkSeen(user_state=user_state, clock=lambda: NOW)(record, result.overview)
+
+    assert snapshot.taken_at == NOW
+    assert await user_state.get_snapshot(record.user.id) == snapshot
+
+
+async def test_get_changes_returns_empty_before_first_mark_seen():
+    record = await build_login_record()
+    api = FakeApi(repos=[make_repo("a", prs=1)])
+    user_state = FakeUserState()
+    result = await build_overview_uc(api, FakeSessions(), FakeCache())(record)
+
+    changes = await GetChanges(user_state=user_state)(record, result.overview)
+
+    assert changes.since is None
+    assert changes.total == 0
+
+
+async def test_get_changes_reports_new_pr_after_mark_seen():
+    record = await build_login_record()
+    api = FakeApi(repos=[make_repo("a", prs=1)])
+    user_state = FakeUserState()
+    sessions, cache = FakeSessions(), FakeCache()
+    uc = build_overview_uc(api, sessions, cache)
+
+    seen_result = await uc(record)
+    await MarkSeen(user_state=user_state, clock=lambda: NOW)(record, seen_result.overview)
+
+    api.repos = [make_repo("a", prs=2)]
+    later_result = await uc(record, force_refresh=True)
+    changes = await GetChanges(user_state=user_state)(record, later_result.overview)
+
+    assert changes.since == NOW
+    assert changes.total == 1
+    assert changes.new_prs[0].number == 2
