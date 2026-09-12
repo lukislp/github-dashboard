@@ -58,6 +58,8 @@
     person: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M10.56 8.07a6 6 0 0 1 3.43 5.14.75.75 0 1 1-1.5.07 4.5 4.5 0 0 0-8.98 0 .75.75 0 0 1-1.5-.07 6 6 0 0 1 3.43-5.14 4 4 0 1 1 5.12 0ZM10.5 5a2.5 2.5 0 1 0-5 0 2.5 2.5 0 0 0 5 0Z"/></svg>',
     comment: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.75 1A1.75 1.75 0 0 0 1 2.75v7.5c0 .966.784 1.75 1.75 1.75H6v2.19c0 .34.41.51.65.27L9.31 12h3.94A1.75 1.75 0 0 0 15 10.25v-7.5A1.75 1.75 0 0 0 13.25 1Z"/></svg>',
     alert: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M6.46 1.05c.66-1.24 2.43-1.24 3.09 0l6.08 11.38A1.75 1.75 0 0 1 14.08 15H1.92a1.75 1.75 0 0 1-1.55-2.57Zm1.29 4.7v2.5a.75.75 0 0 0 1.5 0v-2.5a.75.75 0 0 0-1.5 0ZM9 11a1 1 0 1 0-2 0 1 1 0 0 0 2 0Z"/></svg>',
+    shield: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M7.467.133a1.75 1.75 0 0 1 1.066 0l5.25 1.68A1.75 1.75 0 0 1 15 3.48V7c0 1.566-.32 3.182-1.303 4.682-.983 1.498-2.585 2.813-5.032 3.855a1.7 1.7 0 0 1-1.33 0c-2.447-1.042-4.049-2.357-5.032-3.855C1.32 10.182 1 8.566 1 7V3.48a1.75 1.75 0 0 1 1.217-1.667Zm.61 1.429a.25.25 0 0 0-.153 0l-5.25 1.68a.25.25 0 0 0-.174.238V7c0 1.36.275 2.666 1.057 3.86.784 1.194 2.121 2.34 4.366 3.297a.2.2 0 0 0 .154 0c2.245-.956 3.582-2.104 4.366-3.298C13.225 9.666 13.5 8.36 13.5 7V3.48a.25.25 0 0 0-.174-.237l-5.25-1.68ZM11.28 6.28l-3.5 3.5a.75.75 0 0 1-1.06 0l-1.5-1.5a.75.75 0 0 1 1.06-1.06l.97.97 2.97-2.97a.75.75 0 0 1 1.06 1.06Z"/></svg>',
+    bell: '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 16a2 2 0 0 0 1.985-1.75c.017-.137-.097-.25-.235-.25h-3.5c-.138 0-.252.113-.235.25A2 2 0 0 0 8 16ZM8 1.5A3.5 3.5 0 0 0 4.5 5v2.947c0 .346-.102.683-.294.97l-1.703 2.556a.018.018 0 0 0-.003.01l.001.006c0 .002.002.004.004.006l.006.004.007.001h11.964l.007-.001.006-.004.004-.006.001-.007a.017.017 0 0 0-.003-.01l-1.703-2.554a1.75 1.75 0 0 1-.294-.97V5A3.5 3.5 0 0 0 8 1.5ZM3 5a5 5 0 0 1 10 0v2.947c0 .05.015.098.042.139l1.703 2.555A1.518 1.518 0 0 1 13.482 13H2.518a1.518 1.518 0 0 1-1.263-2.36l1.703-2.554A.25.25 0 0 0 3 7.947Z"/></svg>',
   };
 
   const STATE_ICON = {
@@ -90,6 +92,27 @@
     mentioned: ICONS.comment,
   };
 
+  const NOTIF_ICON = {
+    review_requested: ICONS.eye,
+    mention: ICONS.comment,
+    team_mention: ICONS.comment,
+    assign: ICONS.person,
+    author: ICONS.pencil,
+    comment: ICONS.comment,
+    subscribed: ICONS.dot,
+    state_change: ICONS.dot,
+    ci_activity: ICONS.clock,
+    security_alert: ICONS.alert,
+    manual: ICONS.dot,
+    invitation: ICONS.person,
+  };
+
+  function notifReasonLabel(reason) {
+    const key = "notif_reason_" + reason;
+    const label = t(key);
+    return label === key ? reason : label;
+  }
+
   const CI_ICON = {
     failing: ICONS.x,
     passing: ICONS.check,
@@ -106,8 +129,49 @@
     return (
       item.ci.state === "failing" ||
       item.repository.open_pr_count > 0 ||
-      item.repository.open_issue_count > 0
+      item.repository.open_issue_count > 0 ||
+      (item.security && item.security.has_critical)
     );
+  }
+
+  function severityBreakdown(counts) {
+    const parts = [];
+    if (counts.critical) parts.push(`${counts.critical} ${t("sev_critical")}`);
+    if (counts.high) parts.push(`${counts.high} ${t("sev_high")}`);
+    if (counts.moderate) parts.push(`${counts.moderate} ${t("sev_moderate")}`);
+    if (counts.low) parts.push(`${counts.low} ${t("sev_low")}`);
+    return parts.length ? parts.join(", ") : t("security_none");
+  }
+
+  function securityLines(security) {
+    const dep = security.dependabot ? severityBreakdown(security.dependabot) : t("security_unavailable");
+    const cs = security.code_scanning ? severityBreakdown(security.code_scanning) : t("security_unavailable");
+    const secrets =
+      security.secret_scanning == null
+        ? t("security_unavailable")
+        : security.secret_scanning > 0
+          ? t("security_secrets_count", { n: security.secret_scanning })
+          : t("security_none");
+    return [
+      `${t("security_dependabot")}: ${dep}`,
+      `${t("security_code_scanning")}: ${cs}`,
+      `${t("security_secrets")}: ${secrets}`,
+    ];
+  }
+
+  function alertsTone(security) {
+    if (security.has_critical) return "critical";
+    const high =
+      (security.dependabot ? security.dependabot.high : 0) +
+      (security.code_scanning ? security.code_scanning.high : 0);
+    if (high > 0) return "warning";
+    return "muted";
+  }
+
+  function alertsCellMarkup(security) {
+    const tone = alertsTone(security);
+    const title = securityLines(security).join("\n");
+    return `<span class="alert-cell alert-cell--${tone}" title="${esc(title)}">${ICONS.shield}<span class="mono">${esc(I18N.formatNumber(security.total))}</span></span>`;
   }
 
   function visiblePrs(repo) {
@@ -197,6 +261,35 @@
     let issuesSub = t("kpi_issues_sub", { repos: reposWithIssues });
     if (totals.stale_issues > 0) issuesSub += " · " + t("stale_suffix", { n: totals.stale_issues });
 
+    const securitySub = t("kpi_security_sub", {
+      critical: totals.security_critical ?? 0,
+      high: totals.security_high ?? 0,
+      secrets: totals.secret_alerts ?? 0,
+    });
+    const securityTone =
+      (totals.security_critical ?? 0) > 0 || (totals.secret_alerts ?? 0) > 0
+        ? "critical"
+        : (totals.security_high ?? 0) > 0
+          ? "warning"
+          : "good";
+
+    const unreleasedTone = (totals.repos_unreleased ?? 0) > 0 ? "warning" : "good";
+
+    const notifAvailable = d ? d.notifications_available : false;
+    let notifValue = notifAvailable ? totals.notifications_unread ?? 0 : null;
+    let notifSub;
+    if (!notifAvailable) {
+      notifSub = t("kpi_notifications_unavailable");
+    } else if (!totals.notifications_unread) {
+      notifSub = t("kpi_notifications_empty");
+    } else {
+      const reasons = Object.entries(totals.notifications_by_reason || {})
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 2)
+        .map(([reason, n]) => `${n} ${notifReasonLabel(reason)}`);
+      notifSub = reasons.join(" · ");
+    }
+
     const tiles = [
       {
         key: "repos",
@@ -229,6 +322,27 @@
         tone: totals.failed_runs > 0 ? "critical" : "good",
       },
       { key: "running", label: t("kpi_running"), value: totals.active_runs, sub: t("kpi_running_sub") },
+      {
+        key: "security",
+        label: t("kpi_security"),
+        value: totals.security_total,
+        sub: securitySub,
+        tone: securityTone,
+      },
+      {
+        key: "unreleased",
+        label: t("kpi_unreleased"),
+        value: totals.repos_unreleased,
+        sub: t("kpi_unreleased_sub", { n: totals.unreleased_commits ?? 0 }),
+        tone: unreleasedTone,
+      },
+      {
+        key: "notifications",
+        label: t("kpi_notifications"),
+        value: notifValue,
+        sub: notifSub,
+        tone: notifAvailable && totals.notifications_unread > 0 ? "accent" : null,
+      },
     ];
 
     els.kpis.innerHTML = tiles
@@ -236,7 +350,7 @@
         (tile) => `
         <div class="kpi ${tile.tone && !loading ? "kpi--" + tile.tone : ""} ${loading ? "is-loading" : ""}">
           <p class="kpi__label">${esc(tile.label)}</p>
-          <p class="kpi__value">${loading ? "—" : esc(I18N.formatNumber(tile.value ?? 0))}</p>
+          <p class="kpi__value">${loading || tile.value == null ? "—" : esc(I18N.formatNumber(tile.value))}</p>
           <p class="kpi__sub">${loading ? "" : esc(tile.sub)}</p>
         </div>`
       )
@@ -277,6 +391,20 @@
     </li>`;
   }
 
+  function notificationItemMarkup(n) {
+    const label = notifReasonLabel(n.reason);
+    const icon = NOTIF_ICON[n.reason] || ICONS.dot;
+    const titleLink = n.subject_url
+      ? `<a class="inbox-item__title" href="${esc(n.subject_url)}" target="_blank" rel="noopener" title="${esc(n.subject_title)}">${esc(n.subject_title)}</a>`
+      : `<span class="inbox-item__title" title="${esc(n.subject_title)}">${esc(n.subject_title)}</span>`;
+    return `<li class="inbox-item">
+      <span class="inbox-item__kind">${icon}${esc(label)}</span>
+      <span class="inbox-item__repo mono">${esc(n.repo_full_name)}</span>
+      ${titleLink}
+      <span class="inbox-item__time" title="${esc(I18N.formatDateTime(n.updated_at))}">${esc(I18N.formatRelative(n.updated_at))}</span>
+    </li>`;
+  }
+
   function renderInbox() {
     const d = state.data;
     if (!d) {
@@ -284,26 +412,45 @@
       return;
     }
     const inbox = d.inbox;
-    if (!inbox || inbox.total === 0) {
+    const notifAvailable = d.notifications_available;
+    const notifUnread = d.totals.notifications_unread ?? 0;
+    const nothingWaiting = (!inbox || inbox.total === 0) && (!notifAvailable || notifUnread === 0);
+    if (nothingWaiting) {
       els.inbox.innerHTML = `<p class="inbox-empty">${ICONS.check}${esc(t("inbox_empty"))}</p>`;
       return;
     }
 
-    const tiles = INBOX_KINDS.map((kind) => {
-      const count = (inbox[kind] || []).length;
-      const active = state.inboxFilter === kind;
-      return `<button type="button" class="inbox-tile ${active ? "is-active" : ""}" data-kind="${kind}" aria-pressed="${active}">
+    const tiles =
+      INBOX_KINDS.map((kind) => {
+        const count = (inbox[kind] || []).length;
+        const active = state.inboxFilter === kind;
+        return `<button type="button" class="inbox-tile ${active ? "is-active" : ""}" data-kind="${kind}" aria-pressed="${active}">
         <span class="inbox-tile__label">${INBOX_ICON[kind] || ""}${esc(t("inbox_" + kind))}</span>
         <span class="inbox-tile__value">${esc(I18N.formatNumber(count))}</span>
       </button>`;
-    }).join("");
+      }).join("") +
+      (() => {
+        const active = state.inboxFilter === "notifications";
+        const value = notifAvailable ? esc(I18N.formatNumber(notifUnread)) : "—";
+        const titleAttr = notifAvailable ? "" : ` title="${esc(t("notifications_scope_missing"))}"`;
+        return `<button type="button" class="inbox-tile ${active ? "is-active" : ""}" data-kind="notifications" aria-pressed="${active}"${titleAttr}>
+        <span class="inbox-tile__label">${ICONS.bell}${esc(t("inbox_notifications"))}</span>
+        <span class="inbox-tile__value">${value}</span>
+      </button>`;
+      })();
 
-    const items = state.inboxFilter
-      ? inbox[state.inboxFilter] || []
-      : inboxItems(inbox);
-    const list = items.length
-      ? items.map(inboxItemMarkup).join("")
-      : `<li class="inbox-empty-row">${esc(t("inbox_empty_list"))}</li>`;
+    let list;
+    if (state.inboxFilter === "notifications") {
+      const items = notifAvailable ? d.notifications.filter((n) => n.unread) : [];
+      list = items.length
+        ? items.map(notificationItemMarkup).join("")
+        : `<li class="inbox-empty-row">${esc(notifAvailable ? t("inbox_empty_list") : t("notifications_scope_missing"))}</li>`;
+    } else {
+      const items = state.inboxFilter ? inbox[state.inboxFilter] || [] : inboxItems(inbox);
+      list = items.length
+        ? items.map(inboxItemMarkup).join("")
+        : `<li class="inbox-empty-row">${esc(t("inbox_empty_list"))}</li>`;
+    }
 
     els.inbox.innerHTML = `
       <div class="section-head">
@@ -346,6 +493,7 @@
       name: (a, b) => a.repository.full_name.localeCompare(b.repository.full_name),
       prs: (a, b) => a.repository.open_pr_count - b.repository.open_pr_count,
       issues: (a, b) => a.repository.open_issue_count - b.repository.open_issue_count,
+      alerts: (a, b) => (a.security.total || 0) - (b.security.total || 0),
       ci: (a, b) => CI_RANK[a.ci.state] - CI_RANK[b.ci.state],
       pushed: (a, b) => Date.parse(a.repository.pushed_at || 0) - Date.parse(b.repository.pushed_at || 0),
     };
@@ -367,6 +515,14 @@
       ? `<span class="lang"><span class="lang__dot" data-color="${esc(repo.language_color || "")}"></span>${esc(repo.language)}</span>`
       : "";
     const stars = repo.stars ? `<span class="mono">★ ${esc(I18N.formatNumber(repo.stars))}</span>` : "";
+    const unreleasedCommits = item.release ? item.release.unreleased_commits : null;
+    const unreleasedBadge =
+      unreleasedCommits > 0
+        ? `<span class="badge" title="${esc(t("badge_unreleased_title", { n: unreleasedCommits }))}">${esc(t("badge_unreleased", { n: unreleasedCommits }))}</span>`
+        : "";
+    const alertsCell = repo.is_archived
+      ? `<span class="num is-zero">–</span>`
+      : alertsCellMarkup(item.security);
     const longRunning = ci.long_running_count > 0;
     const ciLabel = longRunning
       ? t("ci_running_slow")
@@ -392,10 +548,11 @@
             <a class="repo-name__name" href="${esc(repo.url)}" target="_blank" rel="noopener" data-stop>${esc(repo.name)}</a>
             ${badges.join("")}
           </div>
-          <div class="repo-meta">${lang}${stars}</div>
+          <div class="repo-meta">${lang}${stars}${unreleasedBadge}</div>
         </td>
         <td class="col-num"><span class="num-cell"><span class="num ${prCount ? "is-hot" : "is-zero"}">${prCount}</span>${dots}</span></td>
         <td class="col-num"><span class="num ${repo.open_issue_count ? "is-hot" : "is-zero"}">${repo.open_issue_count}</span></td>
+        <td class="col-alerts">${alertsCell}</td>
         <td class="col-ci">
           <div class="ci ci--${esc(ci.state)}">
             ${ci.state === "skipped" ? "" : runsMarkup(ci.runs, runsPerRepo)}
@@ -469,13 +626,37 @@
         `<a class="more" href="${esc(repo.url)}/actions" target="_blank" rel="noopener">${esc(t("open_on_github"))}</a>`
       : `<p class="empty">${esc(t("ci_" + ci.state))}</p>`;
 
+    const release = item.release;
+    const releaseList = release
+      ? (() => {
+          const tagLink = `<a class="title mono" href="${esc(release.url)}" target="_blank" rel="noopener">${esc(release.tag)}</a>`;
+          const prerelease = release.is_prerelease ? `<span class="tag">${esc(t("prerelease_tag"))}</span>` : "";
+          const time = `<span class="by" title="${esc(I18N.formatDateTime(release.published_at))}">${esc(I18N.formatRelative(release.published_at))}</span>`;
+          let unreleased;
+          if (release.unreleased_commits == null) {
+            unreleased = `<span class="state-chip state-chip--neutral">${ICONS.dash}${esc(t("unreleased_unknown"))}</span>`;
+          } else if (release.unreleased_commits > 0) {
+            unreleased = `<span class="state-chip state-chip--warning">${ICONS.clock}${esc(t("unreleased_commits", { n: release.unreleased_commits }))}</span>`;
+          } else {
+            unreleased = `<span class="state-chip state-chip--good">${ICONS.check}${esc(t("unreleased_none"))}</span>`;
+          }
+          return `<ul><li>${tagLink}${prerelease}${time}</li><li>${unreleased}</li></ul>`;
+        })()
+      : `<p class="empty">${esc(t("release_none"))}</p>`;
+
+    const securityList = `<ul>${securityLines(item.security)
+      .map((line) => `<li>${esc(line)}</li>`)
+      .join("")}</ul><a class="more" href="${esc(repo.url)}/security" target="_blank" rel="noopener">${esc(t("security_open_link"))}</a>`;
+
     return `
       <tr class="detail-row" data-detail="${esc(repo.full_name)}">
-        <td colspan="6">
+        <td colspan="7">
           <div class="details">
             <div><h4>${esc(t("details_prs"))} · ${prCount}</h4>${prList}</div>
             <div><h4>${esc(t("details_issues"))} · ${repo.open_issue_count}</h4>${issueList}</div>
             <div><h4>${esc(t("details_runs"))}</h4>${runList}</div>
+            <div><h4>${esc(t("details_release"))}</h4>${releaseList}</div>
+            <div><h4>${esc(t("details_security"))}</h4>${securityList}</div>
           </div>
         </td>
       </tr>`;
@@ -484,7 +665,7 @@
   function renderTable() {
     const d = state.data;
     if (!d) {
-      els.rows.innerHTML = `<tr><td colspan="6" class="table-empty">${esc(t("loading"))}</td></tr>`;
+      els.rows.innerHTML = `<tr><td colspan="7" class="table-empty">${esc(t("loading"))}</td></tr>`;
       els.count.textContent = "";
       return;
     }
@@ -492,7 +673,7 @@
     els.count.textContent = t("repo_count", { shown: items.length, total: d.repos.length });
     els.rows.innerHTML = items.length
       ? items.map(repoRow).join("")
-      : `<tr><td colspan="6" class="table-empty">${esc(t("empty_table"))}</td></tr>`;
+      : `<tr><td colspan="7" class="table-empty">${esc(t("empty_table"))}</td></tr>`;
 
     // Language colours come from GitHub; set them via CSSOM because the CSP forbids inline styles.
     els.rows.querySelectorAll(".lang__dot[data-color]").forEach((dot) => {
