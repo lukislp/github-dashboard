@@ -6,7 +6,9 @@ from datetime import UTC, datetime, timedelta
 
 from app.application.errors import ActionsUnavailable, AuthenticationError
 from app.application.ports import RepositoryPage, SessionRecord
+from app.domain.hygiene import HYGIENE_KEYS, HygieneCheck, RepoHygiene
 from app.domain.models import (
+    Branch,
     ChecksState,
     Inbox,
     Issue,
@@ -63,6 +65,21 @@ def make_pr(
     )
 
 
+def make_branch(
+    name: str,
+    *,
+    last_commit_at: datetime | None = NOW,
+    author: str | None = "someone",
+) -> Branch:
+    return Branch(name=name, last_commit_at=last_commit_at, author=author)
+
+
+def make_hygiene(*, failing: tuple[str, ...] = (), applicable: bool = True) -> RepoHygiene:
+    """A RepoHygiene with all nine checks passing, except the given failing keys."""
+    checks = tuple(HygieneCheck(key, key not in failing) for key in HYGIENE_KEYS)
+    return RepoHygiene(checks, applicable=applicable)
+
+
 def make_repo(
     name: str,
     *,
@@ -78,6 +95,8 @@ def make_repo(
     pr_updated_at: datetime = NOW,
     issue_updated_at: datetime = NOW,
     last_commit: LastCommit | None = None,
+    branches: tuple[Branch, ...] = (),
+    branch_count: int | None = None,
 ) -> Repository:
     return Repository(
         full_name=f"{owner}/{name}",
@@ -110,6 +129,8 @@ def make_repo(
             for i in range(1, issues + 1)
         ),
         last_commit=last_commit,
+        branch_count=branch_count if branch_count is not None else len(branches) + 1,
+        branches_without_pr=branches,
     )
 
 
@@ -172,6 +193,7 @@ class FakeApi:
         inbox: Inbox | None = None,
         dependabot_by_repo: dict[str, tuple[SeverityCounts | None, int | None]] | None = None,
         release_by_repo: dict[str, ReleaseInfo | None] | None = None,
+        hygiene_by_repo: dict[str, RepoHygiene] | None = None,
         security: dict[str, tuple[SeverityCounts | None, int | None]] | None = None,
         commits_since: dict[str, int | None] | None = None,
         notifications: list[Notification] | None = None,
@@ -182,6 +204,7 @@ class FakeApi:
         self.inbox = inbox if inbox is not None else Inbox((), (), (), ())
         self.dependabot_by_repo = dependabot_by_repo or {}
         self.release_by_repo = release_by_repo or {}
+        self.hygiene_by_repo = hygiene_by_repo or {}
         self.security = security or {}
         self.commits_since = commits_since or {}
         # None means the `notifications` scope is missing, matching the real port method.
@@ -208,6 +231,7 @@ class FakeApi:
             self.rate_limit,
             dict(self.dependabot_by_repo),
             dict(self.release_by_repo),
+            dict(self.hygiene_by_repo),
         )
 
     async def list_recent_runs(

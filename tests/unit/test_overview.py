@@ -1,6 +1,7 @@
 import dataclasses
 from datetime import timedelta
 
+from app.domain.hygiene import HYGIENE_KEYS
 from app.domain.models import (
     AttentionItem,
     AttentionKind,
@@ -16,7 +17,7 @@ from app.domain.models import (
     SeverityCounts,
 )
 from app.domain.overview import build_overview, classify_ci, skipped_ci
-from tests.fakes import NOW, make_pr, make_repo, make_run
+from tests.fakes import NOW, make_branch, make_hygiene, make_pr, make_repo, make_run
 
 
 def test_no_runs_is_none():
@@ -342,3 +343,124 @@ def test_notifications_default_to_empty_and_unavailable():
     assert overview.notifications_available is False
     assert overview.totals.notifications_unread == 0
     assert overview.totals.notifications_by_reason == {}
+
+
+# -- hygiene --------------------------------------------------------------------------------
+
+
+def test_repo_without_hygiene_facts_defaults_to_not_applicable_and_full_score():
+    overview = build_overview(
+        viewer_login="x", repositories=[make_repo("a")], ci_by_repo={}, rate_limit=None, now=NOW
+    )
+    hygiene = overview.repos[0].hygiene
+    assert hygiene.applicable is False
+    assert hygiene.total == 0
+    assert hygiene.score == 100
+    assert overview.totals.hygiene_average == 100
+
+
+def test_hygiene_average_ignores_non_applicable_repos():
+    repo_a = make_repo("a")
+    repo_b = make_repo("b", archived=True)
+    hygiene_by_repo = {
+        "octocat/a": make_hygiene(failing=("codeowners",)),  # score 89, applicable
+        "octocat/b": make_hygiene(failing=("readme", "license"), applicable=False),  # ignored
+    }
+    overview = build_overview(
+        viewer_login="x",
+        repositories=[repo_a, repo_b],
+        ci_by_repo={},
+        rate_limit=None,
+        now=NOW,
+        hygiene_by_repo=hygiene_by_repo,
+    )
+    by_name = {r.repository.name: r for r in overview.repos}
+    assert by_name["a"].hygiene.score == 89
+    assert by_name["b"].hygiene.score == 100  # not applicable, greyed out
+    assert overview.totals.hygiene_average == 89
+
+
+def test_hygiene_average_defaults_to_100_when_no_applicable_repos():
+    hygiene_by_repo = {"octocat/a": make_hygiene(applicable=False)}
+    overview = build_overview(
+        viewer_login="x",
+        repositories=[make_repo("a")],
+        ci_by_repo={},
+        rate_limit=None,
+        now=NOW,
+        hygiene_by_repo=hygiene_by_repo,
+    )
+    assert overview.totals.hygiene_average == 100
+
+
+def test_totals_count_repos_missing_each_hygiene_check():
+    repo_a = make_repo("a")
+    repo_b = make_repo("b")
+    hygiene_by_repo = {
+        "octocat/a": make_hygiene(failing=("ci_workflow", "license")),
+        "octocat/b": make_hygiene(failing=("branch_protection", "dependency_updates")),
+    }
+    overview = build_overview(
+        viewer_login="x",
+        repositories=[repo_a, repo_b],
+        ci_by_repo={},
+        rate_limit=None,
+        now=NOW,
+        hygiene_by_repo=hygiene_by_repo,
+    )
+    totals = overview.totals
+    assert totals.repos_without_ci == 1
+    assert totals.repos_without_license == 1
+    assert totals.repos_without_protection == 1
+    assert totals.repos_without_dependency_updates == 1
+
+
+def test_hygiene_missing_checks_do_not_count_non_applicable_repos():
+    hygiene_by_repo = {"octocat/a": make_hygiene(failing=HYGIENE_KEYS, applicable=False)}
+    overview = build_overview(
+        viewer_login="x",
+        repositories=[make_repo("a", archived=True)],
+        ci_by_repo={},
+        rate_limit=None,
+        now=NOW,
+        hygiene_by_repo=hygiene_by_repo,
+    )
+    totals = overview.totals
+    assert totals.repos_without_ci == 0
+    assert totals.repos_without_license == 0
+    assert totals.repos_without_protection == 0
+    assert totals.repos_without_dependency_updates == 0
+
+
+# -- branches without a pull request ---------------------------------------------------------
+
+
+def test_branches_without_pr_are_marked_stale_by_last_commit_age():
+    fresh = make_branch("feature-fresh", last_commit_at=NOW)
+    old = make_branch("feature-old", last_commit_at=NOW - timedelta(days=20))
+    unknown = make_branch("feature-unknown", last_commit_at=None)
+    repo = make_repo("a", branches=(old, fresh, unknown))
+
+    overview = build_overview(
+        viewer_login="x",
+        repositories=[repo],
+        ci_by_repo={},
+        rate_limit=None,
+        now=NOW,
+        stale_after=timedelta(days=14),
+    )
+
+    branches_by_name = {b.name: b for b in overview.repos[0].repository.branches_without_pr}
+    assert branches_by_name["feature-old"].stale is True
+    assert branches_by_name["feature-fresh"].stale is False
+    assert branches_by_name["feature-unknown"].stale is False
+    assert overview.totals.branches_without_pr == 3
+    assert overview.totals.stale_branches == 1
+
+
+def test_totals_branches_without_pr_and_stale_branches_default_to_zero():
+    overview = build_overview(
+        viewer_login="x", repositories=[make_repo("a")], ci_by_repo={}, rate_limit=None, now=NOW
+    )
+    assert overview.totals.branches_without_pr == 0
+    assert overview.totals.stale_branches == 0

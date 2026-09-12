@@ -290,6 +290,192 @@ async def test_latest_release_is_none_when_repository_has_no_release(client):
 
 
 @respx.mock
+async def test_hygiene_facts_are_mapped_from_repo_node(client):
+    node = repo_node("a")
+    node["licenseInfo"] = {"spdxId": "MIT", "name": "MIT License"}
+    node["hasVulnerabilityAlertsEnabled"] = True
+    node["deleteBranchOnMerge"] = True
+    node["branchProtectionRules"] = {"totalCount": 1}
+    node["rulesets"] = {"totalCount": 0}
+    node["workflowsDir"] = {"entries": [{"name": "ci.yml"}, {"name": "README"}]}
+    node["dependabotYml"] = {"id": "1"}
+    node["dependabotYaml"] = None
+    node["renovateJson"] = None
+    node["renovateJsonGithub"] = None
+    node["renovaterc"] = None
+    node["readmeFile"] = {"id": "2"}
+    node["securityMd"] = {"id": "3"}
+    node["securityMdGithub"] = None
+    node["codeownersFile"] = None
+    node["codeownersFileGithub"] = {"id": "4"}
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=graphql_page([node], has_next=False, cursor=None))
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    hygiene = page.hygiene_by_repo["octocat/a"]
+    assert hygiene.applicable is True
+    assert hygiene.total == 9
+    assert hygiene.passed == 9
+    assert hygiene.failing_keys == ()
+
+
+@respx.mock
+async def test_hygiene_facts_default_to_failing_when_files_are_missing(client):
+    node = repo_node("a")
+    node["licenseInfo"] = None
+    node["hasVulnerabilityAlertsEnabled"] = False
+    node["deleteBranchOnMerge"] = False
+    node["branchProtectionRules"] = {"totalCount": 0}
+    node["rulesets"] = {"totalCount": 0}
+    node["workflowsDir"] = None
+    node["dependabotYml"] = None
+    node["dependabotYaml"] = None
+    node["renovateJson"] = None
+    node["renovateJsonGithub"] = None
+    node["renovaterc"] = None
+    node["readmeFile"] = None
+    node["securityMd"] = None
+    node["securityMdGithub"] = None
+    node["codeownersFile"] = None
+    node["codeownersFileGithub"] = None
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=graphql_page([node], has_next=False, cursor=None))
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    hygiene = page.hygiene_by_repo["octocat/a"]
+    assert hygiene.passed == 0
+    assert hygiene.total == 9
+
+
+@respx.mock
+async def test_hygiene_ruleset_partial_error_is_treated_as_zero(client):
+    node = repo_node("a")
+    node["branchProtectionRules"] = {"totalCount": 0}
+    node["rulesets"] = None  # nulled out by a partial GraphQL error for this token/plan
+    payload = graphql_page([node], has_next=False, cursor=None)
+    payload["errors"] = [
+        {
+            "type": "FORBIDDEN",
+            "message": "Resource not accessible",
+            "path": ["viewer", "repositories", "nodes", 0, "rulesets"],
+        }
+    ]
+    respx.post(f"{API}/graphql").mock(return_value=httpx.Response(200, json=payload))
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    hygiene = page.hygiene_by_repo["octocat/a"]
+    assert "branch_protection" in hygiene.failing_keys
+
+
+@respx.mock
+async def test_hygiene_workflow_file_count_ignores_non_yaml_entries(client):
+    node = repo_node("a")
+    node["workflowsDir"] = {
+        "entries": [{"name": "ci.yml"}, {"name": "release.yaml"}, {"name": "README.md"}]
+    }
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=graphql_page([node], has_next=False, cursor=None))
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    hygiene = page.hygiene_by_repo["octocat/a"]
+    assert "ci_workflow" not in hygiene.failing_keys
+
+
+@respx.mock
+async def test_hygiene_not_applicable_for_archived_and_forked_repos(client):
+    node = repo_node("a")
+    node["isArchived"] = True
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=graphql_page([node], has_next=False, cursor=None))
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    assert page.hygiene_by_repo["octocat/a"].applicable is False
+
+
+@respx.mock
+async def test_branches_without_pr_excludes_default_branch_and_branches_with_prs(client):
+    node = repo_node("a")
+    node["refs"] = {
+        "totalCount": 3,
+        "nodes": [
+            {
+                "name": "main",
+                "target": {"committedDate": "2026-09-01T10:00:00Z", "author": {}},
+                "associatedPullRequests": {"totalCount": 0},
+            },
+            {
+                "name": "has-pr",
+                "target": {"committedDate": "2026-09-01T10:00:00Z", "author": {}},
+                "associatedPullRequests": {"totalCount": 1},
+            },
+            {
+                "name": "orphan",
+                "target": {
+                    "committedDate": "2026-08-01T10:00:00Z",
+                    "author": {"name": "Ada", "user": {"login": "ada"}},
+                },
+                "associatedPullRequests": {"totalCount": 0},
+            },
+        ],
+    }
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=graphql_page([node], has_next=False, cursor=None))
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    repo = page.repositories[0]
+    assert repo.branch_count == 3
+    assert [b.name for b in repo.branches_without_pr] == ["orphan"]
+    assert repo.branches_without_pr[0].author == "ada"
+    assert repo.branches_without_pr[0].last_commit_at is not None
+
+
+@respx.mock
+async def test_branches_without_pr_are_sorted_oldest_commit_first(client):
+    node = repo_node("a")
+
+    def ref(name: str, date: str) -> dict:
+        return {
+            "name": name,
+            "target": {"committedDate": date, "author": {"name": "x", "user": None}},
+            "associatedPullRequests": {"totalCount": 0},
+        }
+
+    node["refs"] = {
+        "totalCount": 3,
+        "nodes": [
+            ref("newer", "2026-09-05T10:00:00Z"),
+            ref("oldest", "2026-08-01T10:00:00Z"),
+            ref("middle", "2026-08-20T10:00:00Z"),
+        ],
+    }
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=graphql_page([node], has_next=False, cursor=None))
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    names = [b.name for b in page.repositories[0].branches_without_pr]
+    assert names == ["oldest", "middle", "newer"]
+
+
+@respx.mock
+async def test_branches_without_pr_defaults_to_empty_when_refs_missing(client):
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(
+            200, json=graphql_page([repo_node("a")], has_next=False, cursor=None)
+        )
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    assert page.repositories[0].branches_without_pr == ()
+    assert page.repositories[0].branch_count == 0
+
+
+@respx.mock
 async def test_fetch_security_combines_code_and_secret_scanning(client):
     respx.get(f"{API}/repos/octocat/a/code-scanning/alerts").mock(
         return_value=httpx.Response(

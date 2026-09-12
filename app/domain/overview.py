@@ -6,6 +6,7 @@ import dataclasses
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
 
+from app.domain.hygiene import RepoHygiene
 from app.domain.models import (
     CiState,
     FailedRun,
@@ -26,6 +27,7 @@ from app.domain.pull_requests import PrState, pr_state
 
 _EMPTY_INBOX = Inbox((), (), (), ())
 _EMPTY_SECURITY = RepoSecurity(None, None, None, None)
+_EMPTY_HYGIENE = RepoHygiene((), applicable=False)
 DEFAULT_STALE_AFTER = timedelta(days=14)
 DEFAULT_LONG_RUN_AFTER = timedelta(minutes=30)
 
@@ -67,7 +69,7 @@ def skipped_ci(reason: str) -> RepoCi:
 
 
 def _mark_stale(repo: Repository, *, now: datetime, stale_after: timedelta) -> Repository:
-    """Attach the derived 'stale' flag to a repository's pull requests and issues."""
+    """Attach the derived 'stale' flag to a repository's pull requests, issues and branches."""
     prs = tuple(
         dataclasses.replace(p, stale=(now - p.updated_at) >= stale_after)
         for p in repo.pull_requests
@@ -75,7 +77,13 @@ def _mark_stale(repo: Repository, *, now: datetime, stale_after: timedelta) -> R
     issues = tuple(
         dataclasses.replace(i, stale=(now - i.updated_at) >= stale_after) for i in repo.issues
     )
-    return dataclasses.replace(repo, pull_requests=prs, issues=issues)
+    branches = tuple(
+        dataclasses.replace(
+            b, stale=b.last_commit_at is not None and (now - b.last_commit_at) >= stale_after
+        )
+        for b in repo.branches_without_pr
+    )
+    return dataclasses.replace(repo, pull_requests=prs, issues=issues, branches_without_pr=branches)
 
 
 def _mark_long_running(ci: RepoCi, *, now: datetime, long_run_after: timedelta) -> RepoCi:
@@ -100,6 +108,7 @@ def build_overview(
     long_run_after: timedelta = DEFAULT_LONG_RUN_AFTER,
     security_by_repo: Mapping[str, RepoSecurity] | None = None,
     release_by_repo: Mapping[str, ReleaseInfo | None] | None = None,
+    hygiene_by_repo: Mapping[str, RepoHygiene] | None = None,
     notifications: tuple[Notification, ...] = (),
     notifications_available: bool = False,
 ) -> Overview:
@@ -107,6 +116,7 @@ def build_overview(
     failures: list[FailedRun] = []
     security_by_repo = security_by_repo or {}
     release_by_repo = release_by_repo or {}
+    hygiene_by_repo = hygiene_by_repo or {}
 
     for repo in repositories:
         repo = _mark_stale(repo, now=now, stale_after=stale_after)
@@ -114,7 +124,8 @@ def build_overview(
         ci = _mark_long_running(ci, now=now, long_run_after=long_run_after)
         security = security_by_repo.get(repo.full_name) or _EMPTY_SECURITY
         release = release_by_repo.get(repo.full_name)
-        repos.append(RepoOverview(repo, ci, security, release))
+        hygiene = hygiene_by_repo.get(repo.full_name) or _EMPTY_HYGIENE
+        repos.append(RepoOverview(repo, ci, security, release, hygiene))
         failures.extend(FailedRun(repo.full_name, run) for run in ci.runs if run.failed)
 
     repos.sort(key=_repo_sort_key)
@@ -170,6 +181,13 @@ def build_overview(
         unreleased_commits=sum(r.release.unreleased_commits or 0 for r in repos if r.release),
         notifications_unread=sum(1 for n in notifications if n.unread),
         notifications_by_reason=_group_by_reason(notifications),
+        hygiene_average=_hygiene_average(repos),
+        repos_without_ci=_repos_missing_check(repos, "ci_workflow"),
+        repos_without_protection=_repos_missing_check(repos, "branch_protection"),
+        repos_without_dependency_updates=_repos_missing_check(repos, "dependency_updates"),
+        repos_without_license=_repos_missing_check(repos, "license"),
+        branches_without_pr=sum(len(r.repository.branches_without_pr) for r in repos),
+        stale_branches=sum(1 for r in repos for b in r.repository.branches_without_pr if b.stale),
     )
     return Overview(
         viewer_login=viewer_login,
@@ -182,6 +200,19 @@ def build_overview(
         notifications=notifications,
         notifications_available=notifications_available,
     )
+
+
+def _hygiene_average(repos: list[RepoOverview]) -> int:
+    """Mean hygiene score over repositories the checks apply to. 100 when there are none."""
+    scores = [r.hygiene.score for r in repos if r.hygiene.applicable]
+    if not scores:
+        return 100
+    return round(sum(scores) / len(scores))
+
+
+def _repos_missing_check(repos: list[RepoOverview], key: str) -> int:
+    """Count repositories (the checks apply to) that fail the given hygiene check."""
+    return sum(1 for r in repos if r.hygiene.applicable and key in r.hygiene.failing_keys)
 
 
 def _group_by_reason(notifications: Iterable[Notification]) -> dict[str, int]:

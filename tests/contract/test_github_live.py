@@ -20,6 +20,23 @@ async def test_live_repositories_and_runs():
         assert page.rate_limit is not None
 
         candidate = next(r for r in page.repositories if not r.is_archived)
+
+        # Hygiene facts are always computed by the adapter; a non-archived, non-fork
+        # repository always has all nine checks evaluated and is marked applicable.
+        applicable_candidate = next(
+            r for r in page.repositories if not r.is_archived and not r.is_fork
+        )
+        hygiene = page.hygiene_by_repo[applicable_candidate.full_name]
+        assert hygiene.applicable is True
+        assert hygiene.total == 9
+        assert 0 <= hygiene.score <= 100
+
+        # Branches without a pull request: sanity-check the shape only, since the actual
+        # counts depend on the state of whatever repositories the token can see.
+        assert candidate.branch_count >= 0
+        for branch in candidate.branches_without_pr:
+            assert branch.name != candidate.default_branch
+
         try:
             runs = await api.list_recent_runs(token, candidate.owner, candidate.name, 5)
         except ActionsUnavailable:

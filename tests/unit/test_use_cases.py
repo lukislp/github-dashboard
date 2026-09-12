@@ -15,6 +15,7 @@ from app.application.use_cases import (
     SavePreferences,
     validate_preferences,
 )
+from app.domain.hygiene import RepoHygiene
 from app.domain.models import (
     AttentionItem,
     AttentionKind,
@@ -35,6 +36,7 @@ from tests.fakes import (
     FakeSessions,
     FakeUserState,
     PlainCipher,
+    make_hygiene,
     make_repo,
     make_run,
 )
@@ -359,6 +361,39 @@ async def test_get_overview_degrades_unreleased_commits_to_none_on_error():
     result = await build_overview_uc(api, sessions, cache)(record)
 
     assert result.overview.repos[0].release.unreleased_commits is None
+
+
+async def test_get_overview_includes_hygiene_from_api_by_default():
+    hygiene = make_hygiene(failing=("readme",))
+    api = FakeApi(repos=[make_repo("a")], hygiene_by_repo={"octocat/a": hygiene})
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.repos[0].hygiene == hygiene
+
+
+async def test_get_overview_ignores_hygiene_when_disabled():
+    hygiene = make_hygiene(failing=("readme",))
+    api = FakeApi(repos=[make_repo("a")], hygiene_by_repo={"octocat/a": hygiene})
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = GetOverview(
+        api=api,
+        sessions=sessions,
+        cipher=PlainCipher(),
+        cache=cache,
+        cache_ttl_seconds=60,
+        runs_per_repo=5,
+        max_concurrency=2,
+        hygiene_checks=False,
+        clock=clock,
+    )
+
+    result = await uc(record)
+
+    assert result.overview.repos[0].hygiene == RepoHygiene((), applicable=False)
 
 
 async def test_get_overview_includes_notifications_when_available():

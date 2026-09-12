@@ -11,6 +11,7 @@ from app.domain.codec import (
     snapshot_from_dict,
     snapshot_to_dict,
 )
+from app.domain.hygiene import HygieneCheck, RepoHygiene
 from app.domain.models import (
     AttentionItem,
     AttentionKind,
@@ -34,7 +35,7 @@ from app.domain.models import (
 )
 from app.domain.overview import build_overview, classify_ci
 from app.domain.pull_requests import PrState
-from tests.fakes import NOW, make_pr, make_repo, make_run
+from tests.fakes import NOW, make_branch, make_hygiene, make_pr, make_repo, make_run
 
 
 def test_overview_roundtrip_through_json():
@@ -53,7 +54,8 @@ def test_overview_roundtrip_through_json():
         committed_at=NOW,
         url="https://github.com/octocat/a/commit/abc123",
     )
-    repo_a = make_repo("a", prs=0, issues=2, last_commit=last_commit)
+    branch = make_branch("feature-old", last_commit_at=NOW, author="ada")
+    repo_a = make_repo("a", prs=0, issues=2, last_commit=last_commit, branches=(branch,))
     repo_a = dataclasses.replace(repo_a, pull_requests=(pr,), open_pr_count=1)
     repos = [repo_a, make_repo("b", archived=True)]
     ci = {
@@ -111,6 +113,10 @@ def test_overview_roundtrip_through_json():
             unread=True,
         ),
     )
+    hygiene_by_repo = {
+        "octocat/a": make_hygiene(failing=("codeowners", "security_policy")),
+        "octocat/b": make_hygiene(applicable=False),
+    }
     original = build_overview(
         viewer_login="octocat",
         repositories=repos,
@@ -120,6 +126,7 @@ def test_overview_roundtrip_through_json():
         inbox=inbox,
         security_by_repo=security_by_repo,
         release_by_repo=release_by_repo,
+        hygiene_by_repo=hygiene_by_repo,
         notifications=notifications,
         notifications_available=True,
     )
@@ -269,6 +276,100 @@ def test_repo_security_missing_from_payload_defaults_to_fully_unavailable():
     ).repos[0]
     assert repo.security == RepoSecurity(None, None, None, None)
     assert repo.release is None
+
+
+def test_hygiene_dict_exposes_score_and_round_trips():
+    hygiene_by_repo = {"octocat/a": make_hygiene(failing=("readme", "license"))}
+    payload = overview_to_dict(
+        build_overview(
+            viewer_login="o",
+            repositories=[make_repo("a")],
+            ci_by_repo={},
+            rate_limit=None,
+            now=NOW,
+            hygiene_by_repo=hygiene_by_repo,
+        )
+    )
+    hygiene = payload["repos"][0]["hygiene"]
+    assert hygiene["total"] == 9
+    assert hygiene["passed"] == 7
+    assert hygiene["applicable"] is True
+    assert hygiene["score"] == 78  # round(100 * 7 / 9)
+    assert {c["key"] for c in hygiene["checks"] if not c["ok"]} == {"readme", "license"}
+
+    restored = overview_from_dict(json.loads(json.dumps(payload)))
+    assert restored.repos[0].hygiene == RepoHygiene(
+        checks=tuple(HygieneCheck(c["key"], c["ok"], c["detail"]) for c in hygiene["checks"]),
+        applicable=True,
+    )
+
+
+def test_hygiene_missing_from_payload_defaults_to_not_applicable():
+    repo = overview_from_dict(
+        {
+            "viewer_login": "o",
+            "generated_at": NOW.isoformat(),
+            "totals": dataclasses.asdict(
+                build_overview(
+                    viewer_login="o",
+                    repositories=[make_repo("a")],
+                    ci_by_repo={},
+                    rate_limit=None,
+                    now=NOW,
+                ).totals
+            ),
+            "repos": [
+                {
+                    "repository": {
+                        "full_name": "octocat/a",
+                        "name": "a",
+                        "owner": "octocat",
+                        "url": "u",
+                        "description": None,
+                        "is_private": False,
+                        "is_archived": False,
+                        "is_fork": False,
+                        "has_issues": True,
+                        "stars": 0,
+                        "pushed_at": None,
+                        "language": None,
+                        "language_color": None,
+                        "default_branch": None,
+                        "open_pr_count": 0,
+                        "open_issue_count": 0,
+                    },
+                    "ci": {
+                        "state": "none",
+                        "runs": [],
+                        "failed_count": 0,
+                        "active_count": 0,
+                    },
+                }
+            ],
+            "failures": [],
+        }
+    ).repos[0]
+    assert repo.hygiene == RepoHygiene((), applicable=False)
+    assert repo.repository.branch_count == 0
+    assert repo.repository.branches_without_pr == ()
+
+
+def test_branch_dict_round_trips():
+    branch = make_branch("feature-x", last_commit_at=NOW, author="ada")
+    repo = make_repo("a", branches=(branch,), branch_count=3)
+    payload = overview_to_dict(
+        build_overview(
+            viewer_login="o", repositories=[repo], ci_by_repo={}, rate_limit=None, now=NOW
+        )
+    )
+    repo_dict = payload["repos"][0]["repository"]
+    assert repo_dict["branch_count"] == 3
+    assert repo_dict["branches_without_pr"] == [
+        {"name": "feature-x", "last_commit_at": NOW.isoformat(), "author": "ada", "stale": False}
+    ]
+    restored = overview_from_dict(json.loads(json.dumps(payload)))
+    assert restored.repos[0].repository.branches_without_pr == (branch,)
+    assert restored.repos[0].repository.branch_count == 3
 
 
 def test_notification_dict_round_trips():

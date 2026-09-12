@@ -19,6 +19,39 @@ without a login.
 workflow runs concluded with `failure`, `timed_out` or `startup_failure`, regardless of branch.
 The five runs are drawn as a small history strip in the table; hover shows workflow and result.
 
+### Repository hygiene
+
+Each non-archived, non-forked repository gets a hygiene score (0-100%) from nine checks, all
+read from the same batched GraphQL query (no extra REST calls):
+
+1. **readme** - a `README.md` exists at the repository root.
+2. **license** - GitHub detected a license (`licenseInfo`).
+3. **ci_workflow** - `.github/workflows` contains at least one `.yml`/`.yaml` file.
+4. **dependency_updates** - a Dependabot (`.github/dependabot.yml`/`.yaml`) or Renovate
+   (`renovate.json`, `.github/renovate.json`, `.renovaterc.json`) configuration is present.
+5. **branch_protection** - at least one branch protection rule or ruleset is configured.
+6. **vulnerability_alerts** - Dependabot alerts are enabled for the repository.
+7. **delete_branch_on_merge** - merged branches are deleted automatically.
+8. **security_policy** - a `SECURITY.md` exists (root or `.github/`).
+9. **codeowners** - a `CODEOWNERS` file exists (root or `.github/`).
+
+Archived repositories and forks still have all nine checks computed but are marked "not
+applicable" with a fixed score of 100, so the UI can grey them out instead of penalising them.
+Set `HYGIENE_CHECKS=false` to skip scoring altogether (every repository is then reported as not
+applicable, with no checks). Hygiene contributes four totals (`repos_without_ci`,
+`repos_without_protection`, `repos_without_dependency_updates`, `repos_without_license`) and an
+account-wide `hygiene_average`, both computed only over applicable repositories.
+
+### Branches without a pull request
+
+Each repository also reports its branches (other than the default one) that have no open or
+closed pull request pointing at them, oldest last-commit first, so forgotten branches surface
+without an extra API call. Branch data is limited to the first 25 branches per repository (a
+GraphQL page limit chosen to keep the batched query's cost and latency predictable; see
+"Architecture" below); repositories with more branches than that will under-report
+`branches_without_pr` for the branches beyond the first 25, though `branch_count` always
+reflects the true total.
+
 ## Setup
 
 ### 1. Create a GitHub OAuth App
@@ -54,6 +87,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> SECRET_KEY
 | `STALE_DAYS` | no | `14` | Days without activity before a PR/issue is flagged stale |
 | `LONG_RUN_MINUTES` | no | `30` | Minutes an active run may run before it is flagged long-running |
 | `SECURITY_ALERTS` | no | `true` | Fetch code-scanning and secret-scanning alerts per repository (`true`/`false`/`1`/`0`) |
+| `HYGIENE_CHECKS` | no | `true` | Score each repository's hygiene from the batched GraphQL query (`true`/`false`/`1`/`0`); when `false` every repository is reported as not applicable instead |
 | `DB_PATH` | no | `./data/sessions.db` | SQLite session store (single replica) |
 | `REDIS_URL` | no | | Redis for sessions and cache (multiple replicas) |
 
@@ -139,9 +173,13 @@ tests/
 ```
 
 Dependencies point inwards only. Repositories with their open PR/issue counts, Dependabot alert
-counts and latest release come from one paginated GraphQL query; workflow runs, code/secret
-scanning alerts and unreleased-commit counts come from the REST API, fetched concurrently with a
-semaphore. Archived repositories are not queried for runs, security alerts or release status.
+counts, latest release, hygiene facts (license/workflows/dependency-update config/branch
+protection/rulesets/security policy/CODEOWNERS) and branches without a pull request all come
+from one paginated GraphQL query (25 repositories and 25 branch refs per page — pushed further
+and the combined query intermittently hit GitHub's per-query resource limits); workflow runs,
+code/secret scanning alerts and unreleased-commit counts come from the REST API, fetched
+concurrently with a semaphore. Archived repositories are not queried for runs, security alerts
+or release status.
 
 ## Development
 

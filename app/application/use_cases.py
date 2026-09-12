@@ -152,6 +152,7 @@ class GetOverview:
     stale_after: timedelta = DEFAULT_STALE_AFTER
     long_run_after: timedelta = DEFAULT_LONG_RUN_AFTER
     security_alerts: bool = True
+    hygiene_checks: bool = True
     clock: Clock = utc_now
     _locks: dict[int, asyncio.Lock] = field(default_factory=dict)
 
@@ -276,6 +277,8 @@ class GetOverview:
             security_by_repo[full_name] = security
             release_by_repo[full_name] = release
 
+        hygiene_by_repo = dict(page.hygiene_by_repo) if self.hygiene_checks else {}
+
         return build_overview(
             viewer_login=session.user.login,
             repositories=page.repositories,
@@ -284,6 +287,7 @@ class GetOverview:
             inbox=inbox_result,
             security_by_repo=security_by_repo,
             release_by_repo=release_by_repo,
+            hygiene_by_repo=hygiene_by_repo,
             notifications=notification_items,
             notifications_available=notifications_available,
             stale_after=self.stale_after,

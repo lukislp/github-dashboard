@@ -16,9 +16,11 @@ from app.application.errors import (
     RateLimited,
 )
 from app.application.ports import RepositoryPage
+from app.domain.hygiene import HygieneFacts, RepoHygiene, assess_hygiene
 from app.domain.models import (
     AttentionItem,
     AttentionKind,
+    Branch,
     ChecksState,
     Inbox,
     Issue,
@@ -40,13 +42,27 @@ from app.domain.pull_requests import is_bot_login
 log = logging.getLogger(__name__)
 
 _API_VERSION = "2022-11-28"
-_PAGE_SIZE = 50
+# Repository page size and refs-per-repository were both lowered from 50 to 25: at 50/50 the
+# combined query (PRs, issues, vulnerability alerts, 11 file probes and 50 branch refs with
+# their commit/PR lookups per repository) intermittently hit GitHub's per-query resource
+# limits (RESOURCE_LIMITS_EXCEEDED partial errors, and once an outright 502) even though its
+# reported `rateLimit.cost` stayed low (single digits to ~40). 25/25 measured a consistent
+# cost of ~13 and 7-9s against a real 37-repository account with no partial errors.
+_PAGE_SIZE = 25
 _PR_DETAIL_ITEMS = 20
 _ISSUE_DETAIL_ITEMS = 10
+_REFS_PAGE_SIZE = 25
+_WORKFLOW_FILE_SUFFIXES = (".yml", ".yaml")
 
 _REPOSITORIES_QUERY = """
-query Repositories($cursor: String, $pageSize: Int!, $prDetails: Int!, $issueDetails: Int!) {
-  rateLimit { remaining limit resetAt }
+query Repositories(
+  $cursor: String
+  $pageSize: Int!
+  $prDetails: Int!
+  $issueDetails: Int!
+  $refsPageSize: Int!
+) {
+  rateLimit { remaining limit resetAt cost }
   viewer {
     login
     repositories(
@@ -70,6 +86,24 @@ query Repositories($cursor: String, $pageSize: Int!, $prDetails: Int!, $issueDet
         stargazerCount
         pushedAt
         primaryLanguage { name color }
+        licenseInfo { spdxId name }
+        hasVulnerabilityAlertsEnabled
+        deleteBranchOnMerge
+        branchProtectionRules(first: 1) { totalCount }
+        rulesets(first: 1) { totalCount }
+        workflowsDir: object(expression: "HEAD:.github/workflows") {
+          ... on Tree { entries { name } }
+        }
+        dependabotYml: object(expression: "HEAD:.github/dependabot.yml") { id }
+        dependabotYaml: object(expression: "HEAD:.github/dependabot.yaml") { id }
+        renovateJson: object(expression: "HEAD:renovate.json") { id }
+        renovateJsonGithub: object(expression: "HEAD:.github/renovate.json") { id }
+        renovaterc: object(expression: "HEAD:.renovaterc.json") { id }
+        readmeFile: object(expression: "HEAD:README.md") { id }
+        securityMd: object(expression: "HEAD:SECURITY.md") { id }
+        securityMdGithub: object(expression: "HEAD:.github/SECURITY.md") { id }
+        codeownersFile: object(expression: "HEAD:CODEOWNERS") { id }
+        codeownersFileGithub: object(expression: "HEAD:.github/CODEOWNERS") { id }
         defaultBranchRef {
           name
           target {
@@ -80,6 +114,19 @@ query Repositories($cursor: String, $pageSize: Int!, $prDetails: Int!, $issueDet
               url
               author { name user { login } }
             }
+          }
+        }
+        refs(refPrefix: "refs/heads/", first: $refsPageSize) {
+          totalCount
+          nodes {
+            name
+            target {
+              ... on Commit {
+                committedDate
+                author { name user { login } }
+              }
+            }
+            associatedPullRequests(first: 1) { totalCount }
           }
         }
         pullRequests(
@@ -329,6 +376,7 @@ class GitHubHttpApi:
         repositories: list[Repository] = []
         dependabot_by_repo: dict[str, tuple[SeverityCounts | None, int | None]] = {}
         release_by_repo: dict[str, ReleaseInfo | None] = {}
+        hygiene_by_repo: dict[str, RepoHygiene] = {}
         rate_limit: RateLimit | None = None
         cursor: str | None = None
         while True:
@@ -340,11 +388,14 @@ class GitHubHttpApi:
                     "pageSize": _PAGE_SIZE,
                     "prDetails": _PR_DETAIL_ITEMS,
                     "issueDetails": _ISSUE_DETAIL_ITEMS,
+                    "refsPageSize": _REFS_PAGE_SIZE,
                 },
             )
             rl = data.get("rateLimit")
             if rl:
                 rate_limit = RateLimit(rl["remaining"], rl["limit"], _parse_dt(rl.get("resetAt")))
+                if "cost" in rl:
+                    log.debug("repositories query cost=%s", rl["cost"])
             connection = data["viewer"]["repositories"]
             for node in connection["nodes"]:
                 if not node:
@@ -353,11 +404,14 @@ class GitHubHttpApi:
                 repositories.append(repo)
                 dependabot_by_repo[repo.full_name] = _dependabot_from_node(node)
                 release_by_repo[repo.full_name] = _release_from_node(node.get("latestRelease"))
+                hygiene_by_repo[repo.full_name] = assess_hygiene(_hygiene_facts_from_node(node))
             page = connection["pageInfo"]
             if not page["hasNextPage"]:
                 break
             cursor = page["endCursor"]
-        return RepositoryPage(tuple(repositories), rate_limit, dependabot_by_repo, release_by_repo)
+        return RepositoryPage(
+            tuple(repositories), rate_limit, dependabot_by_repo, release_by_repo, hygiene_by_repo
+        )
 
     async def fetch_security(
         self, token: str, owner: str, name: str
@@ -594,6 +648,70 @@ def _last_commit_from_node(target: dict[str, Any] | None) -> LastCommit | None:
     )
 
 
+def _branch_from_ref_node(node: dict[str, Any]) -> Branch:
+    target = node.get("target") or {}
+    author = target.get("author") or {}
+    user = author.get("user") or {}
+    return Branch(
+        name=node["name"],
+        last_commit_at=_parse_dt(target.get("committedDate")),
+        author=user.get("login") or author.get("name"),
+    )
+
+
+def _branches_without_pr_from_node(
+    node: dict[str, Any], *, default_branch: str | None
+) -> tuple[Branch, ...]:
+    """Branches (other than the default one) with no pull request, oldest commit first."""
+    refs = node.get("refs") or {}
+    branches = [
+        _branch_from_ref_node(ref_node)
+        for ref_node in refs.get("nodes") or []
+        if ref_node
+        and ref_node["name"] != default_branch
+        and int((ref_node.get("associatedPullRequests") or {}).get("totalCount") or 0) == 0
+    ]
+    branches.sort(key=lambda b: (b.last_commit_at is None, b.last_commit_at))
+    return tuple(branches)
+
+
+def _hygiene_facts_from_node(node: dict[str, Any]) -> HygieneFacts:
+    """Plain booleans/counts for `assess_hygiene`, read off the repositories query node."""
+    workflow_entries = (node.get("workflowsDir") or {}).get("entries") or []
+    workflow_file_count = sum(
+        1 for e in workflow_entries if (e.get("name") or "").endswith(_WORKFLOW_FILE_SUFFIXES)
+    )
+    branch_protection_rules = node.get("branchProtectionRules") or {}
+    # `rulesets` can come back nulled out by a partial GraphQL error for tokens/plans that
+    # don't expose it; treat that the same as "no rulesets configured".
+    rulesets = node.get("rulesets") or {}
+    return HygieneFacts(
+        has_readme=node.get("readmeFile") is not None,
+        has_license=node.get("licenseInfo") is not None,
+        workflow_file_count=workflow_file_count,
+        has_dependabot_config=(
+            node.get("dependabotYml") is not None or node.get("dependabotYaml") is not None
+        ),
+        has_renovate_config=(
+            node.get("renovateJson") is not None
+            or node.get("renovateJsonGithub") is not None
+            or node.get("renovaterc") is not None
+        ),
+        branch_protection_rule_count=int(branch_protection_rules.get("totalCount") or 0),
+        ruleset_count=int(rulesets.get("totalCount") or 0),
+        vulnerability_alerts_enabled=bool(node.get("hasVulnerabilityAlertsEnabled", False)),
+        delete_branch_on_merge=bool(node.get("deleteBranchOnMerge", False)),
+        has_security_policy=(
+            node.get("securityMd") is not None or node.get("securityMdGithub") is not None
+        ),
+        has_codeowners=(
+            node.get("codeownersFile") is not None or node.get("codeownersFileGithub") is not None
+        ),
+        is_archived=bool(node["isArchived"]),
+        is_fork=bool(node["isFork"]),
+    )
+
+
 def _repository_from_node(node: dict[str, Any]) -> Repository:
     language = node.get("primaryLanguage") or {}
     default_branch = node.get("defaultBranchRef") or {}
@@ -650,6 +768,10 @@ def _repository_from_node(node: dict[str, Any]) -> Repository:
             if i
         ),
         last_commit=_last_commit_from_node(default_branch.get("target")),
+        branch_count=int((node.get("refs") or {}).get("totalCount") or 0),
+        branches_without_pr=_branches_without_pr_from_node(
+            node, default_branch=default_branch.get("name")
+        ),
     )
 
 

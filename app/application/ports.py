@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
+from app.domain.hygiene import RepoHygiene
 from app.domain.models import (
     Inbox,
     Notification,
@@ -45,6 +46,9 @@ class RepositoryPage:
         default_factory=dict
     )
     release_by_repo: Mapping[str, ReleaseInfo | None] = field(default_factory=dict)
+    # Hygiene facts are always computed by the adapter (same GraphQL query); GetOverview
+    # decides whether to forward them to build_overview based on Settings.hygiene_checks.
+    hygiene_by_repo: Mapping[str, RepoHygiene] = field(default_factory=dict)
 
 
 class GitHubOAuth(Protocol):
