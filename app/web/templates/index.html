@@ -38,14 +38,19 @@
 
     <section class="inbox" id="inbox" aria-label="Waiting on you"></section>
 
+    <section class="changes" id="changes" aria-label="Changes since last visit" hidden></section>
+
     <section class="toolbar" aria-label="Filters">
       <label class="search">
         <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M11.5 7a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0Zm-.82 4.74a6 6 0 1 1 1.06-1.06l3.04 3.04-1.06 1.06-3.04-3.04Z"/></svg>
         <input type="search" id="filter-q" data-i18n-placeholder="search_placeholder" autocomplete="off">
       </label>
       <select id="filter-owner" class="select" aria-label="Owner"></select>
+      <select id="filter-group" class="select" aria-label="Group"></select>
+      <button type="button" class="btn btn--quiet" id="manage-groups" data-i18n="manage_groups"></button>
       <div class="chips">
         <label class="chip"><input type="checkbox" id="filter-attention"><span data-i18n="only_attention"></span></label>
+        <label class="chip"><input type="checkbox" id="filter-favorites"><span data-i18n="only_favorites"></span></label>
         <label class="chip"><input type="checkbox" id="filter-archived"><span data-i18n="show_archived"></span></label>
         <label class="chip"><input type="checkbox" id="filter-forks" checked><span data-i18n="show_forks"></span></label>
         <label class="chip"><input type="checkbox" id="filter-bots" checked><span data-i18n="show_bots"></span></label>
@@ -54,6 +59,7 @@
     </section>
 
     <section class="repos" aria-label="Repositories">
+      <div class="group-summary" id="group-summary" hidden></div>
       <div class="table-wrap">
         <table class="repo-table" id="repo-table">
           <thead>
@@ -82,6 +88,8 @@
   </main>
 
   <footer class="footer" id="footer"></footer>
+
+  <dialog class="dialog" id="groups-dialog"></dialog>
 
   <script src="/static/i18n.js"></script>
   <script src="/static/app.js"></script>
