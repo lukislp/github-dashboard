@@ -118,6 +118,8 @@ class Container:
                 cache_ttl_seconds=settings.cache_ttl_seconds,
                 runs_per_repo=settings.runs_per_repo,
                 max_concurrency=settings.max_concurrency,
+                stale_after=timedelta(days=settings.stale_days),
+                long_run_after=timedelta(minutes=settings.long_run_minutes),
             ),
             _closables=[],
         )

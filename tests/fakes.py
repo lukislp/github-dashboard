@@ -7,11 +7,16 @@ from datetime import UTC, datetime, timedelta
 from app.application.errors import ActionsUnavailable, AuthenticationError
 from app.application.ports import RepositoryPage, SessionRecord
 from app.domain.models import (
+    ChecksState,
+    Inbox,
     Issue,
+    LastCommit,
+    Mergeable,
     Overview,
     PullRequest,
     RateLimit,
     Repository,
+    ReviewDecision,
     RunStatus,
     User,
     WorkflowRun,
@@ -22,6 +27,35 @@ NOW = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)
 DEFAULT_RATE_LIMIT = RateLimit(4990, 5000, NOW)
 
 VIEWER = User(id=42, login="octocat", name="Octo Cat", avatar_url="https://a/x.png", html_url="h")
+
+
+def make_pr(
+    number: int,
+    *,
+    author: str | None = "someone",
+    is_draft: bool = False,
+    updated_at: datetime = NOW,
+    created_at: datetime | None = None,
+    head_branch: str | None = "feature",
+    review_decision: ReviewDecision | None = None,
+    checks: ChecksState | None = None,
+    mergeable: Mergeable = Mergeable.MERGEABLE,
+    is_bot: bool = False,
+) -> PullRequest:
+    return PullRequest(
+        number=number,
+        title=f"PR {number}",
+        url=f"u/{number}",
+        author=author,
+        is_draft=is_draft,
+        updated_at=updated_at,
+        created_at=created_at if created_at is not None else updated_at,
+        head_branch=head_branch,
+        review_decision=review_decision,
+        checks=checks,
+        mergeable=mergeable,
+        is_bot=is_bot,
+    )
 
 
 def make_repo(
@@ -35,6 +69,10 @@ def make_repo(
     private: bool = False,
     stars: int = 0,
     pushed_at: datetime | None = NOW,
+    bot_prs: int = 0,
+    pr_updated_at: datetime = NOW,
+    issue_updated_at: datetime = NOW,
+    last_commit: LastCommit | None = None,
 ) -> Repository:
     return Repository(
         full_name=f"{owner}/{name}",
@@ -54,11 +92,19 @@ def make_repo(
         open_pr_count=prs,
         open_issue_count=issues,
         pull_requests=tuple(
-            PullRequest(i, f"PR {i}", f"u/{i}", "someone", False, NOW) for i in range(1, prs + 1)
+            make_pr(
+                i,
+                author="dependabot[bot]" if i <= bot_prs else "someone",
+                updated_at=pr_updated_at,
+                is_bot=i <= bot_prs,
+            )
+            for i in range(1, prs + 1)
         ),
         issues=tuple(
-            Issue(i, f"Issue {i}", f"u/{i}", "someone", NOW) for i in range(1, issues + 1)
+            Issue(i, f"Issue {i}", f"u/{i}", "someone", issue_updated_at)
+            for i in range(1, issues + 1)
         ),
+        last_commit=last_commit,
     )
 
 
@@ -69,8 +115,9 @@ def make_run(
     workflow: str = "ci",
     branch: str = "main",
     age_minutes: int = 0,
+    created_at: datetime | None = None,
 ) -> WorkflowRun:
-    when = NOW - timedelta(minutes=age_minutes)
+    updated = NOW - timedelta(minutes=age_minutes)
     return WorkflowRun(
         id=run_id,
         workflow_name=workflow,
@@ -80,8 +127,8 @@ def make_run(
         event="push",
         status=status,
         run_number=run_id,
-        created_at=when,
-        updated_at=when,
+        created_at=created_at if created_at is not None else updated,
+        updated_at=updated,
     )
 
 
@@ -117,14 +164,18 @@ class FakeApi:
         repos: list[Repository] | None = None,
         runs: dict[str, list[WorkflowRun]] | None = None,
         rate_limit: RateLimit | None = DEFAULT_RATE_LIMIT,
+        inbox: Inbox | None = None,
     ) -> None:
         self.repos = repos or []
         self.runs = runs or {}
         self.rate_limit = rate_limit
+        self.inbox = inbox if inbox is not None else Inbox((), (), (), ())
         self.unavailable: set[str] = set()
         self.calls = 0
         self.run_calls: list[str] = []
+        self.inbox_calls = 0
         self.token_valid = True
+        self.inbox_error: Exception | None = None
 
     async def list_repositories(self, token: str) -> RepositoryPage:
         self.calls += 1
@@ -140,6 +191,12 @@ class FakeApi:
         if full in self.unavailable:
             raise ActionsUnavailable("disabled")
         return self.runs.get(full, [])[:limit]
+
+    async def search_inbox(self, token: str) -> Inbox:
+        self.inbox_calls += 1
+        if self.inbox_error is not None:
+            raise self.inbox_error
+        return self.inbox
 
 
 class FakeSessions:

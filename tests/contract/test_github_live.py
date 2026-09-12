@@ -25,3 +25,6 @@ async def test_live_repositories_and_runs():
         except ActionsUnavailable:
             runs = []
         assert len(runs) <= 5
+
+        inbox = await api.search_inbox(token)
+        assert inbox.total >= 0

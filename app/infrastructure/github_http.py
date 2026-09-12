@@ -17,23 +17,32 @@ from app.application.errors import (
 )
 from app.application.ports import RepositoryPage
 from app.domain.models import (
+    AttentionItem,
+    AttentionKind,
+    ChecksState,
+    Inbox,
     Issue,
+    LastCommit,
+    Mergeable,
     PullRequest,
     RateLimit,
     Repository,
+    ReviewDecision,
     RunStatus,
     User,
     WorkflowRun,
 )
+from app.domain.pull_requests import is_bot_login
 
 log = logging.getLogger(__name__)
 
 _API_VERSION = "2022-11-28"
 _PAGE_SIZE = 50
-_DETAIL_ITEMS = 10
+_PR_DETAIL_ITEMS = 20
+_ISSUE_DETAIL_ITEMS = 10
 
 _REPOSITORIES_QUERY = """
-query Repositories($cursor: String, $pageSize: Int!, $details: Int!) {
+query Repositories($cursor: String, $pageSize: Int!, $prDetails: Int!, $issueDetails: Int!) {
   rateLimit { remaining limit resetAt }
   viewer {
     login
@@ -58,15 +67,40 @@ query Repositories($cursor: String, $pageSize: Int!, $details: Int!) {
         stargazerCount
         pushedAt
         primaryLanguage { name color }
-        defaultBranchRef { name }
+        defaultBranchRef {
+          name
+          target {
+            ... on Commit {
+              oid
+              messageHeadline
+              committedDate
+              url
+              author { name user { login } }
+            }
+          }
+        }
         pullRequests(
-          states: OPEN, first: $details, orderBy: { field: UPDATED_AT, direction: DESC }
+          states: OPEN, first: $prDetails, orderBy: { field: UPDATED_AT, direction: DESC }
         ) {
           totalCount
-          nodes { number title url isDraft updatedAt author { login } }
+          nodes {
+            number
+            title
+            url
+            isDraft
+            updatedAt
+            author { login }
+            createdAt
+            headRefName
+            reviewDecision
+            mergeable
+            commits(last: 1) {
+              nodes { commit { statusCheckRollup { state } } }
+            }
+          }
         }
         issues(
-          states: OPEN, first: $details, orderBy: { field: UPDATED_AT, direction: DESC }
+          states: OPEN, first: $issueDetails, orderBy: { field: UPDATED_AT, direction: DESC }
         ) {
           totalCount
           nodes { number title url updatedAt author { login } }
@@ -76,6 +110,64 @@ query Repositories($cursor: String, $pageSize: Int!, $details: Int!) {
   }
 }
 """
+
+_INBOX_QUERY = """
+query Inbox(
+  $reviewRequested: String!
+  $changesRequested: String!
+  $assigned: String!
+  $mentioned: String!
+) {
+  rateLimit { remaining limit resetAt }
+  review_requested: search(type: ISSUE, first: 30, query: $reviewRequested) {
+    nodes {
+      ... on PullRequest {
+        number title url isDraft updatedAt author { login } repository { nameWithOwner }
+      }
+      ... on Issue { number title url updatedAt author { login } repository { nameWithOwner } }
+    }
+  }
+  changes_requested: search(type: ISSUE, first: 30, query: $changesRequested) {
+    nodes {
+      ... on PullRequest {
+        number title url isDraft updatedAt author { login } repository { nameWithOwner }
+      }
+      ... on Issue { number title url updatedAt author { login } repository { nameWithOwner } }
+    }
+  }
+  assigned: search(type: ISSUE, first: 30, query: $assigned) {
+    nodes {
+      ... on PullRequest {
+        number title url isDraft updatedAt author { login } repository { nameWithOwner }
+      }
+      ... on Issue { number title url updatedAt author { login } repository { nameWithOwner } }
+    }
+  }
+  mentioned: search(type: ISSUE, first: 30, query: $mentioned) {
+    nodes {
+      ... on PullRequest {
+        number title url isDraft updatedAt author { login } repository { nameWithOwner }
+      }
+      ... on Issue { number title url updatedAt author { login } repository { nameWithOwner } }
+    }
+  }
+}
+"""
+
+_INBOX_FIELDS: tuple[tuple[str, AttentionKind], ...] = (
+    ("review_requested", AttentionKind.REVIEW_REQUESTED),
+    ("changes_requested", AttentionKind.CHANGES_REQUESTED),
+    ("assigned", AttentionKind.ASSIGNED),
+    ("mentioned", AttentionKind.MENTIONED),
+)
+
+_CHECKS_STATE_BY_ROLLUP: dict[str, ChecksState] = {
+    "SUCCESS": ChecksState.SUCCESS,
+    "FAILURE": ChecksState.FAILURE,
+    "ERROR": ChecksState.ERROR,
+    "PENDING": ChecksState.PENDING,
+    "EXPECTED": ChecksState.PENDING,
+}
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -202,7 +294,12 @@ class GitHubHttpApi:
             data = await self._graphql(
                 token,
                 _REPOSITORIES_QUERY,
-                {"cursor": cursor, "pageSize": _PAGE_SIZE, "details": _DETAIL_ITEMS},
+                {
+                    "cursor": cursor,
+                    "pageSize": _PAGE_SIZE,
+                    "prDetails": _PR_DETAIL_ITEMS,
+                    "issueDetails": _ISSUE_DETAIL_ITEMS,
+                },
             )
             rl = data.get("rateLimit")
             if rl:
@@ -233,6 +330,32 @@ class GitHubHttpApi:
         _raise_for_status(response, context=f"runs {owner}/{name}")
         return [_run_from_json(r) for r in response.json().get("workflow_runs", [])]
 
+    async def search_inbox(self, token: str) -> Inbox:
+        variables = {
+            "reviewRequested": "is:open is:pr review-requested:@me archived:false",
+            "changesRequested": "is:open is:pr author:@me review:changes-requested archived:false",
+            "assigned": "is:open assignee:@me archived:false",
+            "mentioned": "is:open mentions:@me -author:@me archived:false",
+        }
+        data = await self._graphql(token, _INBOX_QUERY, variables)
+        buckets: dict[str, tuple[AttentionItem, ...]] = {}
+        for field_name, kind in _INBOX_FIELDS:
+            nodes = (data.get(field_name) or {}).get("nodes") or []
+            items = []
+            for node in nodes:
+                if not node:
+                    continue
+                item = _attention_item_from_node(node, kind)
+                if item is not None:
+                    items.append(item)
+            buckets[field_name] = tuple(items)
+        return Inbox(
+            review_requested=buckets["review_requested"],
+            changes_requested=buckets["changes_requested"],
+            assigned=buckets["assigned"],
+            mentioned=buckets["mentioned"],
+        )
+
     async def _graphql(self, token: str, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         try:
             response = await self._client.post(
@@ -254,6 +377,31 @@ class GitHubHttpApi:
                 raise GitHubUnavailable(f"graphql: {messages}")
             log.warning("graphql partial errors: %s", messages)
         return payload["data"]
+
+
+def _pr_checks(node: dict[str, Any]) -> ChecksState | None:
+    commit_nodes = (node.get("commits") or {}).get("nodes") or []
+    if not commit_nodes:
+        return None
+    rollup = (commit_nodes[0].get("commit") or {}).get("statusCheckRollup")
+    if not rollup:
+        return None
+    return _CHECKS_STATE_BY_ROLLUP.get(rollup.get("state"))
+
+
+def _last_commit_from_node(target: dict[str, Any] | None) -> LastCommit | None:
+    if not target or "oid" not in target:
+        return None
+    author = target.get("author") or {}
+    user = author.get("user") or {}
+    return LastCommit(
+        sha=target["oid"],
+        headline=target.get("messageHeadline", ""),
+        author_login=user.get("login"),
+        author_name=author.get("name"),
+        committed_at=_parse_dt(target.get("committedDate")) or datetime.now(UTC),
+        url=target.get("url", ""),
+    )
 
 
 def _repository_from_node(node: dict[str, Any]) -> Repository:
@@ -286,6 +434,16 @@ def _repository_from_node(node: dict[str, Any]) -> Repository:
                 author=(p.get("author") or {}).get("login"),
                 is_draft=bool(p["isDraft"]),
                 updated_at=_parse_dt(p["updatedAt"]),  # type: ignore[arg-type]
+                created_at=_parse_dt(p["createdAt"]),  # type: ignore[arg-type]
+                head_branch=p.get("headRefName"),
+                review_decision=(
+                    ReviewDecision(p["reviewDecision"].lower()) if p.get("reviewDecision") else None
+                ),
+                checks=_pr_checks(p),
+                mergeable=(
+                    Mergeable(p["mergeable"].lower()) if p.get("mergeable") else Mergeable.UNKNOWN
+                ),
+                is_bot=is_bot_login((p.get("author") or {}).get("login")),
             )
             for p in prs["nodes"]
             if p
@@ -301,6 +459,25 @@ def _repository_from_node(node: dict[str, Any]) -> Repository:
             for i in issues["nodes"]
             if i
         ),
+        last_commit=_last_commit_from_node(default_branch.get("target")),
+    )
+
+
+def _attention_item_from_node(node: dict[str, Any], kind: AttentionKind) -> AttentionItem | None:
+    repository = node.get("repository")
+    updated_at = _parse_dt(node.get("updatedAt"))
+    if not repository or updated_at is None:
+        return None
+    return AttentionItem(
+        kind=kind,
+        is_pull_request="isDraft" in node,
+        repo_full_name=repository["nameWithOwner"],
+        number=node["number"],
+        title=node["title"],
+        url=node["url"],
+        author=(node.get("author") or {}).get("login"),
+        updated_at=updated_at,
+        is_draft=bool(node.get("isDraft", False)),
     )
 
 

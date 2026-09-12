@@ -22,6 +22,8 @@ class Settings:
     session_ttl_hours: int
     runs_per_repo: int
     max_concurrency: int
+    stale_days: int
+    long_run_minutes: int
     db_path: str
     redis_url: str | None
     github_api_url: str
@@ -82,6 +84,8 @@ class Settings:
             session_ttl_hours=integer("SESSION_TTL_HOURS", 168),
             runs_per_repo=integer("RUNS_PER_REPO", 5),
             max_concurrency=integer("MAX_CONCURRENCY", 8),
+            stale_days=integer("STALE_DAYS", 14),
+            long_run_minutes=integer("LONG_RUN_MINUTES", 30),
             db_path=env.get("DB_PATH", "./data/sessions.db").strip() or "./data/sessions.db",
             redis_url=env.get("REDIS_URL", "").strip() or None,
             github_api_url=(

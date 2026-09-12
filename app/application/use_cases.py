@@ -24,8 +24,14 @@ from app.application.ports import (
     SessionRepository,
     TokenCipher,
 )
-from app.domain.models import Overview, RepoCi, Repository
-from app.domain.overview import build_overview, classify_ci, skipped_ci
+from app.domain.models import Inbox, Overview, RepoCi, Repository
+from app.domain.overview import (
+    DEFAULT_LONG_RUN_AFTER,
+    DEFAULT_STALE_AFTER,
+    build_overview,
+    classify_ci,
+    skipped_ci,
+)
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +129,8 @@ class GetOverview:
     cache_ttl_seconds: int
     runs_per_repo: int
     max_concurrency: int
+    stale_after: timedelta = DEFAULT_STALE_AFTER
+    long_run_after: timedelta = DEFAULT_LONG_RUN_AFTER
     clock: Clock = utc_now
     _locks: dict[int, asyncio.Lock] = field(default_factory=dict)
 
@@ -175,11 +183,23 @@ class GetOverview:
                     return repo.full_name, classify_ci((), error="github_error")
             return repo.full_name, classify_ci(runs)
 
-        results = await asyncio.gather(*(ci_for(r) for r in page.repositories))
+        async def inbox() -> Inbox:
+            try:
+                return await self.api.search_inbox(token)
+            except (RateLimited, GitHubUnavailable) as exc:
+                log.warning("inbox search failed: %s", exc)
+                return Inbox((), (), (), ())
+
+        ci_results, inbox_result = await asyncio.gather(
+            asyncio.gather(*(ci_for(r) for r in page.repositories)), inbox()
+        )
         return build_overview(
             viewer_login=session.user.login,
             repositories=page.repositories,
-            ci_by_repo=dict(results),
+            ci_by_repo=dict(ci_results),
             rate_limit=page.rate_limit,
+            inbox=inbox_result,
+            stale_after=self.stale_after,
+            long_run_after=self.long_run_after,
             now=self.clock(),
         )

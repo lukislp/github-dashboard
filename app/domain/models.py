@@ -40,6 +40,40 @@ class CiState(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class ReviewDecision(StrEnum):
+    """GitHub's aggregated review verdict for a pull request."""
+
+    APPROVED = "approved"
+    CHANGES_REQUESTED = "changes_requested"
+    REVIEW_REQUIRED = "review_required"
+
+
+class ChecksState(StrEnum):
+    """Rollup of a pull request's status checks on its latest commit."""
+
+    SUCCESS = "success"
+    FAILURE = "failure"
+    PENDING = "pending"
+    ERROR = "error"
+
+
+class Mergeable(StrEnum):
+    """Whether a pull request can be merged without conflicts."""
+
+    MERGEABLE = "mergeable"
+    CONFLICTING = "conflicting"
+    UNKNOWN = "unknown"
+
+
+class AttentionKind(StrEnum):
+    """Why a pull request or issue showed up in the viewer's inbox."""
+
+    REVIEW_REQUESTED = "review_requested"
+    CHANGES_REQUESTED = "changes_requested"
+    ASSIGNED = "assigned"
+    MENTIONED = "mentioned"
+
+
 @dataclass(frozen=True, slots=True)
 class User:
     id: int
@@ -57,6 +91,13 @@ class PullRequest:
     author: str | None
     is_draft: bool
     updated_at: datetime
+    created_at: datetime
+    head_branch: str | None
+    review_decision: ReviewDecision | None
+    checks: ChecksState | None
+    mergeable: Mergeable
+    is_bot: bool
+    stale: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +107,17 @@ class Issue:
     url: str
     author: str | None
     updated_at: datetime
+    stale: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LastCommit:
+    sha: str
+    headline: str
+    author_login: str | None
+    author_name: str | None
+    committed_at: datetime
+    url: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +140,7 @@ class Repository:
     open_issue_count: int
     pull_requests: tuple[PullRequest, ...]
     issues: tuple[Issue, ...]
+    last_commit: LastCommit | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +155,7 @@ class WorkflowRun:
     run_number: int
     created_at: datetime
     updated_at: datetime
+    long_running: bool = False
 
     @property
     def failed(self) -> bool:
@@ -119,6 +173,7 @@ class RepoCi:
     failed_count: int
     active_count: int
     error: str | None = None
+    long_running_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +189,40 @@ class FailedRun:
 
 
 @dataclass(frozen=True, slots=True)
+class AttentionItem:
+    """One pull request or issue that is waiting on the viewer."""
+
+    kind: AttentionKind
+    is_pull_request: bool
+    repo_full_name: str
+    number: int
+    title: str
+    url: str
+    author: str | None
+    updated_at: datetime
+    is_draft: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Inbox:
+    """Everything currently waiting on the viewer, grouped by why it needs them."""
+
+    review_requested: tuple[AttentionItem, ...]
+    changes_requested: tuple[AttentionItem, ...]
+    assigned: tuple[AttentionItem, ...]
+    mentioned: tuple[AttentionItem, ...]
+
+    @property
+    def total(self) -> int:
+        return (
+            len(self.review_requested)
+            + len(self.changes_requested)
+            + len(self.assigned)
+            + len(self.mentioned)
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Totals:
     repos: int
     private: int
@@ -145,6 +234,15 @@ class Totals:
     failed_runs: int
     repos_failing: int
     active_runs: int
+    human_prs: int
+    bot_prs: int
+    stale_prs: int
+    stale_issues: int
+    prs_ready: int
+    prs_changes_requested: int
+    prs_failing: int
+    long_running_runs: int
+    inbox_total: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,3 +260,4 @@ class Overview:
     repos: tuple[RepoOverview, ...]
     failures: tuple[FailedRun, ...]
     rate_limit: RateLimit | None
+    inbox: Inbox

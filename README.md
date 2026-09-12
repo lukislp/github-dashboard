@@ -49,6 +49,8 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> SECRET_KEY
 | `SESSION_TTL_HOURS` | no | `168` | Login lifetime |
 | `RUNS_PER_REPO` | no | `5` | Recent runs inspected per repository |
 | `MAX_CONCURRENCY` | no | `8` | Parallel GitHub requests per refresh |
+| `STALE_DAYS` | no | `14` | Days without activity before a PR/issue is flagged stale |
+| `LONG_RUN_MINUTES` | no | `30` | Minutes an active run may run before it is flagged long-running |
 | `DB_PATH` | no | `./data/sessions.db` | SQLite session store (single replica) |
 | `REDIS_URL` | no | | Redis for sessions and cache (multiple replicas) |
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from app.domain.models import Overview, RateLimit, Repository, User, WorkflowRun
+from app.domain.models import Inbox, Overview, RateLimit, Repository, User, WorkflowRun
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +49,11 @@ class GitHubApi(Protocol):
         self, token: str, owner: str, name: str, limit: int
     ) -> list[WorkflowRun]:
         """Newest workflow runs of one repository, newest first."""
+        ...
+
+    async def search_inbox(self, token: str) -> Inbox:
+        """Pull requests and issues waiting on the viewer: review requests, changes
+        requested on their own PRs, assignments and mentions."""
         ...
 
 

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.domain.models import (
     CiState,
     FailedRun,
+    Inbox,
     Overview,
     RateLimit,
     RepoCi,
@@ -17,6 +19,11 @@ from app.domain.models import (
     Totals,
     WorkflowRun,
 )
+from app.domain.pull_requests import PrState, pr_state
+
+_EMPTY_INBOX = Inbox((), (), (), ())
+DEFAULT_STALE_AFTER = timedelta(days=14)
+DEFAULT_LONG_RUN_AFTER = timedelta(minutes=30)
 
 
 def classify_ci(runs: Iterable[WorkflowRun], *, error: str | None = None) -> RepoCi:
@@ -55,6 +62,28 @@ def skipped_ci(reason: str) -> RepoCi:
     return RepoCi(CiState.SKIPPED, (), 0, 0, reason)
 
 
+def _mark_stale(repo: Repository, *, now: datetime, stale_after: timedelta) -> Repository:
+    """Attach the derived 'stale' flag to a repository's pull requests and issues."""
+    prs = tuple(
+        dataclasses.replace(p, stale=(now - p.updated_at) >= stale_after)
+        for p in repo.pull_requests
+    )
+    issues = tuple(
+        dataclasses.replace(i, stale=(now - i.updated_at) >= stale_after) for i in repo.issues
+    )
+    return dataclasses.replace(repo, pull_requests=prs, issues=issues)
+
+
+def _mark_long_running(ci: RepoCi, *, now: datetime, long_run_after: timedelta) -> RepoCi:
+    """Attach the derived 'long_running' flag to active runs and recompute the count."""
+    runs = tuple(
+        dataclasses.replace(r, long_running=r.active and (now - r.created_at) >= long_run_after)
+        for r in ci.runs
+    )
+    long_running_count = sum(1 for r in runs if r.long_running)
+    return dataclasses.replace(ci, runs=runs, long_running_count=long_running_count)
+
+
 def build_overview(
     *,
     viewer_login: str,
@@ -62,17 +91,33 @@ def build_overview(
     ci_by_repo: Mapping[str, RepoCi],
     rate_limit: RateLimit | None,
     now: datetime,
+    inbox: Inbox = _EMPTY_INBOX,
+    stale_after: timedelta = DEFAULT_STALE_AFTER,
+    long_run_after: timedelta = DEFAULT_LONG_RUN_AFTER,
 ) -> Overview:
     repos: list[RepoOverview] = []
     failures: list[FailedRun] = []
 
     for repo in repositories:
+        repo = _mark_stale(repo, now=now, stale_after=stale_after)
         ci = ci_by_repo.get(repo.full_name) or classify_ci(())
+        ci = _mark_long_running(ci, now=now, long_run_after=long_run_after)
         repos.append(RepoOverview(repo, ci))
         failures.extend(FailedRun(repo.full_name, run) for run in ci.runs if run.failed)
 
     repos.sort(key=_repo_sort_key)
     failures.sort(key=lambda f: f.run.updated_at, reverse=True)
+
+    all_prs = [p for r in repos for p in r.repository.pull_requests]
+    all_issues = [i for r in repos for i in r.repository.issues]
+
+    human_prs = 0
+    bot_prs = 0
+    for r in repos:
+        prs = r.repository.pull_requests
+        human_prs += sum(1 for p in prs if not p.is_bot)
+        bot_prs += sum(1 for p in prs if p.is_bot)
+        human_prs += max(0, r.repository.open_pr_count - len(prs))
 
     totals = Totals(
         repos=len(repos),
@@ -85,6 +130,15 @@ def build_overview(
         failed_runs=sum(r.ci.failed_count for r in repos),
         repos_failing=sum(1 for r in repos if r.ci.state == CiState.FAILING),
         active_runs=sum(r.ci.active_count for r in repos),
+        human_prs=human_prs,
+        bot_prs=bot_prs,
+        stale_prs=sum(1 for p in all_prs if p.stale),
+        stale_issues=sum(1 for i in all_issues if i.stale),
+        prs_ready=sum(1 for p in all_prs if pr_state(p) == PrState.READY),
+        prs_changes_requested=sum(1 for p in all_prs if pr_state(p) == PrState.CHANGES_REQUESTED),
+        prs_failing=sum(1 for p in all_prs if pr_state(p) in (PrState.FAILING, PrState.CONFLICT)),
+        long_running_runs=sum(r.ci.long_running_count for r in repos),
+        inbox_total=inbox.total,
     )
     return Overview(
         viewer_login=viewer_login,
@@ -93,6 +147,7 @@ def build_overview(
         repos=tuple(repos),
         failures=tuple(failures),
         rate_limit=rate_limit,
+        inbox=inbox,
     )
 
 

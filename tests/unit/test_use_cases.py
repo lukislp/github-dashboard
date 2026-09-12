@@ -2,7 +2,7 @@ from datetime import timedelta
 
 import pytest
 
-from app.application.errors import AccessDenied, AuthenticationError
+from app.application.errors import AccessDenied, AuthenticationError, GitHubUnavailable, RateLimited
 from app.application.use_cases import (
     AccessPolicy,
     CompleteLogin,
@@ -10,7 +10,7 @@ from app.application.use_cases import (
     Logout,
     ResolveSession,
 )
-from app.domain.models import CiState, RunStatus
+from app.domain.models import AttentionItem, AttentionKind, CiState, Inbox, RunStatus
 from tests.fakes import (
     NOW,
     FakeApi,
@@ -131,6 +131,67 @@ async def test_get_overview_serves_from_cache_until_forced():
 async def test_get_overview_revoked_token_deletes_session():
     api = FakeApi(repos=[make_repo("a")])
     api.token_valid = False
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AuthenticationError):
+        await build_overview_uc(api, sessions, cache)(record)
+    assert sessions.records == {}
+
+
+def _attention_item(number: int) -> AttentionItem:
+    return AttentionItem(
+        kind=AttentionKind.REVIEW_REQUESTED,
+        is_pull_request=True,
+        repo_full_name="octocat/a",
+        number=number,
+        title="t",
+        url="u",
+        author="bob",
+        updated_at=NOW,
+        is_draft=False,
+    )
+
+
+async def test_get_overview_includes_inbox_from_api():
+    inbox = Inbox(
+        review_requested=(_attention_item(1),), changes_requested=(), assigned=(), mentioned=()
+    )
+    api = FakeApi(repos=[make_repo("a")], inbox=inbox)
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.inbox.total == 1
+    assert api.inbox_calls == 1
+
+
+async def test_get_overview_falls_back_to_empty_inbox_on_rate_limited():
+    api = FakeApi(repos=[make_repo("a")])
+    api.inbox_error = RateLimited("inbox")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.inbox.total == 0
+
+
+async def test_get_overview_falls_back_to_empty_inbox_on_github_unavailable():
+    api = FakeApi(repos=[make_repo("a")])
+    api.inbox_error = GitHubUnavailable("down")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.inbox.total == 0
+
+
+async def test_get_overview_propagates_authentication_error_from_inbox():
+    api = FakeApi(repos=[make_repo("a")])
+    api.inbox_error = AuthenticationError("revoked")
     oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
     record = await build_login(oauth, sessions)("code")
 
