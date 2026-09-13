@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/lukislp/github-dashboard/compare/v1.2.0...v1.3.0) (2026-09-13)
+
+
+### Features
+
+* failing job detail, re-run, pull request age, full lists, Actions time ([#10](https://github.com/lukislp/github-dashboard/issues/10)) ([96796c7](https://github.com/lukislp/github-dashboard/commit/96796c792324563406761ad8f231739be9dfda68))
+
 # [1.2.0](https://github.com/lukislp/github-dashboard/compare/v1.1.4...v1.2.0) (2026-09-13)
 
 
