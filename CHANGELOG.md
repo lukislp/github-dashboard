@@ -1,3 +1,10 @@
+## [1.1.1](https://github.com/lukislp/github-dashboard/compare/v1.1.0...v1.1.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* redact the OAuth callback query string from the access log ([#5](https://github.com/lukislp/github-dashboard/issues/5)) ([23fd590](https://github.com/lukislp/github-dashboard/commit/23fd59064aa72a1937a1872e9ac980d1e08705c9))
+
 # [1.1.0](https://github.com/lukislp/github-dashboard/compare/v1.0.2...v1.1.0) (2026-09-13)
 
 
