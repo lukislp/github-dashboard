@@ -1,3 +1,10 @@
+## [1.1.3](https://github.com/lukislp/github-dashboard/compare/v1.1.2...v1.1.3) (2026-09-13)
+
+
+### Bug Fixes
+
+* **k8s:** drop the catch-all egress rule from allow-dns ([#7](https://github.com/lukislp/github-dashboard/issues/7)) ([34eee90](https://github.com/lukislp/github-dashboard/commit/34eee90d5f5a62d9778468de33bf9e8f12f9a2b5))
+
 ## [1.1.2](https://github.com/lukislp/github-dashboard/compare/v1.1.1...v1.1.2) (2026-09-13)
 
 
