@@ -242,6 +242,7 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 .btn--primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
 .btn--primary:hover { background: var(--ink-2); border-color: var(--ink-2); }
 .btn--lg { padding: 11px 18px; font-size: 1rem; }
+.btn--sm { padding: 3px 9px; font-size: 0.78rem; }
 .lang-toggle { font-family: var(--font-mono); font-size: 0.8rem; letter-spacing: 0.06em; min-width: 40px; justify-content: center; }
 .theme-toggle { width: 32px; height: 32px; padding: 0; justify-content: center; }
 .theme-toggle .icon { width: 15px; height: 15px; }
@@ -524,8 +525,11 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 .details li .title { flex: 1 1 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 120px; }
 .details li .by { color: var(--muted); flex: none; font-size: 0.78rem; }
 .details li .branch { font-family: var(--font-mono); font-size: 0.78rem; color: var(--muted); flex: none; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.details li .age { color: var(--muted); font-size: 0.78rem; flex: none; }
 .details .empty { color: var(--muted); font-size: 0.86rem; }
 .details .more { color: var(--muted); font-size: 0.8rem; margin-top: 4px; display: inline-block; }
+.load-more { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+.load-more-error { color: var(--critical-ink); font-size: 0.78rem; }
 .tag { font-family: var(--font-mono); font-size: 0.7rem; padding: 0 5px; border-radius: var(--radius-sm); background: var(--line); color: var(--ink-2); flex: none; }
 .tag--stale { display: inline-flex; align-items: center; gap: 3px; }
 .tag--stale .icon { width: 9px; height: 9px; }
@@ -541,10 +545,26 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 .state-chip--warning { color: var(--warning-ink); border-color: var(--warning-ink); }
 .state-chip--good { color: var(--good-ink); border-color: var(--good-ink); }
 .state-chip--neutral { color: var(--ink-2); border-color: var(--line-strong); }
-.run-line { display: flex; align-items: center; gap: 8px; }
+/* .run-line is the <li>; its first line of content (dot, workflow, branch, status, re-run
+   control) lives in .run-line__row so a failing job/step can sit on its own line below it. */
+/* Each run reads as one block: the run itself, why it failed, and only then the action - in a
+   narrow details column the control would otherwise wrap between the two and look unrelated. */
+.run-line { display: block; padding-left: 8px; border-left: 1px solid var(--line); }
+.run-line + .run-line { margin-top: 6px; }
+.run-line .rerun-control { display: inline-flex; align-items: center; gap: 8px; margin: 4px 0 0 16px; }
+.run-line__row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .run-line .run { flex: none; width: 8px; height: 12px; }
 .run-line .status { color: var(--muted); font-size: 0.78rem; flex: none; }
 .run-line .branch { font-family: var(--font-mono); font-size: 0.78rem; color: var(--muted); flex: none; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-line__failed { margin: 4px 0 0 16px; display: grid; gap: 2px; min-width: 0; }
+.run-line__failed-job {
+  font-family: var(--font-mono); font-size: 0.78rem; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+}
+.run-line__failed-job:hover { color: var(--ink-2); text-decoration: underline; text-underline-offset: 2px; }
+.rerun-control { display: inline-flex; align-items: center; gap: 8px; }
+.rerun-status { font-family: var(--font-mono); font-size: 0.78rem; color: var(--muted); }
+.rerun-error { font-size: 0.78rem; color: var(--critical-ink); }
 
 .table-empty { padding: 32px; text-align: center; color: var(--muted); font-size: 0.92rem; }
 
@@ -562,9 +582,16 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 .failure:first-child { border-top: 0; }
 .failure .run { width: 8px; height: 14px; }
 .failure__repo { font-family: var(--font-mono); font-size: 0.85rem; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.failure__title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.failure__title .workflow { font-weight: 500; }
-.failure__title .sep { color: var(--muted); padding: 0 6px; }
+.failure__title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.failure__title-line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.failure__title-line .workflow { font-weight: 500; }
+.failure__title-line .sep { color: var(--muted); padding: 0 6px; }
+.failure__jobs { display: grid; gap: 2px; min-width: 0; }
+.failure__failed-job {
+  font-family: var(--font-mono); font-size: 0.76rem; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.failure__failed-job:hover { color: var(--ink-2); text-decoration: underline; text-underline-offset: 2px; }
 .failure__branch { font-family: var(--font-mono); font-size: 0.8rem; color: var(--muted); }
 .failure__time { color: var(--muted); font-size: 0.85rem; white-space: nowrap; }
 .failure-list .empty { padding: 20px 14px; color: var(--good-ink); font-size: 0.92rem; display: flex; align-items: center; gap: 8px; }
