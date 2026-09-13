@@ -12,13 +12,16 @@ from starlette.responses import Response
 SESSION_COOKIE = "ghd_session"
 STATE_COOKIE = "ghd_oauth_state"
 LANG_COOKIE = "ghd_lang"
+THEME_COOKIE = "ghd_theme"
 STATE_MAX_AGE = 600
 
+# Web fonts (IBM Plex) are self-hosted under /static/fonts, so style-src and font-src no
+# longer need the Google Fonts hosts.
 _CSP = (
     "default-src 'self'; "
     "script-src 'self'; "
-    "style-src 'self' https://fonts.googleapis.com; "
-    "font-src 'self' https://fonts.gstatic.com; "
+    "style-src 'self'; "
+    "font-src 'self'; "
     "img-src 'self' data: https://avatars.githubusercontent.com; "
     "connect-src 'self'; "
     "frame-ancestors 'none'; "

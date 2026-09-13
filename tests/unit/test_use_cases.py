@@ -2,6 +2,7 @@ from datetime import timedelta
 
 import pytest
 
+from app.application.activity import ActivityTracker
 from app.application.errors import AccessDenied, AuthenticationError, GitHubUnavailable, RateLimited
 from app.application.ports import BranchListing, TokenSet
 from app.application.use_cases import (
@@ -120,6 +121,35 @@ async def test_resolve_session_drops_expired():
     assert await resolve(record.id) is None
     assert record.id not in sessions.records
     assert await resolve(None) is None
+
+
+async def test_resolve_session_touches_the_activity_tracker_on_success():
+    oauth, sessions = FakeOAuth(), FakeSessions()
+    record = await build_login(oauth, sessions)("code")
+    tracker = ActivityTracker()
+    resolve = ResolveSession(sessions=sessions, clock=clock, activity=tracker)
+
+    resolved = await resolve(record.id)
+
+    assert resolved == record
+    assert tracker.active(NOW, timedelta(minutes=1)) == [(record.id, record.user.id)]
+
+
+async def test_resolve_session_without_a_tracker_still_works():
+    oauth, sessions = FakeOAuth(), FakeSessions()
+    record = await build_login(oauth, sessions)("code")
+    resolve = ResolveSession(sessions=sessions, clock=clock)
+
+    assert await resolve(record.id) == record
+
+
+async def test_resolve_session_does_not_touch_the_tracker_when_session_is_missing_or_expired():
+    sessions = FakeSessions()
+    tracker = ActivityTracker()
+    resolve = ResolveSession(sessions=sessions, clock=clock, activity=tracker)
+
+    assert await resolve("no-such-session") is None
+    assert tracker.active(NOW, timedelta(days=1)) == []
 
 
 async def test_logout_deletes_session_and_revokes_token():

@@ -113,6 +113,9 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> SECRET_KEY
 | `LONG_RUN_MINUTES` | no | `30` | Minutes an active run may run before it is flagged long-running |
 | `SECURITY_ALERTS` | no | `true` | Fetch code-scanning and secret-scanning alerts per repository (`true`/`false`/`1`/`0`) |
 | `HYGIENE_CHECKS` | no | `true` | Score each repository's hygiene from the batched GraphQL query (`true`/`false`/`1`/`0`); when `false` every repository is reported as not applicable instead |
+| `BACKGROUND_REFRESH` | no | `true` | Keep recently active users' overview cache warm in the background (`true`/`false`/`1`/`0`) |
+| `BACKGROUND_REFRESH_SECONDS` | no | `240` | Seconds between background-refresh ticks (minimum `60`) |
+| `BACKGROUND_REFRESH_IDLE_MINUTES` | no | `30` | Only refresh sessions seen within this many minutes (minimum `1`) |
 | `DB_PATH` | no | `./data/sessions.db` | SQLite session store (single replica) |
 | `REDIS_URL` | no | | Redis for sessions and cache (multiple replicas) |
 
@@ -162,7 +165,9 @@ session store.
 - A `401` from GitHub (token revoked in your GitHub settings) deletes the session immediately.
 - Expiring tokens ("Expire user access tokens" in the OAuth App) are supported: the refresh
   token is stored encrypted alongside the access token and rotated on every refresh.
-- Strict Content-Security-Policy; no inline scripts. The only external resources are the web fonts.
+- Strict Content-Security-Policy; no inline scripts, no third-party requests. IBM Plex Sans/Mono
+  are self-hosted under `app/web/static/fonts/` (SIL Open Font License 1.1, see
+  `app/web/static/fonts/LICENSE.txt`).
 - No data is shared between users; the cache is keyed by GitHub user ID.
 - `security_events` lets the app read Dependabot, code-scanning and secret-scanning alerts;
   `notifications` lets it read (but never mark read/unsubscribe) your notifications feed. Both
@@ -192,9 +197,11 @@ the underlying store.
 ```
 app/
   domain/          models, aggregation (build_overview), snapshot/diff, JSON codec — pure, no I/O
-  application/     use cases (CompleteLogin, GetOverview, GetChanges, SavePreferences…) and ports
-  infrastructure/  adapters: GitHub HTTP (GraphQL + REST), SQLite/Redis sessions and user state,
-                   memory/Redis cache, Fernet cipher, settings from env
+  application/     use cases (CompleteLogin, GetOverview, GetChanges, SavePreferences…), the
+                   in-memory session-activity tracker feeding the background refresh, and ports
+  infrastructure/  adapters: GitHub HTTP (GraphQL + REST, with a conditional-request ETag
+                   cache), SQLite/Redis sessions and user state, memory/Redis overview cache,
+                   Fernet cipher, settings from env
   web/             FastAPI routers (incl. /api/preferences, /api/seen), composition root
                    (container.py), templates, static assets
 tests/
@@ -216,6 +223,25 @@ to intermittently hit GitHub's per-query resource limits. Workflow runs, code/se
 alerts and unreleased-commit counts come from the REST API, fetched concurrently with a
 semaphore. Archived repositories are not queried for runs, security alerts, release status or
 hygiene.
+
+Every one of those REST calls rides on conditional requests: an `ETag` from a previous
+response is sent back as `If-None-Match`, and an unchanged resource comes back as a `304` with
+an empty body instead of a full `200` - which, unlike a `200`, does not count against the
+token's REST rate limit. A small bounded LRU (`app/infrastructure/http_cache.py`, 2000 entries
+by default) holds the ETag and parsed body per `(token, url)` pair, so a repeat refresh of an
+account that has not changed since the last one is almost free. GraphQL is not covered by this
+- GitHub does not support conditional requests for it - so the two GraphQL queries above are
+still paid on every refresh.
+
+The background refresh (`BACKGROUND_REFRESH`, on by default) is what makes that saving pay off
+for the person actually using the dashboard: every `BACKGROUND_REFRESH_SECONDS`, one process
+tracks which sessions were seen in the last `BACKGROUND_REFRESH_IDLE_MINUTES` and force-refreshes
+their overview cache, one session after another. Only users who were actually looking recently
+get warmed, and each warming refresh is cheap precisely because of conditional requests above -
+so by the time someone reloads the page, the overview is very likely already sitting in cache
+instead of triggering a 7-10s live fetch. The tracker is in-memory per process (see
+`app/application/activity.py`); with several replicas each one warms only the sessions it
+happens to see traffic for.
 
 ## Development
 

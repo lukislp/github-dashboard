@@ -7,6 +7,7 @@ from datetime import timedelta
 
 import httpx
 
+from app.application.activity import ActivityTracker
 from app.application.ports import (
     GitHubApi,
     GitHubOAuth,
@@ -46,6 +47,7 @@ class Container:
     cache: OverviewCache
     cipher: TokenCipher
     user_state: UserStateRepository
+    activity: ActivityTracker
     complete_login: CompleteLogin
     resolve_session: ResolveSession
     logout: Logout
@@ -118,6 +120,7 @@ class Container:
         user_state: UserStateRepository,
     ) -> Container:
         """Build the use cases from explicit adapters (used by tests with fakes)."""
+        activity = ActivityTracker()
         return cls(
             settings=settings,
             signer=CookieSigner(settings.secret_key),
@@ -127,6 +130,7 @@ class Container:
             cache=cache,
             cipher=cipher,
             user_state=user_state,
+            activity=activity,
             complete_login=CompleteLogin(
                 oauth=oauth,
                 sessions=sessions,
@@ -134,7 +138,7 @@ class Container:
                 policy=AccessPolicy(settings.allowed_logins),
                 session_ttl=timedelta(hours=settings.session_ttl_hours),
             ),
-            resolve_session=ResolveSession(sessions=sessions),
+            resolve_session=ResolveSession(sessions=sessions, activity=activity),
             logout=Logout(oauth=oauth, sessions=sessions, cipher=cipher, cache=cache),
             get_overview=GetOverview(
                 api=api,

@@ -18,7 +18,9 @@ data:
   ALLOWED_LOGINS: "lukislp"
   LOG_LEVEL: "INFO"
   DB_PATH: "/data/sessions.db"
-  CACHE_TTL_SECONDS: "120"
+  # Longer than BACKGROUND_REFRESH_SECONDS below, so the warmed entry never expires between two
+  # background ticks and a page load is served from cache instead of waiting ~10 s for GitHub.
+  CACHE_TTL_SECONDS: "300"
   SESSION_TTL_HOURS: "168"
   RUNS_PER_REPO: "5"
   STALE_DAYS: "14"
@@ -26,3 +28,10 @@ data:
   MAX_CONCURRENCY: "8"
   SECURITY_ALERTS: "true"
   HYGIENE_CHECKS: "true"
+
+  # Keeps the overview cache warm for whoever looked recently. Affordable because the REST calls
+  # ride on conditional requests: a repository that did not change answers 304 and costs no
+  # rate-limit units at all (measured: 102 units for a cold refresh, 12 for a warm one).
+  BACKGROUND_REFRESH: "true"
+  BACKGROUND_REFRESH_SECONDS: "240"
+  BACKGROUND_REFRESH_IDLE_MINUTES: "30"
