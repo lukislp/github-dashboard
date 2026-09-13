@@ -135,6 +135,7 @@ class Branch:
 @dataclass(frozen=True, slots=True)
 class Repository:
     full_name: str
+    node_id: str
     name: str
     owner: str
     url: str

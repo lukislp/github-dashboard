@@ -210,6 +210,7 @@ def branch_from_dict(d: dict[str, Any]) -> Branch:
 def repository_to_dict(repo: Repository) -> dict[str, Any]:
     return {
         "full_name": repo.full_name,
+        "node_id": repo.node_id,
         "name": repo.name,
         "owner": repo.owner,
         "url": repo.url,
@@ -236,6 +237,7 @@ def repository_to_dict(repo: Repository) -> dict[str, Any]:
 def repository_from_dict(d: dict[str, Any]) -> Repository:
     return Repository(
         full_name=d["full_name"],
+        node_id=d.get("node_id", ""),
         name=d["name"],
         owner=d["owner"],
         url=d["url"],

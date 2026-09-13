@@ -1,11 +1,13 @@
 """Contract tests against the real GitHub API. Run with GH_TOKEN set; skipped otherwise."""
 
 import os
+import time
 
 import httpx
 import pytest
 
 from app.application.errors import ActionsUnavailable
+from app.domain.hygiene import assess_hygiene
 from app.infrastructure.github_http import GitHubHttpApi
 
 pytestmark = pytest.mark.skipif(not os.environ.get("GH_TOKEN"), reason="GH_TOKEN not set")
@@ -15,27 +17,48 @@ async def test_live_repositories_and_runs():
     token = os.environ["GH_TOKEN"]
     async with httpx.AsyncClient(timeout=30) as client:
         api = GitHubHttpApi(client, api_url="https://api.github.com")
+
+        start = time.monotonic()
         page = await api.list_repositories(token)
+        repositories_elapsed = time.monotonic() - start
+        print(
+            f"\nlist_repositories: {repositories_elapsed:.2f}s for {len(page.repositories)} repos"
+        )
+
         assert page.repositories, "token sees no repositories"
         assert page.rate_limit is not None
 
         candidate = next(r for r in page.repositories if not r.is_archived)
 
-        # Hygiene facts are always computed by the adapter; a non-archived, non-fork
-        # repository always has all nine checks evaluated and is marked applicable.
+        non_archived_ids = [r.node_id for r in page.repositories if not r.is_archived]
+        start = time.monotonic()
+        hygiene_page = await api.fetch_hygiene(token, non_archived_ids)
+        hygiene_elapsed = time.monotonic() - start
+        print(
+            f"fetch_hygiene: {hygiene_elapsed:.2f}s for {len(non_archived_ids)} repos "
+            f"in {max(1, -(-len(non_archived_ids) // 25))} batch(es)"
+        )
+
+        # Hygiene facts are computed for every non-archived repository requested; a non-fork
+        # one always has all nine checks evaluated and is marked applicable.
         applicable_candidate = next(
             r for r in page.repositories if not r.is_archived and not r.is_fork
         )
-        hygiene = page.hygiene_by_repo[applicable_candidate.full_name]
+        facts = hygiene_page.hygiene_by_repo.get(applicable_candidate.full_name)
+        assert facts is not None, "hygiene batch for this repository was not recovered"
+        hygiene = assess_hygiene(facts)
         assert hygiene.applicable is True
         assert hygiene.total == 9
         assert 0 <= hygiene.score <= 100
 
         # Branches without a pull request: sanity-check the shape only, since the actual
-        # counts depend on the state of whatever repositories the token can see.
-        assert candidate.branch_count >= 0
-        for branch in candidate.branches_without_pr:
-            assert branch.name != candidate.default_branch
+        # counts depend on the state of whatever repositories the token can see, and a
+        # repository's listing may be absent if its hygiene batch degraded.
+        listing = hygiene_page.branches_by_repo.get(candidate.full_name)
+        if listing is not None:
+            assert listing.branch_count >= 0
+            for branch in listing.branches:
+                assert branch.name != candidate.default_branch
 
         try:
             runs = await api.list_recent_runs(token, candidate.owner, candidate.name, 5)
