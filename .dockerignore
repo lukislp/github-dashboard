@@ -3,7 +3,7 @@
 .env
 data
 tests
-deploy
+k8s
 docs
 .github
 __pycache__

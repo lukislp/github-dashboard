@@ -1,0 +1,17 @@
+# Applies EXCLUSIVELY k8s/flux-deploy/ (the curated Flux-managed subset - see that folder's
+# kustomization.yaml for which files and why). The resource kinds used there (ConfigMap, PVC,
+# Service, Deployment) are covered by the shared reconciler ClusterRole in homelab-infra.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: github-dashboard-deploy
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: github-dashboard
+  path: ./k8s/flux-deploy
+  prune: true
+  wait: true
+  timeout: 3m

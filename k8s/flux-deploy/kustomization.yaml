@@ -1,0 +1,10 @@
+# Deliberately ONLY these files - NOT the rest of k8s/. kustomize-controller's least-privilege
+# ClusterRole only grants Deployments/ConfigMaps/Services/PersistentVolumeClaims - NOT
+# Namespaces, Secrets, NetworkPolicies or Gateway API objects. Those stay bootstrap-only
+# (applied once by hand); Flux continuously reconciles exactly this subset, which includes the
+# image tag the deploy-bump job rewrites on every release.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../01-config.yaml
+  - ../03-app.yaml

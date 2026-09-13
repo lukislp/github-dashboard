@@ -325,9 +325,9 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-  # Bumps the released version into deploy/k8s/base/kustomization.yaml so the manifests always
-  # pin an explicit image tag, pushing over the same deploy key semantic-release uses. Skips
-  # itself if that file doesn't exist.
+  # Writes the released image tag into the Flux-managed manifests under k8s/ (nothing in the
+  # cluster pushes to this repo, so this is the only way a release reaches the Deployment),
+  # pushing over the same deploy key semantic-release uses.
   deploy-bump:
     needs: [get-version, docker-manifest-merge, trivy]
     if: github.event_name == 'push' && needs.get-version.outputs.published == 'true'
@@ -352,16 +352,14 @@ jobs:
         with:
           deploy-key: ${{ secrets.SEMANTIC_RELEASE_DEPLOY_KEY }}
           required: "true"
-      - name: Bump the image tag and push
+      - name: Point the manifests at the released image and push
         run: |
           set -eu
-          if [ ! -f deploy/k8s/base/kustomization.yaml ]; then
-            echo "deploy/k8s/base/kustomization.yaml not found - nothing to bump."
-            exit 0
-          fi
-          sed -i -E "s#(newTag: ).*#\1${NEXT_VERSION}#" deploy/k8s/base/kustomization.yaml
+          for f in $(grep -rlE 'ghcr\.io/lukislp/github-dashboard:' k8s --include='*.yaml' | grep -v '/flux/'); do
+            sed -i -E "s#(ghcr\.io/lukislp/github-dashboard):[0-9A-Za-z._-]+#\1:${NEXT_VERSION}#g" "$f"
+          done
           if git diff --quiet; then
-            echo "kustomization.yaml already references ${NEXT_VERSION}"
+            echo "manifests already reference ${NEXT_VERSION}"
             exit 0
           fi
           git diff --stat
