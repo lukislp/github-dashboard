@@ -24,11 +24,23 @@
     expanded: new Set(),
     inboxFilter: null,
     seenAutoMarked: false,
+    // Pull requests/issues fetched on demand via "Load more", keyed by "owner/repo:kind".
+    // Kept at the top level (not per-render) so collapsing and re-expanding a row, or any
+    // unrelated re-render, never loses what was already paged in.
+    moreItems: new Map(),
   };
 
   // Working copy of the groups being edited in the "Manage groups" dialog; rebuilt on open,
   // discarded on cancel/close. Kept separate from state.data.preferences so Cancel is free.
   let dialogState = { groups: [], error: "" };
+
+  // Re-run confirmation/progress, keyed by "owner/repo#run_id". Kept outside `state` (and so
+  // outside `state.data`) because it must survive the periodic re-renders triggered by every
+  // filter/language/favourite change without being reset by a fresh overview load.
+  const rerunState = new Map();
+  // The run currently in its "really re-run?" confirmation window, if any - a click anywhere
+  // that is not that button cancels it (see the document click listener in bind()).
+  let activeConfirmKey = null;
 
   const $ = (sel) => document.querySelector(sel);
   const els = {
@@ -231,8 +243,12 @@
     return `<span class="alert-cell alert-cell--${tone}" title="${esc(title)}">${ICONS.shield}<span class="mono">${esc(I18N.formatNumber(security.total))}</span></span>`;
   }
 
+  function filterBotsList(prs) {
+    return state.filters.bots ? prs : prs.filter((p) => !p.is_bot);
+  }
+
   function visiblePrs(repo) {
-    return state.filters.bots ? repo.pull_requests : repo.pull_requests.filter((p) => !p.is_bot);
+    return filterBotsList(repo.pull_requests);
   }
 
   function displayedPrCount(repo) {
@@ -287,6 +303,239 @@
       }
     }
     return `<span class="runs">${cells.join("")}</span>`;
+  }
+
+  // ---------- CI duration ----------
+
+  function formatDuration(totalSeconds) {
+    const s = Math.max(0, Math.round(totalSeconds || 0));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return t("duration_hours_minutes", { h, m });
+    if (m > 0) return t("duration_minutes_seconds", { m, s: sec });
+    return t("duration_seconds", { s: sec });
+  }
+
+  // ---------- pull request / issue age ----------
+
+  function prAgeMarkup(pr) {
+    if (pr.age_days == null) return "";
+    if (pr.idle_days != null && pr.idle_days !== pr.age_days) {
+      return `<span class="mono age">${esc(t("age_idle", { n: pr.age_days, m: pr.idle_days }))}</span>`;
+    }
+    return `<span class="mono age">${esc(t("age_only", { n: pr.age_days }))}</span>`;
+  }
+
+  function issueAgeMarkup(issue) {
+    if (issue.age_days == null) return "";
+    return `<span class="mono age">${esc(t("age_only", { n: issue.age_days }))}</span>`;
+  }
+
+  // ---------- failed jobs ----------
+
+  function failedJobLabel(job) {
+    return job.step ? `${job.name} · ${job.step}` : job.name;
+  }
+
+  function failedJobsMarkup(jobs, containerClass, itemClass) {
+    if (!jobs || !jobs.length) return "";
+    const items = jobs
+      .map(
+        (j) =>
+          `<a class="${itemClass}" href="${esc(j.url)}" target="_blank" rel="noopener">${esc(failedJobLabel(j))}</a>`
+      )
+      .join("");
+    return `<div class="${containerClass}">${items}</div>`;
+  }
+
+  // ---------- re-run failed jobs ----------
+
+  const RERUN_ERROR_KEY = {
+    invalid_repository: "rerun_err_invalid_repository",
+    forbidden: "rerun_err_forbidden",
+    actions_unavailable: "rerun_err_actions_unavailable",
+    not_rerunnable: "rerun_err_not_rerunnable",
+    github_unavailable: "rerun_err_github_unavailable",
+  };
+
+  function rerunKey(owner, name, runId) {
+    return `${owner}/${name}#${runId}`;
+  }
+
+  function rerunControlMarkup(repo, run) {
+    if (!run.failed) return "";
+    const key = rerunKey(repo.owner, repo.name, run.id);
+    const info = rerunState.get(key) || { phase: "idle" };
+    if (info.phase === "queued") {
+      return `<span class="rerun-control"><span class="rerun-status mono">${esc(t("rerun_queued"))}</span></span>`;
+    }
+    const busy = info.phase === "busy";
+    const confirming = info.phase === "confirm";
+    const label = busy ? t("rerun_busy") : confirming ? t("rerun_confirm") : t("rerun_button");
+    const button = `<button type="button" class="btn btn--quiet btn--sm rerun-btn" ${busy ? "disabled" : ""} data-owner="${esc(repo.owner)}" data-name="${esc(repo.name)}" data-run-id="${run.id}">${esc(label)}</button>`;
+    const error =
+      info.phase === "error" ? `<span class="rerun-error mono">${esc(t(info.errorKey))}</span>` : "";
+    return `<span class="rerun-control">${button}${error}</span>`;
+  }
+
+  async function doRerun(owner, name, runId, key) {
+    rerunState.set(key, { phase: "busy" });
+    renderTable();
+    try {
+      const response = await fetch(
+        `/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/runs/${runId}/rerun`,
+        { method: "POST", headers: { Accept: "application/json" }, credentials: "same-origin" }
+      );
+      if (response.status === 202) {
+        rerunState.set(key, { phase: "queued" });
+        renderTable();
+        setTimeout(() => load(true), 5000);
+        return;
+      }
+      if (response.status === 401) {
+        window.location.assign("/login?error=expired");
+        return;
+      }
+      const body = await response.json().catch(() => ({}));
+      rerunState.set(key, {
+        phase: "error",
+        errorKey: RERUN_ERROR_KEY[body.error] || "rerun_err_unknown",
+      });
+      renderTable();
+    } catch (_) {
+      rerunState.set(key, { phase: "error", errorKey: "rerun_err_network" });
+      renderTable();
+    }
+  }
+
+  function handleRerunClick(button) {
+    const owner = button.dataset.owner;
+    const name = button.dataset.name;
+    const runId = Number(button.dataset.runId);
+    const key = rerunKey(owner, name, runId);
+    const info = rerunState.get(key);
+    if (info && (info.phase === "busy" || info.phase === "queued")) return;
+    if (info && info.phase === "confirm") {
+      clearTimeout(info.timer);
+      if (activeConfirmKey === key) activeConfirmKey = null;
+      doRerun(owner, name, runId, key);
+      return;
+    }
+    const timer = setTimeout(() => {
+      const cur = rerunState.get(key);
+      if (cur && cur.phase === "confirm") {
+        rerunState.delete(key);
+        if (activeConfirmKey === key) activeConfirmKey = null;
+        renderTable();
+      }
+    }, 4000);
+    rerunState.set(key, { phase: "confirm", timer });
+    activeConfirmKey = key;
+    renderTable();
+  }
+
+  function cancelActiveConfirm() {
+    if (!activeConfirmKey) return;
+    const key = activeConfirmKey;
+    activeConfirmKey = null;
+    const info = rerunState.get(key);
+    if (info) {
+      clearTimeout(info.timer);
+      rerunState.delete(key);
+    }
+    renderTable();
+  }
+
+  // ---------- load more pull requests / issues ----------
+
+  const ITEMS_ERROR_KEY = {
+    rate_limited: "err_rate_limited",
+    github_unavailable: "err_github",
+  };
+
+  function repoItemsKey(repoFullName, kind) {
+    return `${repoFullName}:${kind}`;
+  }
+
+  function mergeItemsByNumber(base, extra) {
+    const seen = new Set(base.map((i) => i.number));
+    const merged = base.slice();
+    extra.forEach((item) => {
+      if (!seen.has(item.number)) {
+        seen.add(item.number);
+        merged.push(item);
+      }
+    });
+    return merged;
+  }
+
+  function moreItemsMarkup(repo, kind, shownCount, totalCount) {
+    const key = repoItemsKey(repo.full_name, kind);
+    const entry = state.moreItems.get(key);
+    const remaining = Math.max(0, totalCount - shownCount);
+    const exhausted = !!(entry && entry.initialized && entry.nextCursor === null);
+    const githubPath = kind === "pull_requests" ? "pulls" : "issues";
+    const githubLink = `<a class="more" href="${esc(repo.url)}/${githubPath}" target="_blank" rel="noopener">${esc(t("open_on_github"))}</a>`;
+    if (remaining <= 0 || exhausted) {
+      return remaining > 0 ? `<div class="load-more">${githubLink}</div>` : "";
+    }
+    const loading = !!(entry && entry.loading);
+    const button = `<button type="button" class="btn btn--quiet btn--sm load-more-btn" ${loading ? "disabled" : ""} data-repo="${esc(repo.full_name)}" data-kind="${kind}">${esc(loading ? t("load_more_busy") : t("load_more_button", { n: remaining }))}</button>`;
+    const error =
+      entry && entry.error ? `<span class="load-more-error mono">${esc(t(entry.error))}</span>` : "";
+    return `<div class="load-more">${button}${githubLink}${error}</div>`;
+  }
+
+  async function handleLoadMoreClick(button) {
+    const repoFullName = button.dataset.repo;
+    const kind = button.dataset.kind;
+    const key = repoItemsKey(repoFullName, kind);
+    let entry = state.moreItems.get(key);
+    if (entry && entry.loading) return;
+    if (!entry) entry = { items: [], nextCursor: null, initialized: false, loading: false, error: null };
+    entry.loading = true;
+    entry.error = null;
+    state.moreItems.set(key, entry);
+    renderTable();
+
+    const slash = repoFullName.indexOf("/");
+    const owner = repoFullName.slice(0, slash);
+    const name = repoFullName.slice(slash + 1);
+    const cursor = entry.initialized ? entry.nextCursor : null;
+    const query = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
+    try {
+      const response = await fetch(
+        `/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/items?kind=${kind}${query}`,
+        { headers: { Accept: "application/json" }, credentials: "same-origin" }
+      );
+      if (response.status === 401) {
+        window.location.assign("/login?error=expired");
+        return;
+      }
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        entry.loading = false;
+        entry.error = ITEMS_ERROR_KEY[body.error] || "err_github";
+        state.moreItems.set(key, entry);
+        renderTable();
+        return;
+      }
+      const body = await response.json();
+      const newItems = kind === "pull_requests" ? body.pull_requests : body.issues;
+      entry.items = mergeItemsByNumber(entry.items, newItems);
+      entry.nextCursor = body.next_cursor;
+      entry.initialized = true;
+      entry.loading = false;
+      entry.error = null;
+      state.moreItems.set(key, entry);
+      renderTable();
+    } catch (_) {
+      entry.loading = false;
+      entry.error = "err_network";
+      state.moreItems.set(key, entry);
+      renderTable();
+    }
   }
 
   // ---------- preferences (groups & favourites) ----------
@@ -422,6 +671,7 @@
 
     let prsSub = t("kpi_prs_sub", { human: totals.human_prs ?? 0, bots: totals.bot_prs ?? 0 });
     if (totals.stale_prs > 0) prsSub += " · " + t("stale_suffix", { n: totals.stale_prs });
+    if (totals.oldest_pr_days > 0) prsSub += " · " + t("kpi_prs_oldest", { n: totals.oldest_pr_days });
     let issuesSub = t("kpi_issues_sub", { repos: reposWithIssues });
     if (totals.stale_issues > 0) issuesSub += " · " + t("stale_suffix", { n: totals.stale_issues });
 
@@ -947,9 +1197,10 @@
     const repo = item.repository;
     const ci = item.ci;
 
-    const prs = visiblePrs(repo);
+    const prExtra = (state.moreItems.get(repoItemsKey(repo.full_name, "pull_requests")) || {}).items || [];
+    const prs = filterBotsList(mergeItemsByNumber(repo.pull_requests, prExtra));
     const prCount = displayedPrCount(repo);
-    const prList = prs.length
+    const prListItems = prs.length
       ? `<ul>${prs
           .map(
             (p) => `<li>
@@ -961,43 +1212,51 @@
               ${p.stale ? staleTagMarkup() : ""}
               ${p.is_draft ? `<span class="tag">${esc(t("draft"))}</span>` : ""}
               <span class="by">${esc(p.author || "")}</span>
+              ${prAgeMarkup(p)}
             </li>`
           )
-          .join("")}</ul>` +
-        (prCount > prs.length
-          ? `<a class="more" href="${esc(repo.url)}/pulls" target="_blank" rel="noopener">${esc(t("more_on_github", { n: prCount - prs.length }))}</a>`
-          : "")
+          .join("")}</ul>`
       : `<p class="empty">${esc(t("none_open"))}</p>`;
+    const prList = prListItems + moreItemsMarkup(repo, "pull_requests", prs.length, prCount);
 
-    const issueList = repo.issues.length
-      ? `<ul>${repo.issues
+    const issueExtra = (state.moreItems.get(repoItemsKey(repo.full_name, "issues")) || {}).items || [];
+    const issues = mergeItemsByNumber(repo.issues, issueExtra);
+    const issueListItems = issues.length
+      ? `<ul>${issues
           .map(
             (i) => `<li>
               <span class="id">#${i.number}</span>
               <a class="title" href="${esc(i.url)}" target="_blank" rel="noopener" title="${esc(i.title)}">${esc(i.title)}</a>
               ${i.stale ? staleTagMarkup() : ""}
               <span class="by">${esc(i.author || "")}</span>
+              ${issueAgeMarkup(i)}
             </li>`
           )
-          .join("")}</ul>` +
-        (repo.open_issue_count > repo.issues.length
-          ? `<a class="more" href="${esc(repo.url)}/issues" target="_blank" rel="noopener">${esc(t("more_on_github", { n: repo.open_issue_count - repo.issues.length }))}</a>`
-          : "")
+          .join("")}</ul>`
       : `<p class="empty">${esc(t("none_open"))}</p>`;
+    const issueList = issueListItems + moreItemsMarkup(repo, "issues", issues.length, repo.open_issue_count);
 
     const runList = ci.runs.length
       ? `<ul>${ci.runs
           .map(
             (r) => `<li class="run-line">
-              <span class="run run--${esc(r.status)}"></span>
-              <a class="title" href="${esc(r.url)}" target="_blank" rel="noopener" title="${esc(r.title)}">${esc(r.workflow_name)}</a>
-              <span class="branch">${esc(r.branch || "")}</span>
-              <span class="status">${esc(t("run_" + r.status))} · ${esc(I18N.formatRelative(r.updated_at))}${r.long_running ? " " + esc(t("run_long_running_suffix")) : ""}</span>
+              <div class="run-line__row">
+                <span class="run run--${esc(r.status)}"></span>
+                <a class="title" href="${esc(r.url)}" target="_blank" rel="noopener" title="${esc(r.title)}">${esc(r.workflow_name)}</a>
+                <span class="branch">${esc(r.branch || "")}</span>
+                <span class="status">${esc(t("run_" + r.status))} · ${esc(I18N.formatRelative(r.updated_at))}${r.long_running ? " " + esc(t("run_long_running_suffix")) : ""}</span>
+              </div>
+              ${failedJobsMarkup(r.failed_jobs, "run-line__failed", "run-line__failed-job")}
+              ${rerunControlMarkup(repo, r)}
             </li>`
           )
           .join("")}</ul>` +
         `<a class="more" href="${esc(repo.url)}/actions" target="_blank" rel="noopener">${esc(t("open_on_github"))}</a>`
       : `<p class="empty">${esc(t("ci_" + ci.state))}</p>`;
+    const runsHeading =
+      ci.ci_seconds_recent > 0
+        ? `${esc(t("details_runs"))} · ${esc(formatDuration(ci.ci_seconds_recent))}`
+        : esc(t("details_runs"));
 
     const release = item.release;
     const releaseList = release
@@ -1070,7 +1329,7 @@
           <div class="details">
             <div><h4>${esc(t("details_prs"))} · ${prCount}</h4>${prList}</div>
             <div><h4>${esc(t("details_issues"))} · ${repo.open_issue_count}</h4>${issueList}</div>
-            <div><h4>${esc(t("details_runs"))}</h4>${runList}</div>
+            <div><h4>${runsHeading}</h4>${runList}</div>
             <div><h4>${esc(t("details_release"))}</h4>${releaseList}</div>
             <div><h4>${esc(t("details_security"))}</h4>${securityList}</div>
             <div><h4>${hygieneHeading}</h4>${hygieneList}</div>
@@ -1149,7 +1408,10 @@
         (f) => `<li class="failure">
           <span class="run run--${esc(f.run.status)}" aria-hidden="true"></span>
           <span class="failure__repo">${esc(f.repo_full_name)}</span>
-          <span class="failure__title"><a class="workflow" href="${esc(f.run.url)}" target="_blank" rel="noopener">${esc(f.run.workflow_name)}</a><span class="sep">·</span>${esc(f.run.title)}</span>
+          <span class="failure__title">
+            <span class="failure__title-line"><a class="workflow" href="${esc(f.run.url)}" target="_blank" rel="noopener">${esc(f.run.workflow_name)}</a><span class="sep">·</span>${esc(f.run.title)}</span>
+            ${failedJobsMarkup(f.run.failed_jobs, "failure__jobs", "failure__failed-job")}
+          </span>
           <span class="failure__branch">${esc(f.run.branch || "")}</span>
           <span class="failure__time" title="${esc(I18N.formatDateTime(f.run.updated_at))}">${esc(I18N.formatRelative(f.run.updated_at))}</span>
         </li>`
@@ -1171,6 +1433,17 @@
     ];
     if (d.rate_limit) {
       parts.push(t("footer_rate", { remaining: I18N.formatNumber(d.rate_limit.remaining), limit: I18N.formatNumber(d.rate_limit.limit) }));
+    }
+    if (d.totals.ci_seconds_recent > 0) {
+      parts.push(t("footer_ci_time", { duration: formatDuration(d.totals.ci_seconds_recent) }));
+    }
+    if (d.actions_usage && d.actions_usage.available) {
+      parts.push(
+        t("footer_actions_usage", {
+          used: I18N.formatNumber(d.actions_usage.minutes_used ?? 0),
+          included: I18N.formatNumber(d.actions_usage.included_minutes ?? 0),
+        })
+      );
     }
     parts.push(t("footer_auto", { min: AUTO_REFRESH_MS / 60000 }));
     els.footer.innerHTML = parts.map((p) => `<span>${esc(p)}</span>`).join("");
@@ -1404,6 +1677,19 @@
         toggleFavorite(starButton.dataset.repo);
         return;
       }
+      const rerunButton = event.target.closest(".rerun-btn");
+      if (rerunButton) {
+        // Stopped so the document-level listener below does not immediately cancel the
+        // confirmation state this very click just set.
+        event.stopPropagation();
+        handleRerunClick(rerunButton);
+        return;
+      }
+      const loadMoreButton = event.target.closest(".load-more-btn");
+      if (loadMoreButton) {
+        handleLoadMoreClick(loadMoreButton);
+        return;
+      }
       if (event.target.closest("a")) return;
       const row = event.target.closest(".repo-row");
       if (!row) return;
@@ -1412,6 +1698,10 @@
       else state.expanded.add(name);
       renderTable();
     });
+
+    // Any click that isn't on the confirming re-run button itself cancels its confirmation
+    // window (the button's own handler above stops its click from reaching here).
+    document.addEventListener("click", cancelActiveConfirm);
 
     document.addEventListener("langchange", renderAll);
     document.addEventListener("visibilitychange", () => {
