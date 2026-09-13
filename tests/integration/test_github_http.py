@@ -7,10 +7,12 @@ import pytest
 import respx
 
 from app.application.errors import (
+    AccessDenied,
     ActionsUnavailable,
     AuthenticationError,
     GitHubUnavailable,
     RateLimited,
+    RunNotRerunnable,
 )
 from app.domain.models import ChecksState, Mergeable, ReviewDecision, RunStatus, SeverityCounts
 from app.infrastructure.github_http import GitHubHttpApi, GitHubHttpOAuth
@@ -88,6 +90,7 @@ def repo_node(
                     "title": "Bug",
                     "url": "u",
                     "updatedAt": "2026-09-01T10:00:00Z",
+                    "createdAt": "2026-08-25T10:00:00Z",
                     "author": None,
                 }
             ][:issues],
@@ -1221,3 +1224,331 @@ async def test_oauth_refresh_token_server_error_raises_github_unavailable(client
     )
     with pytest.raises(GitHubUnavailable):
         await oauth.refresh_token("ghr_bad")
+
+
+# -- failed jobs -------------------------------------------------------------------------------
+
+
+def _jobs_payload(jobs: list[dict]) -> dict:
+    return {"total_count": len(jobs), "jobs": jobs}
+
+
+def _job(
+    name: str,
+    *,
+    conclusion: str = "failure",
+    html_url: str = "https://github.com/octocat/a/actions/runs/1/job/1",
+    steps: list[dict] | None = None,
+) -> dict:
+    return {
+        "name": name,
+        "conclusion": conclusion,
+        "html_url": html_url,
+        "steps": (
+            steps
+            if steps is not None
+            else [
+                {"name": "Set up job", "number": 1, "conclusion": "success"},
+                {"name": "Run tests", "number": 2, "conclusion": "failure"},
+                {"name": "Post job", "number": 3, "conclusion": "success"},
+            ]
+        ),
+    }
+
+
+@respx.mock
+async def test_list_failed_jobs_maps_first_failing_step(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs/1/jobs").mock(
+        return_value=httpx.Response(200, json=_jobs_payload([_job("build")]))
+    )
+    jobs = await GitHubHttpApi(client, api_url=API).list_failed_jobs("tok", "octocat", "a", 1)
+
+    assert len(jobs) == 1
+    assert jobs[0].name == "build"
+    assert jobs[0].step == "Run tests"
+    assert jobs[0].url == "https://github.com/octocat/a/actions/runs/1/job/1"
+
+
+@respx.mock
+async def test_list_failed_jobs_ignores_successful_jobs(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs/1/jobs").mock(
+        return_value=httpx.Response(
+            200, json=_jobs_payload([_job("build", conclusion="success", steps=[])])
+        )
+    )
+    jobs = await GitHubHttpApi(client, api_url=API).list_failed_jobs("tok", "octocat", "a", 1)
+    assert jobs == ()
+
+
+@respx.mock
+async def test_list_failed_jobs_with_no_failing_step_reports_step_none(client):
+    job = _job(
+        "build",
+        steps=[
+            {"name": "Set up job", "number": 1, "conclusion": "success"},
+            {"name": "Post job", "number": 2, "conclusion": "cancelled"},
+        ],
+    )
+    respx.get(f"{API}/repos/octocat/a/actions/runs/1/jobs").mock(
+        return_value=httpx.Response(200, json=_jobs_payload([job]))
+    )
+    jobs = await GitHubHttpApi(client, api_url=API).list_failed_jobs("tok", "octocat", "a", 1)
+    assert jobs[0].step is None
+
+
+@respx.mock
+async def test_list_failed_jobs_degrades_to_empty_on_404(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs/1/jobs").mock(return_value=httpx.Response(404))
+    jobs = await GitHubHttpApi(client, api_url=API).list_failed_jobs("tok", "octocat", "a", 1)
+    assert jobs == ()
+
+
+@respx.mock
+async def test_list_failed_jobs_degrades_to_empty_on_403_without_rate_limit(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs/1/jobs").mock(
+        return_value=httpx.Response(403, headers={"x-ratelimit-remaining": "500"})
+    )
+    jobs = await GitHubHttpApi(client, api_url=API).list_failed_jobs("tok", "octocat", "a", 1)
+    assert jobs == ()
+
+
+@respx.mock
+async def test_list_failed_jobs_raises_rate_limited_on_exhausted_403(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs/1/jobs").mock(
+        return_value=httpx.Response(403, headers={"x-ratelimit-remaining": "0"})
+    )
+    with pytest.raises(RateLimited):
+        await GitHubHttpApi(client, api_url=API).list_failed_jobs("tok", "octocat", "a", 1)
+
+
+@respx.mock
+async def test_list_failed_jobs_raises_authentication_error_on_401(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs/1/jobs").mock(return_value=httpx.Response(401))
+    with pytest.raises(AuthenticationError):
+        await GitHubHttpApi(client, api_url=API).list_failed_jobs("tok", "octocat", "a", 1)
+
+
+@respx.mock
+async def test_list_failed_jobs_raises_github_unavailable_on_500(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs/1/jobs").mock(return_value=httpx.Response(500))
+    with pytest.raises(GitHubUnavailable):
+        await GitHubHttpApi(client, api_url=API).list_failed_jobs("tok", "octocat", "a", 1)
+
+
+@respx.mock
+async def test_list_failed_jobs_uses_conditional_requests(client):
+    route = respx.get(f"{API}/repos/octocat/a/actions/runs/1/jobs").mock(
+        side_effect=[
+            httpx.Response(200, headers={"etag": "j1"}, json=_jobs_payload([_job("build")])),
+            httpx.Response(304),
+        ]
+    )
+    api = GitHubHttpApi(client, api_url=API, cache=ConditionalCache())
+
+    first = await api.list_failed_jobs("tok", "octocat", "a", 1)
+    second = await api.list_failed_jobs("tok", "octocat", "a", 1)
+
+    assert route.calls[1].request.headers["if-none-match"] == "j1"
+    assert first == second
+
+
+# -- rerun failed jobs ---------------------------------------------------------------------
+
+
+@respx.mock
+async def test_rerun_failed_jobs_success_on_201_and_202(client):
+    route = respx.post(f"{API}/repos/octocat/a/actions/runs/1/rerun-failed-jobs").mock(
+        side_effect=[httpx.Response(201), httpx.Response(202)]
+    )
+    api = GitHubHttpApi(client, api_url=API)
+    await api.rerun_failed_jobs("tok", "octocat", "a", 1)
+    await api.rerun_failed_jobs("tok", "octocat", "a", 1)
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_rerun_failed_jobs_raises_authentication_error_on_401(client):
+    respx.post(f"{API}/repos/octocat/a/actions/runs/1/rerun-failed-jobs").mock(
+        return_value=httpx.Response(401)
+    )
+    with pytest.raises(AuthenticationError):
+        await GitHubHttpApi(client, api_url=API).rerun_failed_jobs("tok", "octocat", "a", 1)
+
+
+@respx.mock
+async def test_rerun_failed_jobs_raises_access_denied_on_403(client):
+    respx.post(f"{API}/repos/octocat/a/actions/runs/1/rerun-failed-jobs").mock(
+        return_value=httpx.Response(403)
+    )
+    with pytest.raises(AccessDenied):
+        await GitHubHttpApi(client, api_url=API).rerun_failed_jobs("tok", "octocat", "a", 1)
+
+
+@respx.mock
+async def test_rerun_failed_jobs_raises_actions_unavailable_on_404(client):
+    respx.post(f"{API}/repos/octocat/a/actions/runs/1/rerun-failed-jobs").mock(
+        return_value=httpx.Response(404)
+    )
+    with pytest.raises(ActionsUnavailable):
+        await GitHubHttpApi(client, api_url=API).rerun_failed_jobs("tok", "octocat", "a", 1)
+
+
+@respx.mock
+async def test_rerun_failed_jobs_raises_run_not_rerunnable_on_409(client):
+    respx.post(f"{API}/repos/octocat/a/actions/runs/1/rerun-failed-jobs").mock(
+        return_value=httpx.Response(409)
+    )
+    with pytest.raises(RunNotRerunnable):
+        await GitHubHttpApi(client, api_url=API).rerun_failed_jobs("tok", "octocat", "a", 1)
+
+
+@respx.mock
+async def test_rerun_failed_jobs_raises_github_unavailable_on_500(client):
+    respx.post(f"{API}/repos/octocat/a/actions/runs/1/rerun-failed-jobs").mock(
+        return_value=httpx.Response(500)
+    )
+    with pytest.raises(GitHubUnavailable):
+        await GitHubHttpApi(client, api_url=API).rerun_failed_jobs("tok", "octocat", "a", 1)
+
+
+# -- list_repo_items (paginated pull requests / issues) -----------------------------------
+
+
+def _repo_items_page(nodes: list[dict], *, has_next: bool, cursor: str | None) -> dict:
+    return {
+        "data": {
+            "repository": {
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                    "nodes": nodes,
+                }
+            }
+        }
+    }
+
+
+def _repo_issues_page(nodes: list[dict], *, has_next: bool, cursor: str | None) -> dict:
+    return {
+        "data": {
+            "repository": {
+                "issues": {
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                    "nodes": nodes,
+                }
+            }
+        }
+    }
+
+
+@respx.mock
+async def test_list_repo_items_pull_requests_paginates(client):
+    route = respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(
+            200, json=_repo_items_page([pr_node(1)], has_next=True, cursor="c1")
+        )
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repo_items(
+        "tok", "octocat", "a", "pull_requests", None, 50
+    )
+
+    assert [p.number for p in page.pull_requests] == [1]
+    assert page.issues == ()
+    assert page.next_cursor == "c1"
+    body = json.loads(route.calls[0].request.content)
+    assert body["variables"] == {"owner": "octocat", "name": "a", "cursor": None, "pageSize": 50}
+
+
+@respx.mock
+async def test_list_repo_items_pull_requests_last_page_has_no_cursor(client):
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(
+            200, json=_repo_items_page([pr_node(1)], has_next=False, cursor=None)
+        )
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repo_items(
+        "tok", "octocat", "a", "pull_requests", "c1", 50
+    )
+    assert page.next_cursor is None
+
+
+@respx.mock
+async def test_list_repo_items_issues(client):
+    issue_node = {
+        "number": 5,
+        "title": "Bug",
+        "url": "u",
+        "updatedAt": "2026-09-01T10:00:00Z",
+        "createdAt": "2026-08-20T10:00:00Z",
+        "author": {"login": "bob"},
+    }
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(
+            200, json=_repo_issues_page([issue_node], has_next=False, cursor=None)
+        )
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repo_items(
+        "tok", "octocat", "a", "issues", None, 50
+    )
+
+    assert page.pull_requests == ()
+    assert [i.number for i in page.issues] == [5]
+    assert page.issues[0].author == "bob"
+    assert page.next_cursor is None
+
+
+async def test_list_repo_items_rejects_unknown_kind(client):
+    with pytest.raises(ValueError, match="unknown item kind"):
+        await GitHubHttpApi(client, api_url=API).list_repo_items(
+            "tok", "octocat", "a", "bogus", None, 50
+        )
+
+
+# -- actions usage billing endpoint ---------------------------------------------------------
+
+
+@respx.mock
+async def test_fetch_actions_usage_available(client):
+    respx.get(f"{API}/users/octocat/settings/billing/actions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total_minutes_used": 150,
+                "total_paid_minutes_used": 0,
+                "included_minutes": 2000,
+            },
+        )
+    )
+    usage = await GitHubHttpApi(client, api_url=API).fetch_actions_usage("tok", "octocat")
+
+    assert usage.available is True
+    assert usage.minutes_used == 150
+    assert usage.included_minutes == 2000
+    assert usage.paid_minutes_used == 0
+
+
+@respx.mock
+async def test_fetch_actions_usage_unavailable_on_403(client):
+    respx.get(f"{API}/users/octocat/settings/billing/actions").mock(
+        return_value=httpx.Response(403, headers={"x-ratelimit-remaining": "500"})
+    )
+    usage = await GitHubHttpApi(client, api_url=API).fetch_actions_usage("tok", "octocat")
+    assert usage.available is False
+    assert usage.minutes_used is None
+
+
+@respx.mock
+async def test_fetch_actions_usage_unavailable_on_404(client):
+    respx.get(f"{API}/users/octocat/settings/billing/actions").mock(
+        return_value=httpx.Response(404)
+    )
+    usage = await GitHubHttpApi(client, api_url=API).fetch_actions_usage("tok", "octocat")
+    assert usage.available is False
+
+
+@respx.mock
+async def test_fetch_actions_usage_raises_authentication_error_on_401(client):
+    respx.get(f"{API}/users/octocat/settings/billing/actions").mock(
+        return_value=httpx.Response(401)
+    )
+    with pytest.raises(AuthenticationError):
+        await GitHubHttpApi(client, api_url=API).fetch_actions_usage("tok", "octocat")

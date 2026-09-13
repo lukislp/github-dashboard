@@ -23,3 +23,7 @@ class GitHubUnavailable(ApplicationError):
 
 class ActionsUnavailable(ApplicationError):
     """Workflow runs of one repository cannot be read (Actions disabled, no permission)."""
+
+
+class RunNotRerunnable(ApplicationError):
+    """GitHub refused to rerun a workflow run's failed jobs (409: still in progress or too old)."""

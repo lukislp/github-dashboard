@@ -12,18 +12,22 @@ from urllib.parse import urlencode
 import httpx
 
 from app.application.errors import (
+    AccessDenied,
     ActionsUnavailable,
     AuthenticationError,
     GitHubUnavailable,
     RateLimited,
+    RunNotRerunnable,
 )
-from app.application.ports import BranchListing, HygienePage, RepositoryPage, TokenSet
+from app.application.ports import BranchListing, HygienePage, RepoItemPage, RepositoryPage, TokenSet
 from app.domain.hygiene import HygieneFacts
 from app.domain.models import (
+    ActionsUsage,
     AttentionItem,
     AttentionKind,
     Branch,
     ChecksState,
+    FailedJob,
     Inbox,
     Issue,
     LastCommit,
@@ -64,6 +68,8 @@ _HYGIENE_BATCH_SIZE = 25
 _REFS_PAGE_SIZE = 50
 _RETRYABLE_HTTP_STATUSES = frozenset({502, 503, 504})
 _RESOURCE_LIMITS_EXCEEDED = "RESOURCE_LIMITS_EXCEEDED"
+# Job/step conclusions that count as a failure, mirroring `FAILED_STATUSES` for workflow runs.
+_JOB_FAILED_CONCLUSIONS = frozenset({"failure", "timed_out", "startup_failure"})
 
 _REPOSITORIES_QUERY = """
 query Repositories(
@@ -133,7 +139,7 @@ query Repositories(
           states: OPEN, first: $issueDetails, orderBy: { field: UPDATED_AT, direction: DESC }
         ) {
           totalCount
-          nodes { number title url updatedAt author { login } }
+          nodes { number title url updatedAt createdAt author { login } }
         }
         vulnerabilityAlerts(states: OPEN, first: 100) {
           totalCount
@@ -196,6 +202,57 @@ query Hygiene($ids: [ID!]!, $refsPageSize: Int!) {
   }
 }
 """
+
+_REPO_PULL_REQUESTS_QUERY = """
+query RepoPullRequests($owner: String!, $name: String!, $cursor: String, $pageSize: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(
+      states: OPEN
+      first: $pageSize
+      after: $cursor
+      orderBy: { field: UPDATED_AT, direction: DESC }
+    ) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        url
+        isDraft
+        updatedAt
+        author { login }
+        createdAt
+        headRefName
+        reviewDecision
+        mergeable
+        commits(last: 1) {
+          nodes { commit { statusCheckRollup { state } } }
+        }
+      }
+    }
+  }
+}
+"""
+
+_REPO_ISSUES_QUERY = """
+query RepoIssues($owner: String!, $name: String!, $cursor: String, $pageSize: Int!) {
+  repository(owner: $owner, name: $name) {
+    issues(
+      states: OPEN
+      first: $pageSize
+      after: $cursor
+      orderBy: { field: UPDATED_AT, direction: DESC }
+    ) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number title url updatedAt createdAt author { login } }
+    }
+  }
+}
+"""
+
+_ITEMS_QUERY_BY_KIND = {
+    "pull_requests": _REPO_PULL_REQUESTS_QUERY,
+    "issues": _REPO_ISSUES_QUERY,
+}
 
 _INBOX_QUERY = """
 query Inbox(
@@ -681,6 +738,89 @@ class GitHubHttpApi:
         _raise_for_status(response, context=context)
         return [_run_from_json(r) for r in response.json().get("workflow_runs", [])]
 
+    async def list_failed_jobs(
+        self, token: str, owner: str, name: str, run_id: int
+    ) -> tuple[FailedJob, ...]:
+        context = f"jobs {owner}/{name}#{run_id}"
+        response = await self._conditional_get(
+            token,
+            f"{self._api_url}/repos/{owner}/{name}/actions/runs/{run_id}/jobs",
+            params={"filter": "latest", "per_page": 50},
+            context=context,
+        )
+        if _optional_or_raise(response, context=context):
+            return ()
+        jobs = response.json().get("jobs", [])
+        return tuple(
+            _failed_job_from_json(j) for j in jobs if j.get("conclusion") in _JOB_FAILED_CONCLUSIONS
+        )
+
+    async def rerun_failed_jobs(self, token: str, owner: str, name: str, run_id: int) -> None:
+        """`POST .../rerun-failed-jobs`. Not a conditional GET: this is the app's one write."""
+        context = f"rerun {owner}/{name}#{run_id}"
+        try:
+            response = await self._client.post(
+                f"{self._api_url}/repos/{owner}/{name}/actions/runs/{run_id}/rerun-failed-jobs",
+                headers=_headers(token),
+            )
+        except httpx.HTTPError as exc:
+            raise GitHubUnavailable(context) from exc
+        status = response.status_code
+        if status in (201, 202):
+            return
+        if status == 401:
+            raise AuthenticationError(context)
+        if status == 403:
+            raise AccessDenied(context)
+        if status == 404:
+            raise ActionsUnavailable(context)
+        if status == 409:
+            raise RunNotRerunnable(context)
+        raise GitHubUnavailable(f"{context}: HTTP {status}")
+
+    async def list_repo_items(
+        self, token: str, owner: str, name: str, kind: str, cursor: str | None, limit: int
+    ) -> RepoItemPage:
+        query = _ITEMS_QUERY_BY_KIND.get(kind)
+        if query is None:
+            raise ValueError(f"unknown item kind: {kind!r}")
+        data = await self._graphql(
+            token, query, {"owner": owner, "name": name, "cursor": cursor, "pageSize": limit}
+        )
+        field_name = "pullRequests" if kind == "pull_requests" else "issues"
+        connection = (data.get("repository") or {}).get(field_name) or {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [],
+        }
+        page_info = connection["pageInfo"]
+        next_cursor = page_info["endCursor"] if page_info["hasNextPage"] else None
+        nodes = [n for n in connection["nodes"] if n]
+        if kind == "pull_requests":
+            return RepoItemPage(
+                pull_requests=tuple(_pull_request_from_node(n) for n in nodes),
+                next_cursor=next_cursor,
+            )
+        return RepoItemPage(
+            issues=tuple(_issue_from_node(n) for n in nodes), next_cursor=next_cursor
+        )
+
+    async def fetch_actions_usage(self, token: str, login: str) -> ActionsUsage:
+        context = f"actions usage {login}"
+        response = await self._conditional_get(
+            token, f"{self._api_url}/users/{login}/settings/billing/actions", context=context
+        )
+        if _optional_or_raise(response, context=context):
+            return ActionsUsage(
+                available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
+            )
+        data = response.json()
+        return ActionsUsage(
+            available=True,
+            minutes_used=int(data.get("total_minutes_used", 0)),
+            included_minutes=int(data.get("included_minutes", 0)),
+            paid_minutes_used=int(data.get("total_paid_minutes_used", 0)),
+        )
+
     async def search_inbox(self, token: str) -> Inbox:
         variables = {
             "reviewRequested": "is:open is:pr review-requested:@me archived:false",
@@ -921,6 +1061,39 @@ def _hygiene_from_nodes(
     return hygiene_by_repo, branches_by_repo
 
 
+def _pull_request_from_node(p: dict[str, Any]) -> PullRequest:
+    """Map one `pullRequests` GraphQL node. Shared by the repositories query and
+    `list_repo_items`, which select the identical set of pull-request fields."""
+    return PullRequest(
+        number=p["number"],
+        title=p["title"],
+        url=p["url"],
+        author=(p.get("author") or {}).get("login"),
+        is_draft=bool(p["isDraft"]),
+        updated_at=_parse_dt(p["updatedAt"]),  # type: ignore[arg-type]
+        created_at=_parse_dt(p["createdAt"]),  # type: ignore[arg-type]
+        head_branch=p.get("headRefName"),
+        review_decision=(
+            ReviewDecision(p["reviewDecision"].lower()) if p.get("reviewDecision") else None
+        ),
+        checks=_pr_checks(p),
+        mergeable=(Mergeable(p["mergeable"].lower()) if p.get("mergeable") else Mergeable.UNKNOWN),
+        is_bot=is_bot_login((p.get("author") or {}).get("login")),
+    )
+
+
+def _issue_from_node(i: dict[str, Any]) -> Issue:
+    """Map one `issues` GraphQL node. Shared by the repositories query and `list_repo_items`."""
+    return Issue(
+        number=i["number"],
+        title=i["title"],
+        url=i["url"],
+        author=(i.get("author") or {}).get("login"),
+        updated_at=_parse_dt(i["updatedAt"]),  # type: ignore[arg-type]
+        created_at=_parse_dt(i["createdAt"]),  # type: ignore[arg-type]
+    )
+
+
 def _repository_from_node(node: dict[str, Any]) -> Repository:
     language = node.get("primaryLanguage") or {}
     default_branch = node.get("defaultBranchRef") or {}
@@ -944,39 +1117,8 @@ def _repository_from_node(node: dict[str, Any]) -> Repository:
         default_branch=default_branch.get("name"),
         open_pr_count=int(prs["totalCount"]),
         open_issue_count=int(issues["totalCount"]),
-        pull_requests=tuple(
-            PullRequest(
-                number=p["number"],
-                title=p["title"],
-                url=p["url"],
-                author=(p.get("author") or {}).get("login"),
-                is_draft=bool(p["isDraft"]),
-                updated_at=_parse_dt(p["updatedAt"]),  # type: ignore[arg-type]
-                created_at=_parse_dt(p["createdAt"]),  # type: ignore[arg-type]
-                head_branch=p.get("headRefName"),
-                review_decision=(
-                    ReviewDecision(p["reviewDecision"].lower()) if p.get("reviewDecision") else None
-                ),
-                checks=_pr_checks(p),
-                mergeable=(
-                    Mergeable(p["mergeable"].lower()) if p.get("mergeable") else Mergeable.UNKNOWN
-                ),
-                is_bot=is_bot_login((p.get("author") or {}).get("login")),
-            )
-            for p in prs["nodes"]
-            if p
-        ),
-        issues=tuple(
-            Issue(
-                number=i["number"],
-                title=i["title"],
-                url=i["url"],
-                author=(i.get("author") or {}).get("login"),
-                updated_at=_parse_dt(i["updatedAt"]),  # type: ignore[arg-type]
-            )
-            for i in issues["nodes"]
-            if i
-        ),
+        pull_requests=tuple(_pull_request_from_node(p) for p in prs["nodes"] if p),
+        issues=tuple(_issue_from_node(i) for i in issues["nodes"] if i),
         last_commit=_last_commit_from_node(default_branch.get("target")),
     )
 
@@ -1011,6 +1153,7 @@ def _run_status(status: str | None, conclusion: str | None) -> RunStatus:
 
 
 def _run_from_json(data: dict[str, Any]) -> WorkflowRun:
+    created_at = _parse_dt(data.get("created_at")) or datetime.now(UTC)
     return WorkflowRun(
         id=int(data["id"]),
         workflow_name=data.get("name") or data.get("path") or "workflow",
@@ -1020,6 +1163,23 @@ def _run_from_json(data: dict[str, Any]) -> WorkflowRun:
         event=data.get("event", ""),
         status=_run_status(data.get("status"), data.get("conclusion")),
         run_number=int(data.get("run_number", 0)),
-        created_at=_parse_dt(data.get("created_at")) or datetime.now(UTC),
+        created_at=created_at,
         updated_at=_parse_dt(data.get("updated_at")) or datetime.now(UTC),
+        started_at=_parse_dt(data.get("run_started_at")) or created_at,
+    )
+
+
+def _first_failed_step(job: dict[str, Any]) -> str | None:
+    """The name of the first step in `job` whose conclusion is a failure, if any."""
+    for step in job.get("steps") or []:
+        if step.get("conclusion") in _JOB_FAILED_CONCLUSIONS:
+            return step.get("name")
+    return None
+
+
+def _failed_job_from_json(job: dict[str, Any]) -> FailedJob:
+    return FailedJob(
+        name=job.get("name", ""),
+        step=_first_failed_step(job),
+        url=job.get("html_url", ""),
     )

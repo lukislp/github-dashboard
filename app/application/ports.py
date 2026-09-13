@@ -9,11 +9,15 @@ from typing import Protocol
 
 from app.domain.hygiene import HygieneFacts
 from app.domain.models import (
+    ActionsUsage,
     Branch,
+    FailedJob,
     Inbox,
+    Issue,
     Notification,
     Overview,
     Preferences,
+    PullRequest,
     RateLimit,
     ReleaseInfo,
     Repository,
@@ -92,6 +96,19 @@ class HygienePage:
     branches_by_repo: Mapping[str, BranchListing] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class RepoItemPage:
+    """One cursor-paginated page of a single repository's open pull requests or issues.
+
+    Only one of `pull_requests`/`issues` is ever populated, depending on the `kind` requested
+    from `GitHubApi.list_repo_items`.
+    """
+
+    pull_requests: tuple[PullRequest, ...] = ()
+    issues: tuple[Issue, ...] = ()
+    next_cursor: str | None = None
+
+
 class GitHubOAuth(Protocol):
     def authorize_url(self, state: str) -> str: ...
 
@@ -159,6 +176,38 @@ class GitHubApi(Protocol):
     async def list_notifications(self, token: str) -> list[Notification] | None:
         """Unread notifications for the viewer. `None` when the `notifications` scope is
         missing (GitHub answers 403/404)."""
+        ...
+
+    async def list_failed_jobs(
+        self, token: str, owner: str, name: str, run_id: int
+    ) -> tuple[FailedJob, ...]:
+        """Failed jobs of one workflow run, each with the first step that failed in it.
+
+        Empty when the run has no failed jobs, or when the lookup itself is unavailable
+        (404/403); callers must never treat that as an error."""
+        ...
+
+    async def rerun_failed_jobs(self, token: str, owner: str, name: str, run_id: int) -> None:
+        """Re-run the failed jobs of one workflow run. The only write this app performs.
+
+        Raises `AccessDenied` (403), `ActionsUnavailable` (404), `RunNotRerunnable` (409: the
+        run is still in progress or too old to rerun) or `AuthenticationError` (401)."""
+        ...
+
+    async def list_repo_items(
+        self, token: str, owner: str, name: str, kind: str, cursor: str | None, limit: int
+    ) -> RepoItemPage:
+        """One cursor-paginated page of one repository's open pull requests or issues.
+
+        `kind` is `"pull_requests"` or `"issues"`."""
+        ...
+
+    async def fetch_actions_usage(self, token: str, login: str) -> ActionsUsage:
+        """GitHub Actions billing usage for the signed-in user.
+
+        `ActionsUsage.available` is False (all other fields `None`) when the endpoint answers
+        403/404 - typically because the token's OAuth scopes do not include `user` - which must
+        never be treated as an error."""
         ...
 
 
