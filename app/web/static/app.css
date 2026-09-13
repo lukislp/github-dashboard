@@ -158,15 +158,15 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 
 .kpis {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--surface);
   overflow: hidden;
 }
 .kpi { padding: 16px 20px 14px; border-right: 1px solid var(--line); min-width: 0; }
-.kpi:nth-child(4n) { border-right: 0; }
-.kpi:nth-child(n + 5) { border-top: 1px solid var(--line); }
+.kpi:nth-child(5n) { border-right: 0; }
+.kpi:nth-child(n + 6) { border-top: 1px solid var(--line); }
 .kpi__label { font-size: 0.78rem; color: var(--muted); letter-spacing: 0.02em; margin: 0 0 6px; }
 .kpi__value { font-size: 2rem; font-weight: 600; line-height: 1; letter-spacing: -0.02em; margin: 0; }
 .kpi__sub {
@@ -176,6 +176,7 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 }
 .kpi--critical .kpi__value { color: var(--critical-ink); }
 .kpi--good .kpi__value { color: var(--good-ink); }
+.kpi--warning .kpi__value { color: var(--warning-ink); }
 .kpi--accent .kpi__value { color: var(--accent-ink); }
 .kpi.is-loading .kpi__value { color: var(--line-strong); }
 
@@ -292,7 +293,7 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 /* No overflow container on wide screens: a scroll container would turn the sticky header
    into a 52px offset inside the wrapper and hide the first row. */
 .table-wrap { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
-.repo-table { width: 100%; border-collapse: collapse; font-size: 0.92rem; min-width: 800px; }
+.repo-table { width: 100%; border-collapse: collapse; font-size: 0.92rem; min-width: 880px; }
 .repo-table th {
   text-align: left; font-weight: 500; font-size: 0.78rem; color: var(--muted);
   padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--surface-2);
@@ -300,6 +301,7 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 }
 .repo-table th.col-num, .repo-table td.col-num { text-align: right; width: 96px; }
 .repo-table th.col-alerts, .repo-table td.col-alerts { text-align: right; width: 84px; }
+.repo-table th.col-hygiene, .repo-table td.col-hygiene { width: 110px; }
 .repo-table th.col-ci, .repo-table td.col-ci { width: 220px; }
 .repo-table th.col-pushed, .repo-table td.col-pushed { width: 220px; color: var(--muted); }
 .repo-table th.col-toggle, .repo-table td.col-toggle { width: 40px; text-align: center; }
@@ -320,11 +322,12 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 .repo-name__owner { color: var(--muted); font-family: var(--font-mono); font-size: 0.85rem; }
 .repo-name__name { font-weight: 500; color: var(--ink); }
 .repo-name__name:hover { color: var(--accent-ink); }
-.repo-meta { display: flex; align-items: center; gap: 10px; margin-top: 3px; font-size: 0.78rem; color: var(--muted); }
+.repo-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-top: 3px; font-size: 0.78rem; color: var(--muted); }
 .lang { display: inline-flex; align-items: center; gap: 5px; }
 .lang__dot { width: 8px; height: 8px; border-radius: 50%; background: var(--neutral); }
 .badge { font-family: var(--font-mono); font-size: 0.72rem; padding: 1px 6px; border-radius: var(--radius-sm); border: 1px solid var(--line-strong); color: var(--ink-2); }
 .badge--archived { color: var(--warning-ink); border-color: var(--warning-ink); }
+.badge--warning { color: var(--warning-ink); border-color: var(--warning-ink); }
 
 .favorite-star {
   border: 0; background: transparent; padding: 0; margin: 0; flex: none;
@@ -349,6 +352,25 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 .alert-cell--critical { color: var(--critical-ink); }
 .alert-cell--warning { color: var(--warning-ink); }
 .alert-cell--muted { color: var(--line-strong); }
+
+/* Hygiene meter: a filled track, no colour named grey — the unfilled part is a lighter
+   step of the same hue as the fill, driven by the same good/warning/critical thresholds. */
+.hygiene-cell { display: inline-flex; align-items: center; gap: 8px; }
+.hygiene-cell--muted { color: var(--line-strong); font-family: var(--font-mono); }
+.meter { position: relative; width: 40px; height: 6px; border-radius: 999px; overflow: hidden; flex: none; background: var(--good-soft); }
+.meter--warning { background: var(--warning-soft); }
+.meter--critical { background: var(--critical-soft); }
+.meter__fill { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--good); }
+.meter--warning .meter__fill { background: var(--warning); }
+.meter--critical .meter__fill { background: var(--critical); }
+
+.hygiene-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px; }
+.hygiene-check { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 0.86rem; }
+.hygiene-check .icon { flex: none; align-self: center; }
+.hygiene-check--good .icon { color: var(--good-ink); }
+.hygiene-check--critical .icon { color: var(--critical-ink); }
+.hygiene-check__label { flex: none; }
+.hygiene-check__detail { color: var(--muted); font-size: 0.78rem; }
 
 .pushed__time { white-space: nowrap; }
 .pushed__commit {
@@ -511,7 +533,7 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
   .table-wrap { overflow-x: auto; }
   .repo-table th { position: static; }
   .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .kpi:nth-child(4n) { border-right: 1px solid var(--line); }
+  .kpi:nth-child(5n) { border-right: 1px solid var(--line); }
   .kpi:nth-child(3n) { border-right: 0; }
   .kpi:nth-child(n + 4) { border-top: 1px solid var(--line); }
   .inbox__tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }

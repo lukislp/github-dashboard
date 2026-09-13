@@ -57,6 +57,7 @@ async def overview(
     body = overview_to_dict(result.overview)
     body["from_cache"] = result.from_cache
     body["cache_ttl_seconds"] = container.settings.cache_ttl_seconds
+    body["stale_days"] = container.settings.stale_days
     body["user"] = user_to_dict(session.user)
     body["preferences"] = preferences_to_dict(preferences)
     body["changes"] = changes_to_dict(changes)

@@ -18,6 +18,7 @@
       archived: false,
       forks: true,
       bots: true,
+      lowHygiene: false,
     },
     sort: { key: "default", dir: "asc" },
     expanded: new Set(),
@@ -53,6 +54,7 @@
     archived: $("#filter-archived"),
     forks: $("#filter-forks"),
     bots: $("#filter-bots"),
+    lowHygiene: $("#filter-low-hygiene"),
   };
 
   // ---------- helpers ----------
@@ -150,12 +152,33 @@
   const CI_RANK = { failing: 0, running: 1, unavailable: 2, neutral: 3, passing: 4, none: 5, skipped: 6 };
 
   function needsAttention(item) {
+    const hasStaleBranch = (item.repository.branches_without_pr || []).some((b) => b.stale);
+    const hasLowHygiene = item.hygiene.applicable && item.hygiene.score < 70;
     return (
       item.ci.state === "failing" ||
       item.repository.open_pr_count > 0 ||
       item.repository.open_issue_count > 0 ||
-      (item.security && item.security.has_critical)
+      (item.security && item.security.has_critical) ||
+      hasStaleBranch ||
+      hasLowHygiene
     );
+  }
+
+  function hygieneTone(score) {
+    return score >= 90 ? "good" : score >= 70 ? "warning" : "critical";
+  }
+
+  function hygieneCellMarkup(hygiene) {
+    if (!hygiene.applicable) {
+      return `<span class="hygiene-cell hygiene-cell--muted" title="${esc(t("hygiene_not_applicable"))}">–</span>`;
+    }
+    const tone = hygieneTone(hygiene.score);
+    const failing = hygiene.checks.filter((c) => !c.ok).map((c) => t("hygiene_" + c.key));
+    const title = failing.length ? failing.join("\n") : t("hygiene_all_pass");
+    return `<span class="hygiene-cell" title="${esc(title)}">
+      <span class="meter meter--${tone}"><span class="meter__fill" data-width="${hygiene.score}"></span></span>
+      <span class="mono">${esc(I18N.formatNumber(hygiene.score))}</span>
+    </span>`;
   }
 
   function severityBreakdown(counts) {
@@ -474,6 +497,30 @@
         sub: notifSub,
         tone: notifAvailable && totals.notifications_unread > 0 ? "accent" : null,
       },
+      {
+        key: "hygiene",
+        label: t("kpi_hygiene"),
+        value: totals.hygiene_average,
+        suffix: "%",
+        sub: t("kpi_hygiene_sub", {
+          a: totals.repos_without_ci ?? 0,
+          b: totals.repos_without_protection ?? 0,
+          c: totals.repos_without_dependency_updates ?? 0,
+        }),
+        tone:
+          (totals.hygiene_average ?? 0) >= 90
+            ? "good"
+            : (totals.hygiene_average ?? 0) >= 70
+              ? "warning"
+              : "critical",
+      },
+      {
+        key: "branches_without_pr",
+        label: t("kpi_branches_without_pr"),
+        value: totals.branches_without_pr,
+        sub: t("kpi_branches_without_pr_sub", { n: totals.stale_branches ?? 0, days: d ? d.stale_days : 14 }),
+        tone: (totals.stale_branches ?? 0) > 0 ? "warning" : null,
+      },
     ];
 
     els.kpis.innerHTML = tiles
@@ -481,7 +528,7 @@
         (tile) => `
         <div class="kpi ${tile.tone && !loading ? "kpi--" + tile.tone : ""} ${loading ? "is-loading" : ""}">
           <p class="kpi__label">${esc(tile.label)}</p>
-          <p class="kpi__value">${loading || tile.value == null ? "—" : esc(I18N.formatNumber(tile.value))}</p>
+          <p class="kpi__value">${loading || tile.value == null ? "—" : esc(I18N.formatNumber(tile.value) + (tile.suffix || ""))}</p>
           <p class="kpi__sub">${loading ? "" : esc(tile.sub)}</p>
         </div>`
       )
@@ -767,6 +814,7 @@
       if (!f.forks && repo.is_fork) return false;
       if (f.owner && repo.owner !== f.owner) return false;
       if (f.attention && !needsAttention(item)) return false;
+      if (f.lowHygiene && !(item.hygiene.applicable && item.hygiene.score < 90)) return false;
       if (activeGroup && !activeGroup.repos.includes(repo.full_name)) return false;
       if (f.favorites && !favoriteSet.has(repo.full_name)) return false;
       if (q) {
@@ -783,10 +831,14 @@
       prs: (a, b) => a.repository.open_pr_count - b.repository.open_pr_count,
       issues: (a, b) => a.repository.open_issue_count - b.repository.open_issue_count,
       alerts: (a, b) => (a.security.total || 0) - (b.security.total || 0),
+      hygiene: (a, b) => a.hygiene.score - b.hygiene.score,
       ci: (a, b) => CI_RANK[a.ci.state] - CI_RANK[b.ci.state],
       pushed: (a, b) => Date.parse(a.repository.pushed_at || 0) - Date.parse(b.repository.pushed_at || 0),
     };
-    if (comparators[key]) {
+    if (f.lowHygiene) {
+      // The "Low hygiene" quick view always sorts worst-first, overriding the column sort.
+      items = items.slice().sort((a, b) => a.hygiene.score - b.hygiene.score);
+    } else if (comparators[key]) {
       items = items.slice().sort((a, b) => sign * comparators[key](a, b));
     }
     // Favourites float to the top; Array#sort is stable, so this preserves the sort above
@@ -822,9 +874,16 @@
       unreleasedCommits > 0
         ? `<span class="badge" title="${esc(t("badge_unreleased_title", { n: unreleasedCommits }))}">${esc(t("badge_unreleased", { n: unreleasedCommits }))}</span>`
         : "";
+    const branchesWithoutPr = repo.branches_without_pr.length;
+    const branchesStale = repo.branches_without_pr.some((b) => b.stale);
+    const branchesBadge =
+      branchesWithoutPr > 0
+        ? `<span class="badge ${branchesStale ? "badge--warning" : ""}">${esc(t("badge_branches_without_pr", { n: branchesWithoutPr }))}</span>`
+        : "";
     const alertsCell = repo.is_archived
       ? `<span class="num is-zero">–</span>`
       : alertsCellMarkup(item.security);
+    const hygieneCell = hygieneCellMarkup(item.hygiene);
     const longRunning = ci.long_running_count > 0;
     const ciLabel = longRunning
       ? t("ci_running_slow")
@@ -851,11 +910,12 @@
             ${newTag}
             ${badges.join("")}
           </div>
-          <div class="repo-meta">${favoriteStar}${lang}${stars}${unreleasedBadge}</div>
+          <div class="repo-meta">${favoriteStar}${lang}${stars}${unreleasedBadge}${branchesBadge}</div>
         </td>
         <td class="col-num"><span class="num-cell"><span class="num ${prCount ? "is-hot" : "is-zero"}">${prCount}</span>${dots}</span></td>
         <td class="col-num"><span class="num ${repo.open_issue_count ? "is-hot" : "is-zero"}">${repo.open_issue_count}</span></td>
         <td class="col-alerts">${alertsCell}</td>
+        <td class="col-hygiene">${hygieneCell}</td>
         <td class="col-ci">
           <div class="ci ci--${esc(ci.state)}">
             ${ci.state === "skipped" ? "" : runsMarkup(ci.runs, runsPerRepo)}
@@ -951,9 +1011,51 @@
       .map((line) => `<li>${esc(line)}</li>`)
       .join("")}</ul><a class="more" href="${esc(repo.url)}/security" target="_blank" rel="noopener">${esc(t("security_open_link"))}</a>`;
 
+    const hygiene = item.hygiene;
+    const hygieneHeading = hygiene.applicable
+      ? `${esc(t("details_hygiene"))} · ${esc(I18N.formatNumber(hygiene.score))}%`
+      : esc(t("details_hygiene"));
+    const hygieneBody = hygiene.applicable
+      ? `<ul class="hygiene-list">${hygiene.checks
+          .map(
+            (c) => `<li class="hygiene-check hygiene-check--${c.ok ? "good" : "critical"}">
+              ${c.ok ? ICONS.check : ICONS.x}
+              <span class="hygiene-check__label">${esc(t("hygiene_" + c.key))}</span>
+              ${c.detail ? `<span class="hygiene-check__detail">${esc(c.detail)}</span>` : ""}
+            </li>`
+          )
+          .join("")}</ul>`
+      : `<p class="empty">${esc(t("hygiene_not_applicable_detail"))}</p>`;
+    const hygieneList = `${hygieneBody}<a class="more" href="${esc(repo.url)}/settings" target="_blank" rel="noopener">${esc(t("hygiene_settings_link"))}</a>`;
+
+    const branches = repo.branches_without_pr;
+    const branchesHeading = esc(
+      t("details_branches", { n: branches.length, branch_count: repo.branch_count })
+    );
+    let branchesBody;
+    if (!branches.length) {
+      branchesBody = `<p class="empty">${esc(t("branches_empty"))}</p>`;
+    } else {
+      const shown = branches.slice(0, 8);
+      const extra = branches.length - shown.length;
+      branchesBody =
+        `<ul>${shown
+          .map(
+            (b) => `<li>
+              <span class="branch">${esc(b.name)}</span>
+              <span class="by">${esc(b.author || "")}</span>
+              <span class="by" title="${esc(I18N.formatDateTime(b.last_commit_at))}">${esc(I18N.formatRelative(b.last_commit_at))}</span>
+              ${b.stale ? staleTagMarkup() : ""}
+            </li>`
+          )
+          .join("")}</ul>` +
+        (extra > 0 ? `<div><span class="more">${esc(t("branches_more", { n: extra }))}</span></div>` : "");
+    }
+    const branchesList = `${branchesBody}<a class="more" href="${esc(repo.url)}/branches" target="_blank" rel="noopener">${esc(t("branches_open_link"))}</a>`;
+
     return `
       <tr class="detail-row" data-detail="${esc(repo.full_name)}">
-        <td colspan="7">
+        <td colspan="8">
           ${groupsLineMarkup(repo)}
           <div class="details">
             <div><h4>${esc(t("details_prs"))} · ${prCount}</h4>${prList}</div>
@@ -961,6 +1063,8 @@
             <div><h4>${esc(t("details_runs"))}</h4>${runList}</div>
             <div><h4>${esc(t("details_release"))}</h4>${releaseList}</div>
             <div><h4>${esc(t("details_security"))}</h4>${securityList}</div>
+            <div><h4>${hygieneHeading}</h4>${hygieneList}</div>
+            <div><h4>${branchesHeading}</h4>${branchesList}</div>
           </div>
         </td>
       </tr>`;
@@ -969,7 +1073,7 @@
   function renderTable() {
     const d = state.data;
     if (!d) {
-      els.rows.innerHTML = `<tr><td colspan="7" class="table-empty">${esc(t("loading"))}</td></tr>`;
+      els.rows.innerHTML = `<tr><td colspan="8" class="table-empty">${esc(t("loading"))}</td></tr>`;
       els.count.textContent = "";
       return;
     }
@@ -978,11 +1082,18 @@
     els.count.textContent = t("repo_count", { shown: items.length, total: d.repos.length });
     els.rows.innerHTML = items.length
       ? items.map((item) => repoRow(item, changedNames)).join("")
-      : `<tr><td colspan="7" class="table-empty">${esc(t("empty_table"))}</td></tr>`;
+      : `<tr><td colspan="8" class="table-empty">${esc(t("empty_table"))}</td></tr>`;
 
     // Language colours come from GitHub; set them via CSSOM because the CSP forbids inline styles.
     els.rows.querySelectorAll(".lang__dot[data-color]").forEach((dot) => {
       if (/^#[0-9a-f]{3,8}$/i.test(dot.dataset.color)) dot.style.backgroundColor = dot.dataset.color;
+    });
+
+    // Hygiene meter fill widths, same CSSOM reasoning as the language dots above.
+    els.rows.querySelectorAll(".meter__fill[data-width]").forEach((fill) => {
+      const raw = Number(fill.dataset.width);
+      const pct = Number.isFinite(raw) ? Math.max(0, Math.min(100, raw)) : 0;
+      fill.style.width = pct + "%";
     });
 
     els.rows.querySelectorAll(".add-to-group").forEach((select) => {
@@ -1244,6 +1355,7 @@
       ["archived", els.archived],
       ["forks", els.forks],
       ["bots", els.bots],
+      ["lowHygiene", els.lowHygiene],
     ]) {
       el.addEventListener("change", () => {
         state.filters[key] = el.checked;
