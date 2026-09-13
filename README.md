@@ -165,7 +165,9 @@ session store.
 - A `401` from GitHub (token revoked in your GitHub settings) deletes the session immediately.
 - Expiring tokens ("Expire user access tokens" in the OAuth App) are supported: the refresh
   token is stored encrypted alongside the access token and rotated on every refresh.
-- Strict Content-Security-Policy; no inline scripts. The only external resources are the web fonts.
+- Strict Content-Security-Policy; no inline scripts, no third-party requests. IBM Plex Sans/Mono
+  are self-hosted under `app/web/static/fonts/` (SIL Open Font License 1.1, see
+  `app/web/static/fonts/LICENSE.txt`).
 - No data is shared between users; the cache is keyed by GitHub user ID.
 - `security_events` lets the app read Dependabot, code-scanning and secret-scanning alerts;
   `notifications` lets it read (but never mark read/unsubscribe) your notifications feed. Both

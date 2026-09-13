@@ -1,14 +1,11 @@
 <!doctype html>
-<html lang="{{ lang }}">
+<html lang="{{ lang }}"{% if theme in ("light", "dark") %} data-theme="{{ theme }}"{% endif %}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>GitHub Dashboard</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body data-page="login">
@@ -19,6 +16,7 @@
     </a>
     <div class="topbar__actions">
       <button type="button" class="btn btn--quiet lang-toggle" id="lang-toggle" aria-label="Language"></button>
+      <button type="button" class="btn btn--quiet theme-toggle" id="theme-toggle" aria-label="Theme"></button>
     </div>
   </header>
 
@@ -44,5 +42,6 @@
   </main>
 
   <script src="/static/i18n.js"></script>
+  <script src="/static/theme.js"></script>
 </body>
 </html>
