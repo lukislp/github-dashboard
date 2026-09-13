@@ -1,3 +1,10 @@
+## [1.1.2](https://github.com/lukislp/github-dashboard/compare/v1.1.1...v1.1.2) (2026-09-13)
+
+
+### Bug Fixes
+
+* **k8s:** add explicit egress policies for the dashboard ([#6](https://github.com/lukislp/github-dashboard/issues/6)) ([08fad7f](https://github.com/lukislp/github-dashboard/commit/08fad7f2911cc8eae273917626ad6d2f2de985c2))
+
 ## [1.1.1](https://github.com/lukislp/github-dashboard/compare/v1.1.0...v1.1.1) (2026-09-13)
 
 
