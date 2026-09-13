@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/lukislp/github-dashboard/compare/v1.1.4...v1.2.0) (2026-09-13)
+
+
+### Features
+
+* conditional requests, background cache warm-up, self-hosted fonts, theme switch ([#9](https://github.com/lukislp/github-dashboard/issues/9)) ([edd266a](https://github.com/lukislp/github-dashboard/commit/edd266a41062656f354863d1c3fdd48b402f3ebd))
+
 ## [1.1.4](https://github.com/lukislp/github-dashboard/compare/v1.1.3...v1.1.4) (2026-09-13)
 
 
