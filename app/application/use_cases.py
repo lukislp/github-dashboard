@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from app.application.activity import ActivityTracker
 from app.application.errors import (
     AccessDenied,
     ActionsUnavailable,
@@ -128,8 +129,15 @@ class CompleteLogin:
 class ResolveSession:
     sessions: SessionRepository
     clock: Clock = utc_now
+    activity: ActivityTracker | None = None
 
-    async def __call__(self, session_id: str | None) -> SessionRecord | None:
+    async def __call__(self, session_id: str | None, *, touch: bool = True) -> SessionRecord | None:
+        """Resolve a session id, recording the session as active unless `touch` is False.
+
+        The background refresh resolves sessions too, and it must NOT count that as activity:
+        otherwise every session it ever warmed would keep itself inside the idle window and be
+        refreshed until it expires days later, long after the user stopped looking.
+        """
         if not session_id:
             return None
         record = await self.sessions.get(session_id)
@@ -138,6 +146,8 @@ class ResolveSession:
         if record.expires_at <= self.clock():
             await self.sessions.delete(session_id)
             return None
+        if touch and self.activity is not None:
+            self.activity.touch(session_id, record.user.id, self.clock())
         return record
 
 

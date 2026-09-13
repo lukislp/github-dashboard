@@ -6,13 +6,14 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.application.errors import AuthenticationError, GitHubUnavailable, RateLimited
 from app.infrastructure.settings import Settings
 from app.web import routes_api, routes_auth, routes_pages
 from app.web.container import Container
@@ -57,10 +58,17 @@ def create_app(container: Container | None = None) -> FastAPI:
         logging.getLogger("uvicorn.access").addFilter(RedactOAuthCallbackQuery())
         app.state.container = active
         purge_task = asyncio.create_task(_purge_loop(active))
+        refresh_task = (
+            asyncio.create_task(refresh_loop(active))
+            if active.settings.background_refresh
+            else None
+        )
         try:
             yield
         finally:
             purge_task.cancel()
+            if refresh_task is not None:
+                refresh_task.cancel()
             if owned:
                 await active.aclose()
 
@@ -89,6 +97,48 @@ async def _purge_loop(container: Container) -> None:
         except Exception:  # noqa: BLE001 - keep the loop alive
             log.exception("session purge failed")
         await asyncio.sleep(_PURGE_INTERVAL_SECONDS)
+
+
+async def _refresh_active_sessions(container: Container, now: datetime) -> None:
+    """One background-refresh tick: force-refresh every session seen within
+    `BACKGROUND_REFRESH_IDLE_MINUTES`, one after another (never concurrently - this only exists
+    to keep the cache warm, it should never compete with foreground traffic).
+
+    Extracted out of `refresh_loop` so it can be exercised directly in tests, once, without
+    waiting on the loop's sleep.
+    """
+    idle = timedelta(minutes=container.settings.background_refresh_idle_minutes)
+    # One warm-up per user, not per session: the cache is keyed by user id, so a second browser
+    # of the same person would otherwise pay for the identical refresh twice.
+    refreshed: set[int] = set()
+    for session_id, user_id in container.activity.active(now, idle):
+        if user_id in refreshed:
+            continue
+        try:
+            session = await container.resolve_session(session_id, touch=False)
+            if session is None:
+                container.activity.forget(session_id)
+                continue
+            await container.get_overview(session, force_refresh=True)
+            refreshed.add(user_id)
+        except AuthenticationError:
+            container.activity.forget(session_id)
+        except RateLimited:
+            log.warning("background refresh rate limited, skipping the rest of this cycle")
+            return
+        except GitHubUnavailable as exc:
+            log.warning("background refresh failed user_id=%s: %s", user_id, exc)
+        except Exception:  # noqa: BLE001 - one session's failure must never stop the others
+            log.exception("background refresh failed unexpectedly user_id=%s", user_id)
+
+
+async def refresh_loop(container: Container) -> None:
+    while True:
+        await asyncio.sleep(container.settings.background_refresh_seconds)
+        try:
+            await _refresh_active_sessions(container, datetime.now(UTC))
+        except Exception:  # noqa: BLE001 - keep the loop alive
+            log.exception("background refresh cycle failed")
 
 
 app = create_app()

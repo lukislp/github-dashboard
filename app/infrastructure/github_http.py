@@ -40,6 +40,7 @@ from app.domain.models import (
     WorkflowRun,
 )
 from app.domain.pull_requests import is_bot_login
+from app.infrastructure.http_cache import ConditionalCache, fingerprint
 
 log = logging.getLogger(__name__)
 
@@ -275,6 +276,11 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
+def _cache_key(url: str, params: dict[str, Any] | None) -> str:
+    """The URL including its query string, so `?per_page=5` and `?per_page=100` never collide."""
+    return str(httpx.URL(url, params=params or {}))
+
+
 def _is_rate_limited(response: httpx.Response) -> bool:
     if response.status_code not in (403, 429):
         return False
@@ -436,11 +442,54 @@ class GitHubHttpOAuth:
 
 
 class GitHubHttpApi:
-    def __init__(self, client: httpx.AsyncClient, *, api_url: str) -> None:
+    def __init__(
+        self, client: httpx.AsyncClient, *, api_url: str, cache: ConditionalCache | None = None
+    ) -> None:
         self._client = client
         self._api_url = api_url
+        self._cache = cache if cache is not None else ConditionalCache()
+
+    async def _conditional_get(
+        self, token: str, url: str, *, params: dict[str, Any] | None = None, context: str
+    ) -> httpx.Response:
+        """`GET url` with an `If-None-Match` header when the cache already holds an ETag for
+        this `(token, url+query)` pair.
+
+        A `304` is served from the cache and returned as a synthetic response carrying the
+        cached body, so callers can treat it exactly like the original `200` (their usual
+        `response.json()` and status-code handling keeps working unchanged). A fresh `200`
+        with an `ETag` header is stored for next time; any other status - including a `200`
+        without an `ETag`, or an error - leaves the cache untouched.
+        """
+        fp = fingerprint(token)
+        key = _cache_key(url, params)
+        cached = self._cache.get(fp, key)
+        headers = _headers(token)
+        if cached is not None:
+            headers["If-None-Match"] = cached[0]
+        try:
+            response = await self._client.get(url, params=params, headers=headers)
+        except httpx.HTTPError as exc:
+            raise GitHubUnavailable(context) from exc
+        if response.status_code == 304:
+            if cached is None:
+                # Cannot happen unless GitHub answers 304 to a request that carried no
+                # If-None-Match; treat it as a transport failure rather than crash on `.json()`.
+                raise GitHubUnavailable(f"{context}: unexpected 304 without a cached entry")
+            return httpx.Response(304, json=cached[1], request=response.request)
+        if response.status_code == 200:
+            etag = response.headers.get("etag")
+            if etag:
+                self._cache.put(fp, key, etag=etag, body=response.json())
+        return response
 
     async def list_repositories(self, token: str) -> RepositoryPage:
+        log.debug(
+            "conditional cache stats so far: hits=%d misses=%d stores=%d",
+            self._cache.hits,
+            self._cache.misses,
+            self._cache.stores,
+        )
         repositories: list[Repository] = []
         dependabot_by_repo: dict[str, tuple[SeverityCounts | None, int | None]] = {}
         release_by_repo: dict[str, ReleaseInfo | None] = {}
@@ -571,28 +620,24 @@ class GitHubHttpApi:
         self, token: str, owner: str, name: str
     ) -> SeverityCounts | None:
         context = f"code scanning {owner}/{name}"
-        try:
-            response = await self._client.get(
-                f"{self._api_url}/repos/{owner}/{name}/code-scanning/alerts",
-                params={"state": "open", "per_page": 100},
-                headers=_headers(token),
-            )
-        except httpx.HTTPError as exc:
-            raise GitHubUnavailable(context) from exc
+        response = await self._conditional_get(
+            token,
+            f"{self._api_url}/repos/{owner}/{name}/code-scanning/alerts",
+            params={"state": "open", "per_page": 100},
+            context=context,
+        )
         if _optional_or_raise(response, context=context):
             return None
         return _severity_counts_from_code_scanning_alerts(response.json())
 
     async def _fetch_secret_scanning(self, token: str, owner: str, name: str) -> int | None:
         context = f"secret scanning {owner}/{name}"
-        try:
-            response = await self._client.get(
-                f"{self._api_url}/repos/{owner}/{name}/secret-scanning/alerts",
-                params={"state": "open", "per_page": 100},
-                headers=_headers(token),
-            )
-        except httpx.HTTPError as exc:
-            raise GitHubUnavailable(context) from exc
+        response = await self._conditional_get(
+            token,
+            f"{self._api_url}/repos/{owner}/{name}/secret-scanning/alerts",
+            params={"state": "open", "per_page": 100},
+            context=context,
+        )
         if _optional_or_raise(response, context=context):
             return None
         return len(response.json())
@@ -601,26 +646,20 @@ class GitHubHttpApi:
         self, token: str, owner: str, name: str, base: str, head: str
     ) -> int | None:
         context = f"compare {owner}/{name}"
-        try:
-            response = await self._client.get(
-                f"{self._api_url}/repos/{owner}/{name}/compare/{base}...{head}",
-                headers=_headers(token),
-            )
-        except httpx.HTTPError as exc:
-            raise GitHubUnavailable(context) from exc
+        response = await self._conditional_get(
+            token, f"{self._api_url}/repos/{owner}/{name}/compare/{base}...{head}", context=context
+        )
         if _optional_or_raise(response, context=context):
             return None
         return int(response.json()["ahead_by"])
 
     async def list_notifications(self, token: str) -> list[Notification] | None:
-        try:
-            response = await self._client.get(
-                f"{self._api_url}/notifications",
-                params={"per_page": 50},
-                headers=_headers(token),
-            )
-        except httpx.HTTPError as exc:
-            raise GitHubUnavailable("notifications") from exc
+        response = await self._conditional_get(
+            token,
+            f"{self._api_url}/notifications",
+            params={"per_page": 50},
+            context="notifications",
+        )
         if _optional_or_raise(response, context="notifications"):
             return None
         return [_notification_from_json(n) for n in response.json()]
@@ -628,19 +667,18 @@ class GitHubHttpApi:
     async def list_recent_runs(
         self, token: str, owner: str, name: str, limit: int
     ) -> list[WorkflowRun]:
-        try:
-            response = await self._client.get(
-                f"{self._api_url}/repos/{owner}/{name}/actions/runs",
-                params={"per_page": limit},
-                headers=_headers(token),
-            )
-        except httpx.HTTPError as exc:
-            raise GitHubUnavailable(f"runs {owner}/{name}") from exc
+        context = f"runs {owner}/{name}"
+        response = await self._conditional_get(
+            token,
+            f"{self._api_url}/repos/{owner}/{name}/actions/runs",
+            params={"per_page": limit},
+            context=context,
+        )
         if response.status_code == 404:
             raise ActionsUnavailable("disabled")
         if response.status_code == 403 and response.headers.get("x-ratelimit-remaining") != "0":
             raise ActionsUnavailable("forbidden")
-        _raise_for_status(response, context=f"runs {owner}/{name}")
+        _raise_for_status(response, context=context)
         return [_run_from_json(r) for r in response.json().get("workflow_runs", [])]
 
     async def search_inbox(self, token: str) -> Inbox:

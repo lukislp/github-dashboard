@@ -31,6 +31,9 @@ class Settings:
     log_level: str
     security_alerts: bool
     hygiene_checks: bool
+    background_refresh: bool
+    background_refresh_seconds: int
+    background_refresh_idle_minutes: int
 
     @property
     def callback_url(self) -> str:
@@ -112,4 +115,9 @@ class Settings:
             log_level=env.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             security_alerts=boolean("SECURITY_ALERTS", True),
             hygiene_checks=boolean("HYGIENE_CHECKS", True),
+            background_refresh=boolean("BACKGROUND_REFRESH", True),
+            background_refresh_seconds=integer("BACKGROUND_REFRESH_SECONDS", 240, minimum=60),
+            background_refresh_idle_minutes=integer(
+                "BACKGROUND_REFRESH_IDLE_MINUTES", 30, minimum=1
+            ),
         )

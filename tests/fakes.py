@@ -257,6 +257,7 @@ class FakeApi:
         security: dict[str, tuple[SeverityCounts | None, int | None]] | None = None,
         commits_since: dict[str, int | None] | None = None,
         notifications: list[Notification] | None = None,
+        list_repositories_error: Exception | None = None,
     ) -> None:
         self.repos = repos or []
         self.runs = runs or {}
@@ -270,6 +271,10 @@ class FakeApi:
         self.commits_since = commits_since or {}
         # None means the `notifications` scope is missing, matching the real port method.
         self.notifications = notifications
+        # When set, `list_repositories` raises it instead of its usual behaviour - the simplest
+        # way to make `GetOverview` (and thus `GetOverview.__call__`) raise an arbitrary error,
+        # since it is the one call in `_load` that is not wrapped by a degrade-on-error path.
+        self.list_repositories_error = list_repositories_error
         self.unavailable: set[str] = set()
         self.calls = 0
         self.run_calls: list[str] = []
@@ -288,6 +293,8 @@ class FakeApi:
 
     async def list_repositories(self, token: str) -> RepositoryPage:
         self.calls += 1
+        if self.list_repositories_error is not None:
+            raise self.list_repositories_error
         if not self.token_valid:
             raise AuthenticationError("revoked")
         return RepositoryPage(

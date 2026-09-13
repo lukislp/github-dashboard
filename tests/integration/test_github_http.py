@@ -14,6 +14,7 @@ from app.application.errors import (
 )
 from app.domain.models import ChecksState, Mergeable, ReviewDecision, RunStatus, SeverityCounts
 from app.infrastructure.github_http import GitHubHttpApi, GitHubHttpOAuth
+from app.infrastructure.http_cache import ConditionalCache, fingerprint
 
 API = "https://api.github.test"
 WEB = "https://github.test"
@@ -912,6 +913,152 @@ async def test_list_recent_runs_404_is_unavailable(client):
     respx.get(f"{API}/repos/octocat/a/actions/runs").mock(return_value=httpx.Response(404))
     with pytest.raises(ActionsUnavailable):
         await GitHubHttpApi(client, api_url=API).list_recent_runs("tok", "octocat", "a", 5)
+
+
+# -- conditional requests (ETag cache) -------------------------------------------------------
+
+
+def _runs_payload(run_id: int = 1) -> dict:
+    return {
+        "workflow_runs": [
+            {
+                "id": run_id,
+                "name": "CI",
+                "html_url": "u",
+                "head_branch": "main",
+                "event": "push",
+                "status": "completed",
+                "conclusion": "success",
+                "run_number": run_id,
+                "created_at": "2026-09-12T09:00:00Z",
+                "updated_at": "2026-09-12T09:05:00Z",
+            }
+        ]
+    }
+
+
+@respx.mock
+async def test_list_recent_runs_second_call_sends_if_none_match_and_reuses_cached_body_on_304(
+    client,
+):
+    route = respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        side_effect=[
+            httpx.Response(200, headers={"etag": 'W/"abc"'}, json=_runs_payload(run_id=1)),
+            httpx.Response(304),
+        ]
+    )
+    cache = ConditionalCache()
+    api = GitHubHttpApi(client, api_url=API, cache=cache)
+
+    first = await api.list_recent_runs("tok", "octocat", "a", 5)
+    second = await api.list_recent_runs("tok", "octocat", "a", 5)
+
+    assert route.call_count == 2
+    assert "if-none-match" not in route.calls[0].request.headers
+    assert route.calls[1].request.headers["if-none-match"] == 'W/"abc"'
+    assert [r.id for r in second] == [r.id for r in first] == [1]
+    assert cache.stores == 1
+
+
+@respx.mock
+async def test_conditional_cache_stores_nothing_when_response_has_no_etag(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        return_value=httpx.Response(200, json=_runs_payload())
+    )
+    cache = ConditionalCache()
+    api = GitHubHttpApi(client, api_url=API, cache=cache)
+
+    await api.list_recent_runs("tok", "octocat", "a", 5)
+
+    assert cache.stores == 0
+
+
+@respx.mock
+async def test_conditional_cache_untouched_on_error_status(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs").mock(return_value=httpx.Response(404))
+    cache = ConditionalCache()
+    api = GitHubHttpApi(client, api_url=API, cache=cache)
+
+    with pytest.raises(ActionsUnavailable):
+        await api.list_recent_runs("tok", "octocat", "a", 5)
+
+    assert cache.stores == 0
+    assert cache.get(fingerprint("tok"), f"{API}/repos/octocat/a/actions/runs?per_page=5") is None
+
+
+@respx.mock
+async def test_fetch_security_uses_conditional_requests(client):
+    code_route = respx.get(f"{API}/repos/octocat/a/code-scanning/alerts").mock(
+        side_effect=[
+            httpx.Response(200, headers={"etag": "c1"}, json=[]),
+            httpx.Response(304),
+        ]
+    )
+    secret_route = respx.get(f"{API}/repos/octocat/a/secret-scanning/alerts").mock(
+        side_effect=[
+            httpx.Response(200, headers={"etag": "s1"}, json=[{"number": 1}]),
+            httpx.Response(304),
+        ]
+    )
+    api = GitHubHttpApi(client, api_url=API, cache=ConditionalCache())
+
+    first = await api.fetch_security("tok", "octocat", "a")
+    second = await api.fetch_security("tok", "octocat", "a")
+
+    assert code_route.calls[1].request.headers["if-none-match"] == "c1"
+    assert secret_route.calls[1].request.headers["if-none-match"] == "s1"
+    assert first == second
+
+
+@respx.mock
+async def test_count_commits_since_uses_conditional_requests(client):
+    route = respx.get(f"{API}/repos/octocat/a/compare/v1...main").mock(
+        side_effect=[
+            httpx.Response(200, headers={"etag": "cmp1"}, json={"ahead_by": 3}),
+            httpx.Response(304),
+        ]
+    )
+    api = GitHubHttpApi(client, api_url=API, cache=ConditionalCache())
+
+    first = await api.count_commits_since("tok", "octocat", "a", "v1", "main")
+    second = await api.count_commits_since("tok", "octocat", "a", "v1", "main")
+
+    assert route.calls[1].request.headers["if-none-match"] == "cmp1"
+    assert first == second == 3
+
+
+@respx.mock
+async def test_list_notifications_uses_conditional_requests(client):
+    route = respx.get(f"{API}/notifications").mock(
+        side_effect=[
+            httpx.Response(200, headers={"etag": "n1"}, json=[]),
+            httpx.Response(304),
+        ]
+    )
+    api = GitHubHttpApi(client, api_url=API, cache=ConditionalCache())
+
+    first = await api.list_notifications("tok")
+    second = await api.list_notifications("tok")
+
+    assert route.calls[1].request.headers["if-none-match"] == "n1"
+    assert first == second == []
+
+
+@respx.mock
+async def test_different_tokens_are_never_served_each_others_cached_body(client):
+    route = respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        side_effect=[
+            httpx.Response(200, headers={"etag": "e1"}, json=_runs_payload(run_id=1)),
+            httpx.Response(200, headers={"etag": "e2"}, json=_runs_payload(run_id=2)),
+        ]
+    )
+    api = GitHubHttpApi(client, api_url=API, cache=ConditionalCache())
+
+    await api.list_recent_runs("tok-a", "octocat", "a", 5)
+    await api.list_recent_runs("tok-b", "octocat", "a", 5)
+
+    assert route.call_count == 2
+    assert "if-none-match" not in route.calls[1].request.headers  # different token, no ETag sent
 
 
 @respx.mock
