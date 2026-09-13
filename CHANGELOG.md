@@ -1,3 +1,10 @@
+## [1.0.1](https://github.com/lukislp/github-dashboard/compare/v1.0.0...v1.0.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* **ci:** bump astral-sh/setup-uv from 10.0.1 to 10.1.0 ([99f0418](https://github.com/lukislp/github-dashboard/commit/99f04185f6b5fd0aecd19781c18e14716a9e505c))
+
 # 1.0.0 (2026-09-13)
 
 
