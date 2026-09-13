@@ -43,3 +43,37 @@ spec:
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: nginx-gateway } }
       ports:
         - { protocol: TCP, port: 8000 }
+---
+# Explicit egress baseline for the whole namespace, mirroring claude-queue's k8s/07-netpol.yaml:
+# every pod is isolated for egress, so anything not allowed by a policy below is dropped once
+# the catch-all rule in allow-dns is gone.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: github-dashboard
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+---
+# The dashboard's only outbound traffic is GitHub over HTTPS: the OAuth dance against
+# github.com/login/oauth/*, the REST/GraphQL calls against api.github.com, and the avatar CDN
+# (avatars.githubusercontent.com). All of those are Cloudflare-fronted anycast addresses that
+# change without notice, so the destination stays 0.0.0.0/0 and the port is the restriction -
+# same trade-off claude-queue's api-egress makes for the Anthropic API.
+# Everything else the app needs is local: the session/preference store is SQLite on the PVC
+# (DB_PATH=/data/sessions.db), and automountServiceAccountToken is false, so it never talks to
+# the Kubernetes API server either.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: github-dashboard-egress
+  namespace: github-dashboard
+spec:
+  podSelector: { matchLabels: { app: github-dashboard } }
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock: { cidr: 0.0.0.0/0 }
+      ports:
+        - { protocol: TCP, port: 443 }
