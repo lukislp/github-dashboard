@@ -1,7 +1,9 @@
-# Same strategy as the sibling apps on this cluster: default-deny ingress as a baseline,
-# egress stays open (the app talks to api.github.com/github.com and GitHub's avatar CDN over
-# HTTPS, no fixed IP allow-list is practical). The only ingress ever needed is the shared NGINX
-# Gateway reaching the pod's port 8000 (k8s/05-httproute.yaml).
+# Same strategy as the sibling apps on this cluster: default-deny in BOTH directions as the
+# baseline, then explicit allowances. The only ingress ever needed is the shared NGINX Gateway
+# reaching the pod's port 8000 (k8s/05-httproute.yaml); the only egress is DNS plus HTTPS to
+# GitHub (see github-dashboard-egress below). allow-dns used to carry a bare `{}` egress rule
+# next to the DNS one, which allowed egress anywhere and made the whole policy decorative -
+# removed now that the explicit rules are in place.
 #
 # Bootstrap-only, NOT Flux-managed - kustomize-controller's ClusterRole has no
 # "networkpolicies" permission (same reasoning as k8s/00-namespace.yaml / k8s/02-secret.yaml).
@@ -28,7 +30,6 @@ spec:
       ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
-    - {} # egress otherwise unrestricted - this policy only adds an explicit DNS allowance
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
