@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -17,15 +19,42 @@ from app.application.errors import (
     RateLimited,
 )
 from app.application.ports import (
+    BranchListing,
     GitHubApi,
     GitHubOAuth,
+    HygienePage,
     OverviewCache,
     SessionRecord,
     SessionRepository,
     TokenCipher,
+    UserStateRepository,
 )
-from app.domain.models import Overview, RepoCi, Repository
-from app.domain.overview import build_overview, classify_ci, skipped_ci
+from app.domain.hygiene import RepoHygiene, assess_hygiene
+from app.domain.models import (
+    Changes,
+    Inbox,
+    Notification,
+    Overview,
+    Preferences,
+    ReleaseInfo,
+    RepoCi,
+    RepoSecurity,
+    Repository,
+    Snapshot,
+)
+from app.domain.overview import (
+    DEFAULT_LONG_RUN_AFTER,
+    DEFAULT_STALE_AFTER,
+    build_overview,
+    classify_ci,
+    skipped_ci,
+)
+from app.domain.snapshot import diff_since, snapshot_of
+
+_MAX_GROUPS = 30
+_MAX_GROUP_NAME_LEN = 40
+_MAX_REPOS_TOTAL = 500
+_REPO_NAME_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +63,20 @@ Clock = Callable[[], datetime]
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _attach_branch_listing(repo: Repository, listing: BranchListing | None) -> Repository:
+    """Attach a repository's branch count/branches-without-pr from the hygiene fetch.
+
+    `listing` is `None` when the repository's hygiene batch could not be fetched this
+    refresh (archived, disabled, or degraded); the repository then keeps its defaults
+    (`branch_count=0`, `branches_without_pr=()`).
+    """
+    if listing is None:
+        return repo
+    return dataclasses.replace(
+        repo, branch_count=listing.branch_count, branches_without_pr=listing.branches
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +166,10 @@ class GetOverview:
     cache_ttl_seconds: int
     runs_per_repo: int
     max_concurrency: int
+    stale_after: timedelta = DEFAULT_STALE_AFTER
+    long_run_after: timedelta = DEFAULT_LONG_RUN_AFTER
+    security_alerts: bool = True
+    hygiene_checks: bool = True
     clock: Clock = utc_now
     _locks: dict[int, asyncio.Lock] = field(default_factory=dict)
 
@@ -156,30 +203,210 @@ class GetOverview:
         page = await self.api.list_repositories(token)
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
-        async def ci_for(repo: Repository) -> tuple[str, RepoCi]:
+        async def worker(repo: Repository) -> tuple[str, RepoCi, RepoSecurity, ReleaseInfo | None]:
+            dependabot, dependabot_total = page.dependabot_by_repo.get(repo.full_name, (None, None))
+            partial_release = page.release_by_repo.get(repo.full_name)
+
             if repo.is_archived:
-                return repo.full_name, skipped_ci("archived")
+                security = RepoSecurity(dependabot, dependabot_total, None, None)
+                return repo.full_name, skipped_ci("archived"), security, partial_release
+
             async with semaphore:
                 try:
                     runs = await self.api.list_recent_runs(
                         token, repo.owner, repo.name, self.runs_per_repo
                     )
+                    ci = classify_ci(runs)
                 except AuthenticationError:
                     raise
                 except ActionsUnavailable as exc:
-                    return repo.full_name, classify_ci((), error=str(exc) or "unavailable")
+                    ci = classify_ci((), error=str(exc) or "unavailable")
                 except RateLimited:
-                    return repo.full_name, classify_ci((), error="rate_limited")
+                    ci = classify_ci((), error="rate_limited")
                 except GitHubUnavailable as exc:
                     log.warning("runs unavailable repo=%s: %s", repo.full_name, exc)
-                    return repo.full_name, classify_ci((), error="github_error")
-            return repo.full_name, classify_ci(runs)
+                    ci = classify_ci((), error="github_error")
 
-        results = await asyncio.gather(*(ci_for(r) for r in page.repositories))
+                if self.security_alerts:
+                    try:
+                        code_scanning, secret_scanning = await self.api.fetch_security(
+                            token, repo.owner, repo.name
+                        )
+                    except AuthenticationError:
+                        raise
+                    except (RateLimited, GitHubUnavailable) as exc:
+                        log.warning("security fetch failed repo=%s: %s", repo.full_name, exc)
+                        code_scanning, secret_scanning = None, None
+                else:
+                    code_scanning, secret_scanning = None, None
+                security = RepoSecurity(
+                    dependabot, dependabot_total, code_scanning, secret_scanning
+                )
+
+                release = partial_release
+                if partial_release is not None and repo.default_branch:
+                    try:
+                        ahead_by = await self.api.count_commits_since(
+                            token,
+                            repo.owner,
+                            repo.name,
+                            partial_release.tag,
+                            repo.default_branch,
+                        )
+                    except AuthenticationError:
+                        raise
+                    except (RateLimited, GitHubUnavailable) as exc:
+                        log.warning("release compare failed repo=%s: %s", repo.full_name, exc)
+                        ahead_by = None
+                    release = dataclasses.replace(partial_release, unreleased_commits=ahead_by)
+
+            return repo.full_name, ci, security, release
+
+        async def inbox() -> Inbox:
+            try:
+                return await self.api.search_inbox(token)
+            except (RateLimited, GitHubUnavailable) as exc:
+                log.warning("inbox search failed: %s", exc)
+                return Inbox((), (), (), ())
+
+        async def notifications() -> tuple[tuple[Notification, ...], bool]:
+            try:
+                result = await self.api.list_notifications(token)
+            except (RateLimited, GitHubUnavailable) as exc:
+                log.warning("notifications fetch failed: %s", exc)
+                return (), False
+            if result is None:
+                return (), False
+            return tuple(result), True
+
+        async def hygiene() -> HygienePage:
+            if not self.hygiene_checks:
+                return HygienePage({}, {})
+            repo_ids = [r.node_id for r in page.repositories if not r.is_archived]
+            if not repo_ids:
+                return HygienePage({}, {})
+            # Runs alongside the per-repo REST work, under the same concurrency limit.
+            # AuthenticationError and RateLimited propagate like everywhere else; any other
+            # failure (GitHubUnavailable) must never take the whole overview down, so it
+            # degrades to "no hygiene/branch data this refresh" instead.
+            async with semaphore:
+                try:
+                    return await self.api.fetch_hygiene(token, repo_ids)
+                except GitHubUnavailable as exc:
+                    log.warning("hygiene fetch failed: %s", exc)
+                    return HygienePage({}, {})
+
+        (
+            worker_results,
+            inbox_result,
+            (notification_items, notifications_available),
+            hygiene_page,
+        ) = await asyncio.gather(
+            asyncio.gather(*(worker(r) for r in page.repositories)),
+            inbox(),
+            notifications(),
+            hygiene(),
+        )
+        ci_by_repo: dict[str, RepoCi] = {}
+        security_by_repo: dict[str, RepoSecurity] = {}
+        release_by_repo: dict[str, ReleaseInfo | None] = {}
+        for full_name, ci, security, release in worker_results:
+            ci_by_repo[full_name] = ci
+            security_by_repo[full_name] = security
+            release_by_repo[full_name] = release
+
+        repositories = tuple(
+            _attach_branch_listing(repo, hygiene_page.branches_by_repo.get(repo.full_name))
+            for repo in page.repositories
+        )
+        hygiene_by_repo: dict[str, RepoHygiene] = {
+            full_name: assess_hygiene(facts)
+            for full_name, facts in hygiene_page.hygiene_by_repo.items()
+        }
+
         return build_overview(
             viewer_login=session.user.login,
-            repositories=page.repositories,
-            ci_by_repo=dict(results),
+            repositories=repositories,
+            ci_by_repo=ci_by_repo,
             rate_limit=page.rate_limit,
+            inbox=inbox_result,
+            security_by_repo=security_by_repo,
+            release_by_repo=release_by_repo,
+            hygiene_by_repo=hygiene_by_repo,
+            notifications=notification_items,
+            notifications_available=notifications_available,
+            stale_after=self.stale_after,
+            long_run_after=self.long_run_after,
             now=self.clock(),
         )
+
+
+def validate_preferences(prefs: Preferences) -> None:
+    """Raise ValueError when `prefs` violates a stored-state limit.
+
+    Limits: at most 30 groups, group names non-empty/at most 40 chars/unique
+    case-insensitively, at most 500 repository names in total (groups plus favourites), and
+    every repository name must look like `owner/repo`.
+    """
+    if len(prefs.groups) > _MAX_GROUPS:
+        raise ValueError(f"a maximum of {_MAX_GROUPS} groups is allowed")
+
+    seen_names: set[str] = set()
+    total_repos = len(prefs.favorites)
+    for group in prefs.groups:
+        if not group.name.strip():
+            raise ValueError("group name must not be empty")
+        if len(group.name) > _MAX_GROUP_NAME_LEN:
+            raise ValueError(f"group name too long: {group.name!r}")
+        key = group.name.casefold()
+        if key in seen_names:
+            raise ValueError(f"duplicate group name: {group.name!r}")
+        seen_names.add(key)
+        total_repos += len(group.repos)
+
+    if total_repos > _MAX_REPOS_TOTAL:
+        raise ValueError(f"a maximum of {_MAX_REPOS_TOTAL} repositories is allowed")
+
+    all_repos = (*prefs.favorites, *(repo for group in prefs.groups for repo in group.repos))
+    for repo_name in all_repos:
+        if not _REPO_NAME_RE.match(repo_name):
+            raise ValueError(f"invalid repository name: {repo_name!r}")
+
+
+@dataclass(slots=True)
+class GetPreferences:
+    user_state: UserStateRepository
+
+    async def __call__(self, session: SessionRecord) -> Preferences:
+        return await self.user_state.get_preferences(session.user.id)
+
+
+@dataclass(slots=True)
+class SavePreferences:
+    user_state: UserStateRepository
+
+    async def __call__(self, session: SessionRecord, prefs: Preferences) -> None:
+        validate_preferences(prefs)
+        await self.user_state.set_preferences(session.user.id, prefs)
+
+
+@dataclass(slots=True)
+class MarkSeen:
+    """Records what the viewer has now seen, for a later `GetChanges` to diff against."""
+
+    user_state: UserStateRepository
+    clock: Clock = utc_now
+
+    async def __call__(self, session: SessionRecord, overview: Overview) -> Snapshot:
+        snapshot = snapshot_of(overview, self.clock())
+        await self.user_state.set_snapshot(session.user.id, snapshot)
+        return snapshot
+
+
+@dataclass(slots=True)
+class GetChanges:
+    user_state: UserStateRepository
+
+    async def __call__(self, session: SessionRecord, overview: Overview) -> Changes:
+        snapshot = await self.user_state.get_snapshot(session.user.id)
+        return diff_since(overview, snapshot)

@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
-from app.domain.models import Overview, RateLimit, Repository, User, WorkflowRun
+from app.domain.hygiene import HygieneFacts
+from app.domain.models import (
+    Branch,
+    Inbox,
+    Notification,
+    Overview,
+    Preferences,
+    RateLimit,
+    ReleaseInfo,
+    Repository,
+    SeverityCounts,
+    Snapshot,
+    User,
+    WorkflowRun,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +39,35 @@ class SessionRecord:
 class RepositoryPage:
     repositories: tuple[Repository, ...]
     rate_limit: RateLimit | None
+    # The following two are populated from the same GraphQL query as `repositories`, keyed
+    # by full name. `dependabot_by_repo` holds (severity counts, GraphQL totalCount), or
+    # (None, None) when the field is unavailable for that repository. `release_by_repo` holds
+    # the release info without `unreleased_commits`, which is filled in by a later REST call.
+    dependabot_by_repo: Mapping[str, tuple[SeverityCounts | None, int | None]] = field(
+        default_factory=dict
+    )
+    release_by_repo: Mapping[str, ReleaseInfo | None] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class BranchListing:
+    """A repository's branch count and its branches without a pull request."""
+
+    branch_count: int
+    branches: tuple[Branch, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HygienePage:
+    """Result of one `fetch_hygiene` call, keyed by repository full name (`nameWithOwner`).
+
+    A repository missing from either mapping means its hygiene batch (or the half of it it
+    fell into after a retry) could not be fetched this refresh; the caller treats that as
+    "hygiene not applicable / no branch data" rather than failing the whole overview.
+    """
+
+    hygiene_by_repo: Mapping[str, HygieneFacts] = field(default_factory=dict)
+    branches_by_repo: Mapping[str, BranchListing] = field(default_factory=dict)
 
 
 class GitHubOAuth(Protocol):
@@ -45,10 +89,45 @@ class GitHubApi(Protocol):
         """All repositories the token can see, with open PR/issue counts."""
         ...
 
+    async def fetch_hygiene(self, token: str, repo_ids: Sequence[str]) -> HygienePage:
+        """Hygiene facts and branch listings for the given repository ids.
+
+        Fetched in batches (25 ids per GraphQL request) from a separate query so a slow or
+        failing lookup here can never take down the rest of the overview. A repository whose
+        batch could not be recovered (even after the retry-and-split policy) is simply absent
+        from the result."""
+        ...
+
     async def list_recent_runs(
         self, token: str, owner: str, name: str, limit: int
     ) -> list[WorkflowRun]:
         """Newest workflow runs of one repository, newest first."""
+        ...
+
+    async def search_inbox(self, token: str) -> Inbox:
+        """Pull requests and issues waiting on the viewer: review requests, changes
+        requested on their own PRs, assignments and mentions."""
+        ...
+
+    async def fetch_security(
+        self, token: str, owner: str, name: str
+    ) -> tuple[SeverityCounts | None, int | None]:
+        """Open code-scanning alerts by severity, and the open secret-scanning alert count.
+
+        Either part is `None` when that feature is disabled or the token cannot see it
+        (GitHub answers 403/404)."""
+        ...
+
+    async def count_commits_since(
+        self, token: str, owner: str, name: str, base: str, head: str
+    ) -> int | None:
+        """Commits on `head` that are not yet in `base`. `None` when the comparison fails
+        (e.g. the base ref no longer exists)."""
+        ...
+
+    async def list_notifications(self, token: str) -> list[Notification] | None:
+        """Unread notifications for the viewer. `None` when the `notifications` scope is
+        missing (GitHub answers 403/404)."""
         ...
 
 
@@ -74,3 +153,18 @@ class TokenCipher(Protocol):
     def encrypt(self, plaintext: str) -> str: ...
 
     def decrypt(self, ciphertext: str) -> str: ...
+
+
+class UserStateRepository(Protocol):
+    """Per-user state that survives logout: repo groups/favourites and the last Snapshot.
+
+    Keyed by GitHub user id, not by session id.
+    """
+
+    async def get_preferences(self, user_id: int) -> Preferences: ...
+
+    async def set_preferences(self, user_id: int, prefs: Preferences) -> None: ...
+
+    async def get_snapshot(self, user_id: int) -> Snapshot | None: ...
+
+    async def set_snapshot(self, user_id: int, snapshot: Snapshot) -> None: ...

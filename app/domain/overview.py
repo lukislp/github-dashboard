@@ -2,21 +2,34 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from app.domain.hygiene import RepoHygiene
 from app.domain.models import (
     CiState,
     FailedRun,
+    Inbox,
+    Notification,
     Overview,
     RateLimit,
+    ReleaseInfo,
     RepoCi,
     RepoOverview,
+    RepoSecurity,
     Repository,
     RunStatus,
     Totals,
     WorkflowRun,
 )
+from app.domain.pull_requests import PrState, pr_state
+
+_EMPTY_INBOX = Inbox((), (), (), ())
+_EMPTY_SECURITY = RepoSecurity(None, None, None, None)
+_EMPTY_HYGIENE = RepoHygiene((), applicable=False)
+DEFAULT_STALE_AFTER = timedelta(days=14)
+DEFAULT_LONG_RUN_AFTER = timedelta(minutes=30)
 
 
 def classify_ci(runs: Iterable[WorkflowRun], *, error: str | None = None) -> RepoCi:
@@ -55,6 +68,34 @@ def skipped_ci(reason: str) -> RepoCi:
     return RepoCi(CiState.SKIPPED, (), 0, 0, reason)
 
 
+def _mark_stale(repo: Repository, *, now: datetime, stale_after: timedelta) -> Repository:
+    """Attach the derived 'stale' flag to a repository's pull requests, issues and branches."""
+    prs = tuple(
+        dataclasses.replace(p, stale=(now - p.updated_at) >= stale_after)
+        for p in repo.pull_requests
+    )
+    issues = tuple(
+        dataclasses.replace(i, stale=(now - i.updated_at) >= stale_after) for i in repo.issues
+    )
+    branches = tuple(
+        dataclasses.replace(
+            b, stale=b.last_commit_at is not None and (now - b.last_commit_at) >= stale_after
+        )
+        for b in repo.branches_without_pr
+    )
+    return dataclasses.replace(repo, pull_requests=prs, issues=issues, branches_without_pr=branches)
+
+
+def _mark_long_running(ci: RepoCi, *, now: datetime, long_run_after: timedelta) -> RepoCi:
+    """Attach the derived 'long_running' flag to active runs and recompute the count."""
+    runs = tuple(
+        dataclasses.replace(r, long_running=r.active and (now - r.created_at) >= long_run_after)
+        for r in ci.runs
+    )
+    long_running_count = sum(1 for r in runs if r.long_running)
+    return dataclasses.replace(ci, runs=runs, long_running_count=long_running_count)
+
+
 def build_overview(
     *,
     viewer_login: str,
@@ -62,17 +103,44 @@ def build_overview(
     ci_by_repo: Mapping[str, RepoCi],
     rate_limit: RateLimit | None,
     now: datetime,
+    inbox: Inbox = _EMPTY_INBOX,
+    stale_after: timedelta = DEFAULT_STALE_AFTER,
+    long_run_after: timedelta = DEFAULT_LONG_RUN_AFTER,
+    security_by_repo: Mapping[str, RepoSecurity] | None = None,
+    release_by_repo: Mapping[str, ReleaseInfo | None] | None = None,
+    hygiene_by_repo: Mapping[str, RepoHygiene] | None = None,
+    notifications: tuple[Notification, ...] = (),
+    notifications_available: bool = False,
 ) -> Overview:
     repos: list[RepoOverview] = []
     failures: list[FailedRun] = []
+    security_by_repo = security_by_repo or {}
+    release_by_repo = release_by_repo or {}
+    hygiene_by_repo = hygiene_by_repo or {}
 
     for repo in repositories:
+        repo = _mark_stale(repo, now=now, stale_after=stale_after)
         ci = ci_by_repo.get(repo.full_name) or classify_ci(())
-        repos.append(RepoOverview(repo, ci))
+        ci = _mark_long_running(ci, now=now, long_run_after=long_run_after)
+        security = security_by_repo.get(repo.full_name) or _EMPTY_SECURITY
+        release = release_by_repo.get(repo.full_name)
+        hygiene = hygiene_by_repo.get(repo.full_name) or _EMPTY_HYGIENE
+        repos.append(RepoOverview(repo, ci, security, release, hygiene))
         failures.extend(FailedRun(repo.full_name, run) for run in ci.runs if run.failed)
 
     repos.sort(key=_repo_sort_key)
     failures.sort(key=lambda f: f.run.updated_at, reverse=True)
+
+    all_prs = [p for r in repos for p in r.repository.pull_requests]
+    all_issues = [i for r in repos for i in r.repository.issues]
+
+    human_prs = 0
+    bot_prs = 0
+    for r in repos:
+        prs = r.repository.pull_requests
+        human_prs += sum(1 for p in prs if not p.is_bot)
+        bot_prs += sum(1 for p in prs if p.is_bot)
+        human_prs += max(0, r.repository.open_pr_count - len(prs))
 
     totals = Totals(
         repos=len(repos),
@@ -85,6 +153,41 @@ def build_overview(
         failed_runs=sum(r.ci.failed_count for r in repos),
         repos_failing=sum(1 for r in repos if r.ci.state == CiState.FAILING),
         active_runs=sum(r.ci.active_count for r in repos),
+        human_prs=human_prs,
+        bot_prs=bot_prs,
+        stale_prs=sum(1 for p in all_prs if p.stale),
+        stale_issues=sum(1 for i in all_issues if i.stale),
+        prs_ready=sum(1 for p in all_prs if pr_state(p) == PrState.READY),
+        prs_changes_requested=sum(1 for p in all_prs if pr_state(p) == PrState.CHANGES_REQUESTED),
+        prs_failing=sum(1 for p in all_prs if pr_state(p) in (PrState.FAILING, PrState.CONFLICT)),
+        long_running_runs=sum(r.ci.long_running_count for r in repos),
+        inbox_total=inbox.total,
+        security_critical=sum(
+            (r.security.dependabot.critical if r.security.dependabot else 0)
+            + (r.security.code_scanning.critical if r.security.code_scanning else 0)
+            for r in repos
+        ),
+        security_high=sum(
+            (r.security.dependabot.high if r.security.dependabot else 0)
+            + (r.security.code_scanning.high if r.security.code_scanning else 0)
+            for r in repos
+        ),
+        security_total=sum(r.security.total for r in repos),
+        repos_with_alerts=sum(1 for r in repos if r.security.total > 0),
+        secret_alerts=sum(r.security.secret_scanning or 0 for r in repos),
+        repos_unreleased=sum(
+            1 for r in repos if r.release and (r.release.unreleased_commits or 0) > 0
+        ),
+        unreleased_commits=sum(r.release.unreleased_commits or 0 for r in repos if r.release),
+        notifications_unread=sum(1 for n in notifications if n.unread),
+        notifications_by_reason=_group_by_reason(notifications),
+        hygiene_average=_hygiene_average(repos),
+        repos_without_ci=_repos_missing_check(repos, "ci_workflow"),
+        repos_without_protection=_repos_missing_check(repos, "branch_protection"),
+        repos_without_dependency_updates=_repos_missing_check(repos, "dependency_updates"),
+        repos_without_license=_repos_missing_check(repos, "license"),
+        branches_without_pr=sum(len(r.repository.branches_without_pr) for r in repos),
+        stale_branches=sum(1 for r in repos for b in r.repository.branches_without_pr if b.stale),
     )
     return Overview(
         viewer_login=viewer_login,
@@ -93,7 +196,30 @@ def build_overview(
         repos=tuple(repos),
         failures=tuple(failures),
         rate_limit=rate_limit,
+        inbox=inbox,
+        notifications=notifications,
+        notifications_available=notifications_available,
     )
+
+
+def _hygiene_average(repos: list[RepoOverview]) -> int:
+    """Mean hygiene score over repositories the checks apply to. 100 when there are none."""
+    scores = [r.hygiene.score for r in repos if r.hygiene.applicable]
+    if not scores:
+        return 100
+    return round(sum(scores) / len(scores))
+
+
+def _repos_missing_check(repos: list[RepoOverview], key: str) -> int:
+    """Count repositories (the checks apply to) that fail the given hygiene check."""
+    return sum(1 for r in repos if r.hygiene.applicable and key in r.hygiene.failing_keys)
+
+
+def _group_by_reason(notifications: Iterable[Notification]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for notification in notifications:
+        counts[notification.reason] = counts.get(notification.reason, 0) + 1
+    return counts
 
 
 def _repo_sort_key(item: RepoOverview) -> tuple[int, float]:

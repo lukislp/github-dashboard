@@ -13,6 +13,7 @@ from tests.fakes import (
     FakeCache,
     FakeOAuth,
     FakeSessions,
+    FakeUserState,
     PlainCipher,
     make_repo,
     make_run,
@@ -42,6 +43,7 @@ def fakes():
         "sessions": FakeSessions(),
         "cache": FakeCache(),
         "cipher": PlainCipher(),
+        "user_state": FakeUserState(),
     }
 
 
@@ -156,3 +158,95 @@ def test_tampered_cookie_is_ignored(client):
     sign_in(client)
     client.cookies.set(SESSION_COOKIE, "not-a-signed-value")
     assert client.get("/api/me").status_code == 401
+
+
+# -- per-user state: preferences and changes-since-last-visit -----------------------------
+
+
+def test_overview_has_empty_preferences_and_changes_on_first_visit(client):
+    sign_in(client)
+    body = client.get("/api/overview").json()
+
+    assert body["preferences"] == {"groups": [], "favorites": []}
+    assert body["changes"]["since"] is None
+    assert body["changes"]["total"] == 0
+    assert body["changes"]["new_prs"] == []
+
+
+def test_preferences_and_seen_endpoints_require_a_session(client):
+    assert client.get("/api/preferences").status_code == 401
+    assert client.put("/api/preferences", json={"groups": [], "favorites": []}).status_code == 401
+    assert client.post("/api/seen").status_code == 401
+
+
+def test_put_preferences_roundtrips_and_is_reflected_in_overview(client):
+    sign_in(client)
+    payload = {
+        "groups": [{"name": "Backend", "repos": ["octocat/red"]}],
+        "favorites": ["octocat/red"],
+    }
+
+    put = client.put("/api/preferences", json=payload)
+    assert put.status_code == 200
+    assert put.json() == {
+        "groups": [{"name": "Backend", "repos": ["octocat/red"]}],
+        "favorites": ["octocat/red"],
+    }
+
+    assert client.get("/api/preferences").json() == put.json()
+    assert client.get("/api/overview").json()["preferences"] == put.json()
+
+
+def test_put_preferences_rejects_invalid_input(client):
+    sign_in(client)
+    response = client.put("/api/preferences", json={"groups": [], "favorites": ["not-a-repo"]})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"] == "invalid_preferences"
+    assert "invalid repository name" in body["detail"]
+
+
+def test_mark_seen_then_new_pr_shows_up_in_next_changes(client, fakes):
+    sign_in(client)
+    client.get("/api/overview")  # populate the cache
+
+    seen = client.post("/api/seen")
+    assert seen.status_code == 200
+    assert "seen_at" in seen.json()
+
+    # A new pull request appears on the "green" repository since the snapshot was taken.
+    fakes["api"].repos = [make_repo("red", prs=2, issues=1), make_repo("green", prs=1)]
+
+    changed = client.get("/api/overview?refresh=true").json()
+    assert changed["changes"]["since"] is not None
+    assert changed["changes"]["total"] == 1
+    assert changed["changes"]["new_prs"][0]["repo_full_name"] == "octocat/green"
+    assert changed["changes"]["new_prs"][0]["number"] == 1
+
+
+def test_csrf_guard_rejects_cross_site_put_and_post(client):
+    sign_in(client)
+    headers = {"Sec-Fetch-Site": "cross-site"}
+
+    put = client.put("/api/preferences", json={"groups": [], "favorites": []}, headers=headers)
+    assert put.status_code == 403
+    assert put.json() == {"error": "cross_site"}
+
+    post = client.post("/api/seen", headers=headers)
+    assert post.status_code == 403
+    assert post.json() == {"error": "cross_site"}
+
+
+def test_csrf_guard_allows_same_origin_and_no_header_requests(client):
+    sign_in(client)
+
+    same_origin = client.put(
+        "/api/preferences",
+        json={"groups": [], "favorites": []},
+        headers={"Sec-Fetch-Site": "same-origin"},
+    )
+    assert same_origin.status_code == 200
+
+    no_headers = client.post("/api/seen")
+    assert no_headers.status_code == 200

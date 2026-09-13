@@ -22,11 +22,15 @@ class Settings:
     session_ttl_hours: int
     runs_per_repo: int
     max_concurrency: int
+    stale_days: int
+    long_run_minutes: int
     db_path: str
     redis_url: str | None
     github_api_url: str
     github_web_url: str
     log_level: str
+    security_alerts: bool
+    hygiene_checks: bool
 
     @property
     def callback_url(self) -> str:
@@ -58,6 +62,16 @@ class Settings:
                 raise ConfigurationError(f"{key} must be >= {minimum}")
             return value
 
+        def boolean(key: str, default: bool) -> bool:
+            raw = env.get(key, "").strip().lower()
+            if not raw:
+                return default
+            if raw in ("true", "1"):
+                return True
+            if raw in ("false", "0"):
+                return False
+            raise ConfigurationError(f"{key} must be one of: true, false, 1, 0")
+
         secret_key = required("SECRET_KEY")
         if len(secret_key) < 32:
             raise ConfigurationError("SECRET_KEY must be at least 32 characters")
@@ -76,12 +90,17 @@ class Settings:
             github_client_secret=required("GITHUB_CLIENT_SECRET"),
             secret_key=secret_key,
             base_url=base_url,
-            github_scopes=env.get("GITHUB_SCOPES", "repo read:org").strip() or "repo read:org",
+            github_scopes=(
+                env.get("GITHUB_SCOPES", "").strip()
+                or "repo read:org security_events notifications"
+            ),
             allowed_logins=allowed,
             cache_ttl_seconds=integer("CACHE_TTL_SECONDS", 120, minimum=0),
             session_ttl_hours=integer("SESSION_TTL_HOURS", 168),
             runs_per_repo=integer("RUNS_PER_REPO", 5),
             max_concurrency=integer("MAX_CONCURRENCY", 8),
+            stale_days=integer("STALE_DAYS", 14),
+            long_run_minutes=integer("LONG_RUN_MINUTES", 30),
             db_path=env.get("DB_PATH", "./data/sessions.db").strip() or "./data/sessions.db",
             redis_url=env.get("REDIS_URL", "").strip() or None,
             github_api_url=(
@@ -91,4 +110,6 @@ class Settings:
                 "/"
             ),
             log_level=env.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
+            security_alerts=boolean("SECURITY_ALERTS", True),
+            hygiene_checks=boolean("HYGIENE_CHECKS", True),
         )

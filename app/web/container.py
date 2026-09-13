@@ -13,19 +13,25 @@ from app.application.ports import (
     OverviewCache,
     SessionRepository,
     TokenCipher,
+    UserStateRepository,
 )
 from app.application.use_cases import (
     AccessPolicy,
     CompleteLogin,
+    GetChanges,
     GetOverview,
+    GetPreferences,
     Logout,
+    MarkSeen,
     ResolveSession,
+    SavePreferences,
 )
 from app.infrastructure.cache_memory import MemoryOverviewCache
 from app.infrastructure.github_http import GitHubHttpApi, GitHubHttpOAuth
 from app.infrastructure.session_sqlite import SqliteSessionRepository
 from app.infrastructure.settings import Settings
 from app.infrastructure.token_fernet import FernetTokenCipher
+from app.infrastructure.user_state_sqlite import SqliteUserStateRepository
 from app.web.security import CookieSigner
 
 
@@ -38,10 +44,15 @@ class Container:
     sessions: SessionRepository
     cache: OverviewCache
     cipher: TokenCipher
+    user_state: UserStateRepository
     complete_login: CompleteLogin
     resolve_session: ResolveSession
     logout: Logout
     get_overview: GetOverview
+    get_preferences: GetPreferences
+    save_preferences: SavePreferences
+    mark_seen: MarkSeen
+    get_changes: GetChanges
     _closables: list[object]
 
     @classmethod
@@ -52,20 +63,26 @@ class Container:
 
         sessions: SessionRepository
         cache: OverviewCache
+        user_state: UserStateRepository
         if settings.redis_url:
             from redis.asyncio import Redis
 
             from app.infrastructure.session_redis import RedisOverviewCache, RedisSessionRepository
+            from app.infrastructure.user_state_redis import RedisUserStateRepository
 
             redis = Redis.from_url(settings.redis_url, decode_responses=True)
             closables.append(redis)
             sessions = RedisSessionRepository(redis)
             cache = RedisOverviewCache(redis)
+            user_state = RedisUserStateRepository(redis)
         else:
             sqlite = SqliteSessionRepository(settings.db_path)
             closables.append(sqlite)
             sessions = sqlite
             cache = MemoryOverviewCache()
+            user_state_sqlite = SqliteUserStateRepository(settings.db_path)
+            closables.append(user_state_sqlite)
+            user_state = user_state_sqlite
 
         oauth = GitHubHttpOAuth(
             http,
@@ -78,7 +95,13 @@ class Container:
         )
         api = GitHubHttpApi(http, api_url=settings.github_api_url)
         return cls.assemble(
-            settings, oauth=oauth, api=api, sessions=sessions, cache=cache, cipher=cipher
+            settings,
+            oauth=oauth,
+            api=api,
+            sessions=sessions,
+            cache=cache,
+            cipher=cipher,
+            user_state=user_state,
         )._with_closables(closables)
 
     @classmethod
@@ -91,6 +114,7 @@ class Container:
         sessions: SessionRepository,
         cache: OverviewCache,
         cipher: TokenCipher,
+        user_state: UserStateRepository,
     ) -> Container:
         """Build the use cases from explicit adapters (used by tests with fakes)."""
         return cls(
@@ -101,6 +125,7 @@ class Container:
             sessions=sessions,
             cache=cache,
             cipher=cipher,
+            user_state=user_state,
             complete_login=CompleteLogin(
                 oauth=oauth,
                 sessions=sessions,
@@ -118,7 +143,15 @@ class Container:
                 cache_ttl_seconds=settings.cache_ttl_seconds,
                 runs_per_repo=settings.runs_per_repo,
                 max_concurrency=settings.max_concurrency,
+                stale_after=timedelta(days=settings.stale_days),
+                long_run_after=timedelta(minutes=settings.long_run_minutes),
+                security_alerts=settings.security_alerts,
+                hygiene_checks=settings.hygiene_checks,
             ),
+            get_preferences=GetPreferences(user_state=user_state),
+            save_preferences=SavePreferences(user_state=user_state),
+            mark_seen=MarkSeen(user_state=user_state),
+            get_changes=GetChanges(user_state=user_state),
             _closables=[],
         )
 
