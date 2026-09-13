@@ -4,7 +4,7 @@ import pytest
 
 from app.application.activity import ActivityTracker
 from app.application.errors import AccessDenied, AuthenticationError, GitHubUnavailable, RateLimited
-from app.application.ports import BranchListing, TokenSet
+from app.application.ports import BranchListing, RepoItemPage, TokenSet
 from app.application.use_cases import (
     AccessPolicy,
     CompleteLogin,
@@ -12,17 +12,21 @@ from app.application.use_cases import (
     GetChanges,
     GetOverview,
     GetPreferences,
+    ListRepoItems,
     Logout,
     MarkSeen,
+    RerunFailedJobs,
     ResolveSession,
     SavePreferences,
     validate_preferences,
 )
 from app.domain.hygiene import RepoHygiene, assess_hygiene
 from app.domain.models import (
+    ActionsUsage,
     AttentionItem,
     AttentionKind,
     CiState,
+    FailedJob,
     Inbox,
     Notification,
     Preferences,
@@ -41,6 +45,8 @@ from tests.fakes import (
     PlainCipher,
     make_branch,
     make_hygiene_facts,
+    make_issue,
+    make_pr,
     make_repo,
     make_run,
 )
@@ -268,6 +274,7 @@ def build_overview_uc(
     cache: FakeCache,
     ttl: int = 60,
     oauth: FakeOAuth | None = None,
+    **extra,
 ):
     return GetOverview(
         api=api,
@@ -277,6 +284,7 @@ def build_overview_uc(
         cache_ttl_seconds=ttl,
         runs_per_repo=5,
         max_concurrency=2,
+        **extra,
         clock=clock,
     )
 
@@ -806,3 +814,240 @@ async def test_get_changes_reports_new_pr_after_mark_seen():
     assert changes.since == NOW
     assert changes.total == 1
     assert changes.new_prs[0].number == 2
+
+
+# -- failed job lookups (bounded across the whole refresh) ---------------------------------
+
+
+async def test_get_overview_attaches_failed_jobs_to_failed_runs():
+    job = FailedJob(name="build", step="Run tests", url="u")
+    run = make_run(RunStatus.FAILURE, run_id=1)
+    api = FakeApi(
+        repos=[make_repo("a")],
+        runs={"octocat/a": [run]},
+        failed_jobs_by_run={("octocat/a", 1): (job,)},
+    )
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    fetched_run = result.overview.repos[0].ci.runs[0]
+    assert fetched_run.failed_jobs == (job,)
+    assert api.failed_jobs_calls == [("octocat/a", 1)]
+
+
+async def test_get_overview_bounds_job_lookups_across_the_whole_refresh_not_per_repo():
+    # Two repositories, two failed runs each - four failed runs in total, but max_job_lookups
+    # caps the lookup at 2, newest (by updated_at) first, across all repositories combined.
+    older = make_run(RunStatus.FAILURE, run_id=1, age_minutes=30)
+    newer = make_run(RunStatus.FAILURE, run_id=2, age_minutes=10)
+    even_newer = make_run(RunStatus.FAILURE, run_id=3, age_minutes=5)
+    newest = make_run(RunStatus.FAILURE, run_id=4, age_minutes=1)
+    api = FakeApi(
+        repos=[make_repo("a"), make_repo("b")],
+        runs={"octocat/a": [older, even_newer], "octocat/b": [newer, newest]},
+    )
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    await build_overview_uc(api, sessions, cache, max_job_lookups=2)(record)
+
+    # Only the 2 newest failed runs across the whole refresh were looked up.
+    assert sorted(api.failed_jobs_calls) == sorted([("octocat/b", 4), ("octocat/a", 3)])
+
+
+async def test_get_overview_max_job_lookups_zero_disables_the_feature():
+    api = FakeApi(
+        repos=[make_repo("a")], runs={"octocat/a": [make_run(RunStatus.FAILURE, run_id=1)]}
+    )
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    await build_overview_uc(api, sessions, cache, max_job_lookups=0)(record)
+
+    assert api.failed_jobs_calls == []
+
+
+async def test_get_overview_failed_job_lookup_degrades_quietly_on_rate_limited_or_unavailable():
+    api = FakeApi(
+        repos=[make_repo("a")], runs={"octocat/a": [make_run(RunStatus.FAILURE, run_id=1)]}
+    )
+    api.failed_jobs_error = GitHubUnavailable("down")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.repos[0].ci.runs[0].failed_jobs == ()
+
+
+async def test_get_overview_failed_job_lookup_propagates_authentication_error():
+    api = FakeApi(
+        repos=[make_repo("a")], runs={"octocat/a": [make_run(RunStatus.FAILURE, run_id=1)]}
+    )
+    api.failed_jobs_error = AuthenticationError("revoked")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AuthenticationError):
+        await build_overview_uc(api, sessions, cache)(record)
+
+
+async def test_get_overview_never_looks_up_jobs_for_successful_runs():
+    api = FakeApi(
+        repos=[make_repo("a")], runs={"octocat/a": [make_run(RunStatus.SUCCESS, run_id=1)]}
+    )
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    await build_overview_uc(api, sessions, cache)(record)
+
+    assert api.failed_jobs_calls == []
+
+
+# -- actions usage ---------------------------------------------------------------------------
+
+
+async def test_get_overview_includes_actions_usage_when_available():
+    usage = ActionsUsage(
+        available=True, minutes_used=10, included_minutes=2000, paid_minutes_used=0
+    )
+    api = FakeApi(repos=[make_repo("a")], actions_usage_value=usage)
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.actions_usage == usage
+    assert api.actions_usage_calls == 1
+
+
+async def test_get_overview_skips_actions_usage_when_disabled():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache, actions_usage_enabled=False)(record)
+
+    assert api.actions_usage_calls == 0
+    assert result.overview.actions_usage == ActionsUsage(
+        available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
+    )
+
+
+async def test_get_overview_actions_usage_degrades_on_rate_limited_or_unavailable():
+    api = FakeApi(repos=[make_repo("a")])
+    api.actions_usage_error = RateLimited("billing")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.actions_usage.available is False
+
+
+async def test_get_overview_actions_usage_propagates_authentication_error():
+    api = FakeApi(repos=[make_repo("a")])
+    api.actions_usage_error = AuthenticationError("revoked")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AuthenticationError):
+        await build_overview_uc(api, sessions, cache)(record)
+
+
+# -- RerunFailedJobs ---------------------------------------------------------------------------
+
+
+def build_rerun_uc(api: FakeApi, sessions: FakeSessions, cache: FakeCache) -> RerunFailedJobs:
+    return RerunFailedJobs(
+        api=api, ensure_fresh_token=build_ensure_fresh_token(FakeOAuth(), sessions), cache=cache
+    )
+
+
+async def test_rerun_failed_jobs_calls_api_and_invalidates_cache():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    await build_overview_uc(api, sessions, cache)(record)  # populates the cache
+    assert record.user.id in cache.entries
+
+    await build_rerun_uc(api, sessions, cache)(record, "octocat", "a", 42)
+
+    assert api.rerun_calls == [("octocat/a", 42)]
+    assert record.user.id not in cache.entries
+
+
+async def test_rerun_failed_jobs_propagates_access_denied():
+    api = FakeApi(repos=[make_repo("a")])
+    api.rerun_error = AccessDenied("forbidden")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AccessDenied):
+        await build_rerun_uc(api, sessions, cache)(record, "octocat", "a", 1)
+
+
+async def test_rerun_failed_jobs_propagates_authentication_error():
+    api = FakeApi(repos=[make_repo("a")])
+    api.rerun_error = AuthenticationError("revoked")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AuthenticationError):
+        await build_rerun_uc(api, sessions, cache)(record, "octocat", "a", 1)
+
+
+# -- ListRepoItems ------------------------------------------------------------------------------
+
+
+def build_list_items_uc(api: FakeApi, sessions: FakeSessions) -> ListRepoItems:
+    return ListRepoItems(
+        api=api, ensure_fresh_token=build_ensure_fresh_token(FakeOAuth(), sessions), clock=clock
+    )
+
+
+async def test_list_repo_items_marks_stale_and_age_on_pull_requests():
+    pr = make_pr(1, created_at=NOW - timedelta(days=20), updated_at=NOW - timedelta(days=20))
+    api = FakeApi(
+        repos=[make_repo("a")],
+        repo_items={("octocat/a", "pull_requests"): RepoItemPage(pull_requests=(pr,))},
+    )
+    oauth, sessions = FakeOAuth(), FakeSessions()
+    record = await build_login(oauth, sessions)("code")
+
+    page = await build_list_items_uc(api, sessions)(record, "octocat", "a", "pull_requests", None)
+
+    assert page.pull_requests[0].stale is True
+    assert page.pull_requests[0].age_days == 20
+    assert api.repo_items_calls == [("octocat/a", "pull_requests", None, 50)]
+
+
+async def test_list_repo_items_marks_stale_and_age_on_issues():
+    issue = make_issue(1, created_at=NOW - timedelta(days=5), updated_at=NOW)
+    api = FakeApi(
+        repos=[make_repo("a")],
+        repo_items={("octocat/a", "issues"): RepoItemPage(issues=(issue,))},
+    )
+    oauth, sessions = FakeOAuth(), FakeSessions()
+    record = await build_login(oauth, sessions)("code")
+
+    page = await build_list_items_uc(api, sessions)(record, "octocat", "a", "issues", "cursor-1")
+
+    assert page.issues[0].stale is False
+    assert page.issues[0].age_days == 5
+    assert api.repo_items_calls == [("octocat/a", "issues", "cursor-1", 50)]
+
+
+async def test_list_repo_items_forwards_next_cursor():
+    api = FakeApi(
+        repos=[make_repo("a")],
+        repo_items={("octocat/a", "pull_requests"): RepoItemPage(next_cursor="next-page")},
+    )
+    oauth, sessions = FakeOAuth(), FakeSessions()
+    record = await build_login(oauth, sessions)("code")
+
+    page = await build_list_items_uc(api, sessions)(record, "octocat", "a", "pull_requests", None)
+
+    assert page.next_cursor == "next-page"

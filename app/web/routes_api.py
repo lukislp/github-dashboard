@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from app.application.errors import AuthenticationError, GitHubUnavailable, RateLimited
+from app.application.errors import (
+    AccessDenied,
+    ActionsUnavailable,
+    AuthenticationError,
+    GitHubUnavailable,
+    RateLimited,
+    RunNotRerunnable,
+)
 from app.domain.codec import (
     changes_to_dict,
+    issue_to_dict,
     overview_to_dict,
+    pr_to_dict,
     preferences_from_dict,
     preferences_to_dict,
     user_to_dict,
@@ -21,11 +31,19 @@ from app.web.routes_auth import clear_session_cookie
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
+# Same shape GitHub allows for owner/repo path segments: letters, digits, `.`, `_`, `-`.
+_OWNER_OR_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+_ITEM_KINDS = frozenset({"pull_requests", "issues"})
+
 
 def _unauthorized() -> JSONResponse:
     response = JSONResponse({"error": "unauthorized"}, status_code=401)
     clear_session_cookie(response)
     return response
+
+
+def _invalid_repository() -> JSONResponse:
+    return JSONResponse({"error": "invalid_repository"}, status_code=400)
 
 
 @router.get("/me")
@@ -105,3 +123,68 @@ async def mark_seen(
 
     snapshot = await container.mark_seen(session, result.overview)
     return JSONResponse({"seen_at": snapshot.taken_at.isoformat()})
+
+
+@router.post("/repos/{owner}/{name}/runs/{run_id}/rerun")
+async def rerun_run(
+    owner: str,
+    name: str,
+    run_id: int,
+    container: ContainerDep,
+    session: SessionDep,
+    _csrf: SameOriginDep,
+) -> JSONResponse:
+    if session is None:
+        return _unauthorized()
+    if not _OWNER_OR_NAME_RE.match(owner) or not _OWNER_OR_NAME_RE.match(name):
+        return _invalid_repository()
+    try:
+        await container.rerun_failed_jobs(session, owner, name, run_id)
+    except AuthenticationError:
+        return _unauthorized()
+    except AccessDenied:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    except ActionsUnavailable:
+        return JSONResponse({"error": "actions_unavailable"}, status_code=404)
+    except RunNotRerunnable:
+        return JSONResponse({"error": "not_rerunnable"}, status_code=409)
+    except (RateLimited, GitHubUnavailable):
+        log.exception(
+            "rerun failed user=%s repo=%s/%s run_id=%s", session.user.login, owner, name, run_id
+        )
+        return JSONResponse({"error": "github_unavailable"}, status_code=502)
+    return JSONResponse({"status": "queued"}, status_code=202)
+
+
+@router.get("/repos/{owner}/{name}/items")
+async def list_items(
+    owner: str,
+    name: str,
+    kind: str,
+    container: ContainerDep,
+    session: SessionDep,
+    cursor: str | None = None,
+) -> JSONResponse:
+    if session is None:
+        return _unauthorized()
+    if not _OWNER_OR_NAME_RE.match(owner) or not _OWNER_OR_NAME_RE.match(name):
+        return _invalid_repository()
+    if kind not in _ITEM_KINDS:
+        return JSONResponse({"error": "invalid_kind"}, status_code=400)
+    try:
+        page = await container.list_repo_items(session, owner, name, kind, cursor)
+    except AuthenticationError:
+        return _unauthorized()
+    except RateLimited:
+        return JSONResponse({"error": "rate_limited"}, status_code=429)
+    except GitHubUnavailable:
+        log.exception("items failed user=%s repo=%s/%s", session.user.login, owner, name)
+        return JSONResponse({"error": "github_unavailable"}, status_code=502)
+
+    return JSONResponse(
+        {
+            "pull_requests": [pr_to_dict(p) for p in page.pull_requests],
+            "issues": [issue_to_dict(i) for i in page.issues],
+            "next_cursor": page.next_cursor,
+        }
+    )

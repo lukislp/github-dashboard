@@ -11,6 +11,7 @@ from typing import Any
 
 from app.domain.hygiene import HygieneCheck, RepoHygiene
 from app.domain.models import (
+    ActionsUsage,
     AttentionItem,
     AttentionKind,
     Branch,
@@ -18,6 +19,7 @@ from app.domain.models import (
     Changes,
     ChecksState,
     CiState,
+    FailedJob,
     FailedRun,
     Inbox,
     Issue,
@@ -68,6 +70,14 @@ def user_from_dict(data: dict[str, Any]) -> User:
     return User(**data)
 
 
+def failed_job_to_dict(job: FailedJob) -> dict[str, Any]:
+    return {"name": job.name, "step": job.step, "url": job.url}
+
+
+def failed_job_from_dict(d: dict[str, Any]) -> FailedJob:
+    return FailedJob(name=d["name"], step=d.get("step"), url=d["url"])
+
+
 def run_to_dict(run: WorkflowRun) -> dict[str, Any]:
     return {
         "id": run.id,
@@ -82,11 +92,15 @@ def run_to_dict(run: WorkflowRun) -> dict[str, Any]:
         "run_number": run.run_number,
         "created_at": _dt(run.created_at),
         "updated_at": _dt(run.updated_at),
+        "started_at": _dt(run.started_at),
+        "duration_seconds": run.duration_seconds,
         "long_running": run.long_running,
+        "failed_jobs": [failed_job_to_dict(j) for j in run.failed_jobs],
     }
 
 
 def run_from_dict(d: dict[str, Any]) -> WorkflowRun:
+    created_at = _require_dt(d["created_at"])
     return WorkflowRun(
         id=d["id"],
         workflow_name=d["workflow_name"],
@@ -96,9 +110,11 @@ def run_from_dict(d: dict[str, Any]) -> WorkflowRun:
         event=d["event"],
         status=RunStatus(d["status"]),
         run_number=d["run_number"],
-        created_at=_require_dt(d["created_at"]),
+        created_at=created_at,
         updated_at=_require_dt(d["updated_at"]),
+        started_at=_parse_dt(d.get("started_at")) or created_at,
         long_running=d.get("long_running", False),
+        failed_jobs=tuple(failed_job_from_dict(j) for j in d.get("failed_jobs", [])),
     )
 
 
@@ -117,6 +133,8 @@ def pr_to_dict(pr: PullRequest) -> dict[str, Any]:
         "mergeable": pr.mergeable.value,
         "is_bot": pr.is_bot,
         "stale": pr.stale,
+        "age_days": pr.age_days,
+        "idle_days": pr.idle_days,
         "state": pr_state(pr).value,
     }
 
@@ -138,6 +156,8 @@ def pr_from_dict(d: dict[str, Any]) -> PullRequest:
         mergeable=Mergeable(d["mergeable"]),
         is_bot=d["is_bot"],
         stale=d.get("stale", False),
+        age_days=d.get("age_days", 0),
+        idle_days=d.get("idle_days", 0),
     )
 
 
@@ -148,18 +168,23 @@ def issue_to_dict(issue: Issue) -> dict[str, Any]:
         "url": issue.url,
         "author": issue.author,
         "updated_at": _dt(issue.updated_at),
+        "created_at": _dt(issue.created_at),
         "stale": issue.stale,
+        "age_days": issue.age_days,
     }
 
 
 def issue_from_dict(d: dict[str, Any]) -> Issue:
+    updated_at = _require_dt(d["updated_at"])
     return Issue(
         number=d["number"],
         title=d["title"],
         url=d["url"],
         author=d.get("author"),
-        updated_at=_require_dt(d["updated_at"]),
+        updated_at=updated_at,
+        created_at=_parse_dt(d.get("created_at")) or updated_at,
         stale=d.get("stale", False),
+        age_days=d.get("age_days", 0),
     )
 
 
@@ -269,6 +294,7 @@ def ci_to_dict(ci: RepoCi) -> dict[str, Any]:
         "active_count": ci.active_count,
         "error": ci.error,
         "long_running_count": ci.long_running_count,
+        "ci_seconds_recent": ci.ci_seconds_recent,
     }
 
 
@@ -280,6 +306,7 @@ def ci_from_dict(d: dict[str, Any]) -> RepoCi:
         active_count=d["active_count"],
         error=d.get("error"),
         long_running_count=d.get("long_running_count", 0),
+        ci_seconds_recent=d.get("ci_seconds_recent", 0),
     )
 
 
@@ -453,6 +480,28 @@ def inbox_from_dict(d: dict[str, Any]) -> Inbox:
     )
 
 
+def actions_usage_to_dict(usage: ActionsUsage) -> dict[str, Any]:
+    return {
+        "available": usage.available,
+        "minutes_used": usage.minutes_used,
+        "included_minutes": usage.included_minutes,
+        "paid_minutes_used": usage.paid_minutes_used,
+    }
+
+
+def actions_usage_from_dict(d: dict[str, Any] | None) -> ActionsUsage:
+    if d is None:
+        return ActionsUsage(
+            available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
+        )
+    return ActionsUsage(
+        available=d.get("available", False),
+        minutes_used=d.get("minutes_used"),
+        included_minutes=d.get("included_minutes"),
+        paid_minutes_used=d.get("paid_minutes_used"),
+    )
+
+
 def overview_to_dict(overview: Overview) -> dict[str, Any]:
     return {
         "viewer_login": overview.viewer_login,
@@ -484,6 +533,7 @@ def overview_to_dict(overview: Overview) -> dict[str, Any]:
         "inbox": inbox_to_dict(overview.inbox),
         "notifications": [notification_to_dict(n) for n in overview.notifications],
         "notifications_available": overview.notifications_available,
+        "actions_usage": actions_usage_to_dict(overview.actions_usage),
     }
 
 
@@ -512,6 +562,7 @@ def overview_from_dict(d: dict[str, Any]) -> Overview:
         inbox=inbox_from_dict(d.get("inbox", {})),
         notifications=tuple(notification_from_dict(n) for n in d.get("notifications", [])),
         notifications_available=d.get("notifications_available", False),
+        actions_usage=actions_usage_from_dict(d.get("actions_usage")),
     )
 
 

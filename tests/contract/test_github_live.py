@@ -91,3 +91,30 @@ async def test_live_repositories_and_runs():
 
         notifications = await api.list_notifications(token)
         assert notifications is None or isinstance(notifications, list)
+
+        # Failed jobs of one run, if any of the sampled runs failed. Never raises for a
+        # merely-unavailable lookup (404/403 degrade to an empty tuple in the adapter itself).
+        failed_run = next((r for r in runs if r.failed), None)
+        if failed_run is not None:
+            jobs = await api.list_failed_jobs(token, candidate.owner, candidate.name, failed_run.id)
+            assert isinstance(jobs, tuple)
+
+        # Actions billing usage: may be unavailable if the local `gh` token's scopes don't
+        # include `user`, which must never surface as an error.
+        viewer = await client.get(
+            "https://api.github.com/user", headers={"Authorization": f"Bearer {token}"}
+        )
+        viewer_login = viewer.json()["login"]
+        usage = await api.fetch_actions_usage(token, viewer_login)
+        assert isinstance(usage.available, bool)
+        if usage.available:
+            assert usage.minutes_used is not None and usage.minutes_used >= 0
+
+        # One page of the candidate repository's open pull requests, cursor-paginated.
+        items_page = await api.list_repo_items(
+            token, candidate.owner, candidate.name, "pull_requests", None, 50
+        )
+        print(
+            f"\nlist_repo_items: {len(items_page.pull_requests)} pull request(s) on "
+            f"{candidate.full_name} (next_cursor={items_page.next_cursor!r})"
+        )

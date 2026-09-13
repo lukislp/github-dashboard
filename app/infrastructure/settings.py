@@ -34,6 +34,8 @@ class Settings:
     background_refresh: bool
     background_refresh_seconds: int
     background_refresh_idle_minutes: int
+    max_job_lookups: int
+    actions_usage: bool
 
     @property
     def callback_url(self) -> str:
@@ -120,4 +122,6 @@ class Settings:
             background_refresh_idle_minutes=integer(
                 "BACKGROUND_REFRESH_IDLE_MINUTES", 30, minimum=1
             ),
+            max_job_lookups=integer("MAX_JOB_LOOKUPS", 20, minimum=0),
+            actions_usage=boolean("ACTIONS_USAGE", True),
         )

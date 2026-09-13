@@ -100,6 +100,10 @@ class PullRequest:
     mergeable: Mergeable
     is_bot: bool
     stale: bool = False
+    # Derived by `app.domain.overview.mark_pr`, same way `stale` is: whole days since
+    # `created_at` (age_days) and since `updated_at` (idle_days).
+    age_days: int = 0
+    idle_days: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +113,10 @@ class Issue:
     url: str
     author: str | None
     updated_at: datetime
+    created_at: datetime
     stale: bool = False
+    # Derived by `app.domain.overview.mark_issue`: whole days since `created_at`.
+    age_days: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +166,15 @@ class Repository:
 
 
 @dataclass(frozen=True, slots=True)
+class FailedJob:
+    """One failed job of a workflow run, with the first step that failed in it."""
+
+    name: str
+    step: str | None
+    url: str
+
+
+@dataclass(frozen=True, slots=True)
 class WorkflowRun:
     id: int
     workflow_name: str
@@ -170,7 +186,13 @@ class WorkflowRun:
     run_number: int
     created_at: datetime
     updated_at: datetime
+    # REST `run_started_at`, falling back to `created_at`. Used for `duration_seconds`.
+    started_at: datetime
     long_running: bool = False
+    # Populated only for failed runs, newest first and capped by `MAX_JOB_LOOKUPS` across the
+    # whole refresh (see `app.application.use_cases.GetOverview`); empty otherwise, including
+    # when the per-run jobs lookup degraded (404/403/GitHubUnavailable).
+    failed_jobs: tuple[FailedJob, ...] = ()
 
     @property
     def failed(self) -> bool:
@@ -179,6 +201,13 @@ class WorkflowRun:
     @property
     def active(self) -> bool:
         return self.status in ACTIVE_STATUSES
+
+    @property
+    def duration_seconds(self) -> int:
+        """Observed wall-clock CI time. Never negative, 0 while the run is still active."""
+        if self.active:
+            return 0
+        return max(0, int((self.updated_at - self.started_at).total_seconds()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +218,7 @@ class RepoCi:
     active_count: int
     error: str | None = None
     long_running_count: int = 0
+    ci_seconds_recent: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +378,20 @@ class Totals:
     repos_without_license: int
     branches_without_pr: int
     stale_branches: int
+    oldest_pr_days: int
+    ci_seconds_recent: int
+
+
+@dataclass(frozen=True, slots=True)
+class ActionsUsage:
+    """GitHub Actions billing usage for the signed-in user (`GET /users/{login}/settings/billing/
+    actions`). `available` is False when the endpoint answered 403/404 - the token's OAuth
+    scopes do not include `user` - in which case the other fields are `None`, never zero."""
+
+    available: bool
+    minutes_used: int | None
+    included_minutes: int | None
+    paid_minutes_used: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +412,7 @@ class Overview:
     inbox: Inbox
     notifications: tuple[Notification, ...]
     notifications_available: bool
+    actions_usage: ActionsUsage
 
 
 @dataclass(frozen=True, slots=True)

@@ -3,6 +3,7 @@ from datetime import timedelta
 
 from app.domain.hygiene import HYGIENE_KEYS
 from app.domain.models import (
+    ActionsUsage,
     AttentionItem,
     AttentionKind,
     ChecksState,
@@ -17,7 +18,7 @@ from app.domain.models import (
     SeverityCounts,
 )
 from app.domain.overview import build_overview, classify_ci, skipped_ci
-from tests.fakes import NOW, make_branch, make_hygiene, make_pr, make_repo, make_run
+from tests.fakes import NOW, make_branch, make_hygiene, make_issue, make_pr, make_repo, make_run
 
 
 def test_no_runs_is_none():
@@ -464,3 +465,147 @@ def test_totals_branches_without_pr_and_stale_branches_default_to_zero():
     )
     assert overview.totals.branches_without_pr == 0
     assert overview.totals.stale_branches == 0
+
+
+# -- pull request / issue age and idle days --------------------------------------------------
+
+
+def test_pr_age_and_idle_days_are_derived_from_created_and_updated_at():
+    pr = make_pr(1, created_at=NOW - timedelta(days=10), updated_at=NOW - timedelta(days=3))
+    repo = make_repo("a", prs=0)
+    repo = dataclasses.replace(repo, pull_requests=(pr,), open_pr_count=1)
+
+    overview = build_overview(
+        viewer_login="x", repositories=[repo], ci_by_repo={}, rate_limit=None, now=NOW
+    )
+
+    updated_pr = overview.repos[0].repository.pull_requests[0]
+    assert updated_pr.age_days == 10
+    assert updated_pr.idle_days == 3
+
+
+def test_issue_age_days_is_derived_from_created_at():
+    issue = make_issue(1, created_at=NOW - timedelta(days=21), updated_at=NOW - timedelta(days=1))
+    repo = make_repo("a", issues=0)
+    repo = dataclasses.replace(repo, issues=(issue,), open_issue_count=1)
+
+    overview = build_overview(
+        viewer_login="x", repositories=[repo], ci_by_repo={}, rate_limit=None, now=NOW
+    )
+
+    assert overview.repos[0].repository.issues[0].age_days == 21
+
+
+def test_oldest_pr_days_is_the_max_age_across_all_fetched_open_prs():
+    pr_a = make_pr(1, created_at=NOW - timedelta(days=5))
+    pr_b = make_pr(2, created_at=NOW - timedelta(days=40))
+    repo_a = dataclasses.replace(make_repo("a", prs=0), pull_requests=(pr_a,), open_pr_count=1)
+    repo_b = dataclasses.replace(make_repo("b", prs=0), pull_requests=(pr_b,), open_pr_count=1)
+
+    overview = build_overview(
+        viewer_login="x", repositories=[repo_a, repo_b], ci_by_repo={}, rate_limit=None, now=NOW
+    )
+
+    assert overview.totals.oldest_pr_days == 40
+
+
+def test_oldest_pr_days_is_zero_when_there_are_no_open_prs():
+    overview = build_overview(
+        viewer_login="x", repositories=[make_repo("a")], ci_by_repo={}, rate_limit=None, now=NOW
+    )
+    assert overview.totals.oldest_pr_days == 0
+
+
+# -- workflow run duration and ci_seconds_recent ---------------------------------------------
+
+
+def test_duration_seconds_is_updated_at_minus_started_at():
+    run = make_run(
+        RunStatus.SUCCESS,
+        created_at=NOW - timedelta(minutes=10),
+        started_at=NOW - timedelta(minutes=9),
+        age_minutes=0,
+    )
+    assert run.duration_seconds == 9 * 60
+
+
+def test_duration_seconds_falls_back_to_created_at_when_started_at_not_given():
+    run = make_run(RunStatus.SUCCESS, created_at=NOW - timedelta(minutes=5), age_minutes=0)
+    assert run.duration_seconds == 5 * 60
+
+
+def test_duration_seconds_is_zero_while_run_is_active():
+    run = make_run(
+        RunStatus.IN_PROGRESS,
+        created_at=NOW - timedelta(minutes=30),
+        started_at=NOW - timedelta(minutes=30),
+        age_minutes=0,
+    )
+    assert run.active is True
+    assert run.duration_seconds == 0
+
+
+def test_duration_seconds_never_negative():
+    # updated_at (NOW - 5min) ends up before started_at (NOW): a data glitch that must clamp
+    # to 0 rather than surface a negative duration.
+    run = make_run(RunStatus.SUCCESS, started_at=NOW, age_minutes=5)
+    assert run.duration_seconds == 0
+
+
+def test_classify_ci_sums_duration_across_runs_into_ci_seconds_recent():
+    run_a = make_run(
+        RunStatus.SUCCESS,
+        run_id=1,
+        started_at=NOW - timedelta(minutes=10),
+        age_minutes=5,  # updated_at = NOW - 5min
+    )
+    run_b = make_run(
+        RunStatus.FAILURE,
+        run_id=2,
+        started_at=NOW - timedelta(minutes=4),
+        age_minutes=2,  # updated_at = NOW - 2min
+    )
+    ci = classify_ci([run_a, run_b])
+    assert ci.ci_seconds_recent == run_a.duration_seconds + run_b.duration_seconds
+
+
+def test_totals_ci_seconds_recent_sums_across_repos():
+    repo_a = make_repo("a")
+    repo_b = make_repo("b")
+    run_a = make_run(RunStatus.SUCCESS, run_id=1, started_at=NOW - timedelta(minutes=6))
+    run_b = make_run(RunStatus.SUCCESS, run_id=2, started_at=NOW - timedelta(minutes=4))
+    ci = {"octocat/a": classify_ci([run_a]), "octocat/b": classify_ci([run_b])}
+
+    overview = build_overview(
+        viewer_login="x", repositories=[repo_a, repo_b], ci_by_repo=ci, rate_limit=None, now=NOW
+    )
+
+    assert overview.totals.ci_seconds_recent == run_a.duration_seconds + run_b.duration_seconds
+    assert overview.totals.ci_seconds_recent == 6 * 60 + 4 * 60
+
+
+# -- actions usage ----------------------------------------------------------------------------
+
+
+def test_actions_usage_defaults_to_unavailable():
+    overview = build_overview(
+        viewer_login="x", repositories=[make_repo("a")], ci_by_repo={}, rate_limit=None, now=NOW
+    )
+    assert overview.actions_usage == ActionsUsage(
+        available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
+    )
+
+
+def test_actions_usage_is_passed_through_when_provided():
+    usage = ActionsUsage(
+        available=True, minutes_used=100, included_minutes=2000, paid_minutes_used=0
+    )
+    overview = build_overview(
+        viewer_login="x",
+        repositories=[make_repo("a")],
+        ci_by_repo={},
+        rate_limit=None,
+        now=NOW,
+        actions_usage=usage,
+    )
+    assert overview.actions_usage == usage

@@ -3,6 +3,8 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from fastapi.testclient import TestClient
 
+from app.application.errors import AccessDenied, ActionsUnavailable, RunNotRerunnable
+from app.application.ports import RepoItemPage
 from app.domain.models import RunStatus
 from app.infrastructure.settings import Settings
 from app.main import create_app
@@ -15,6 +17,8 @@ from tests.fakes import (
     FakeSessions,
     FakeUserState,
     PlainCipher,
+    make_issue,
+    make_pr,
     make_repo,
     make_run,
 )
@@ -250,3 +254,140 @@ def test_csrf_guard_allows_same_origin_and_no_header_requests(client):
 
     no_headers = client.post("/api/seen")
     assert no_headers.status_code == 200
+
+
+# -- rerun failed jobs ------------------------------------------------------------------------
+
+
+def test_rerun_run_success_returns_202_and_invalidates_cache(client, fakes):
+    sign_in(client)
+    client.get("/api/overview")  # populate the cache
+    assert fakes["cache"].entries
+
+    response = client.post("/api/repos/octocat/red/runs/1/rerun")
+
+    assert response.status_code == 202
+    assert response.json() == {"status": "queued"}
+    assert fakes["api"].rerun_calls == [("octocat/red", 1)]
+    assert fakes["cache"].entries == {}
+
+
+def test_rerun_run_forbidden(client, fakes):
+    sign_in(client)
+    fakes["api"].rerun_error = AccessDenied("forbidden")
+
+    response = client.post("/api/repos/octocat/red/runs/1/rerun")
+
+    assert response.status_code == 403
+    assert response.json() == {"error": "forbidden"}
+
+
+def test_rerun_run_not_rerunnable(client, fakes):
+    sign_in(client)
+    fakes["api"].rerun_error = RunNotRerunnable("still running")
+
+    response = client.post("/api/repos/octocat/red/runs/1/rerun")
+
+    assert response.status_code == 409
+    assert response.json() == {"error": "not_rerunnable"}
+
+
+def test_rerun_run_actions_unavailable(client, fakes):
+    sign_in(client)
+    fakes["api"].rerun_error = ActionsUnavailable("disabled")
+
+    response = client.post("/api/repos/octocat/red/runs/1/rerun")
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "actions_unavailable"}
+
+
+def test_rerun_run_rejects_bad_owner_or_name(client):
+    sign_in(client)
+
+    response = client.post("/api/repos/bad%21owner/red/runs/1/rerun")
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_repository"}
+
+
+def test_rerun_run_requires_a_session(client):
+    response = client.post("/api/repos/octocat/red/runs/1/rerun")
+    assert response.status_code == 401
+
+
+def test_rerun_run_rejects_cross_site(client):
+    sign_in(client)
+
+    response = client.post(
+        "/api/repos/octocat/red/runs/1/rerun", headers={"Sec-Fetch-Site": "cross-site"}
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"error": "cross_site"}
+
+
+# -- paginated pull request / issue listing ----------------------------------------------------
+
+
+def test_list_items_returns_pull_requests_marked_like_the_overview(client, fakes):
+    sign_in(client)
+    pr = make_pr(1)
+    fakes["api"].repo_items = {
+        ("octocat/red", "pull_requests"): RepoItemPage(pull_requests=(pr,), next_cursor="c2")
+    }
+
+    response = client.get("/api/repos/octocat/red/items", params={"kind": "pull_requests"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["next_cursor"] == "c2"
+    assert body["issues"] == []
+    assert len(body["pull_requests"]) == 1
+    assert body["pull_requests"][0]["number"] == 1
+    assert "stale" in body["pull_requests"][0]
+    assert "age_days" in body["pull_requests"][0]
+    assert fakes["api"].repo_items_calls == [("octocat/red", "pull_requests", None, 50)]
+
+
+def test_list_items_returns_issues_with_a_cursor(client, fakes):
+    sign_in(client)
+    issue = make_issue(1)
+    fakes["api"].repo_items = {("octocat/red", "issues"): RepoItemPage(issues=(issue,))}
+
+    response = client.get(
+        "/api/repos/octocat/red/items", params={"kind": "issues", "cursor": "abc"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pull_requests"] == []
+    assert len(body["issues"]) == 1
+    assert fakes["api"].repo_items_calls == [("octocat/red", "issues", "abc", 50)]
+
+
+def test_list_items_rejects_invalid_kind(client):
+    sign_in(client)
+    response = client.get("/api/repos/octocat/red/items", params={"kind": "bogus"})
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_kind"}
+
+
+def test_list_items_rejects_bad_owner_or_name(client):
+    sign_in(client)
+    response = client.get("/api/repos/bad%21owner/red/items", params={"kind": "issues"})
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_repository"}
+
+
+def test_list_items_requires_a_session(client):
+    response = client.get("/api/repos/octocat/red/items", params={"kind": "issues"})
+    assert response.status_code == 401
+
+
+def test_bundled_fonts_are_served_with_the_right_media_type(client):
+    """A woff2 served as application/octet-stream still renders, but it defeats caching and
+    compression heuristics - and Python's mimetypes table does not know the type everywhere."""
+    response = client.get("/static/fonts/ibm-plex-sans-400-latin.woff2")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "font/woff2"

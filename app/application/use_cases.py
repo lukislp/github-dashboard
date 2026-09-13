@@ -25,6 +25,7 @@ from app.application.ports import (
     GitHubOAuth,
     HygienePage,
     OverviewCache,
+    RepoItemPage,
     SessionRecord,
     SessionRepository,
     TokenCipher,
@@ -33,7 +34,9 @@ from app.application.ports import (
 )
 from app.domain.hygiene import RepoHygiene, assess_hygiene
 from app.domain.models import (
+    ActionsUsage,
     Changes,
+    FailedJob,
     Inbox,
     Notification,
     Overview,
@@ -43,15 +46,23 @@ from app.domain.models import (
     RepoSecurity,
     Repository,
     Snapshot,
+    WorkflowRun,
 )
 from app.domain.overview import (
     DEFAULT_LONG_RUN_AFTER,
     DEFAULT_STALE_AFTER,
     build_overview,
     classify_ci,
+    mark_issue,
+    mark_pr,
     skipped_ci,
 )
 from app.domain.snapshot import diff_since, snapshot_of
+
+_EMPTY_ACTIONS_USAGE = ActionsUsage(
+    available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
+)
+_REPO_ITEMS_LIMIT = 50
 
 _MAX_GROUPS = 30
 _MAX_GROUP_NAME_LEN = 40
@@ -252,6 +263,8 @@ class GetOverview:
     long_run_after: timedelta = DEFAULT_LONG_RUN_AFTER
     security_alerts: bool = True
     hygiene_checks: bool = True
+    max_job_lookups: int = 20
+    actions_usage_enabled: bool = True
     clock: Clock = utc_now
     _locks: dict[int, asyncio.Lock] = field(default_factory=dict)
 
@@ -378,16 +391,27 @@ class GetOverview:
                     log.warning("hygiene fetch failed: %s", exc)
                     return HygienePage({}, {})
 
+        async def actions_usage() -> ActionsUsage:
+            if not self.actions_usage_enabled:
+                return _EMPTY_ACTIONS_USAGE
+            try:
+                return await self.api.fetch_actions_usage(token, session.user.login)
+            except (RateLimited, GitHubUnavailable) as exc:
+                log.warning("actions usage fetch failed: %s", exc)
+                return _EMPTY_ACTIONS_USAGE
+
         (
             worker_results,
             inbox_result,
             (notification_items, notifications_available),
             hygiene_page,
+            actions_usage_result,
         ) = await asyncio.gather(
             asyncio.gather(*(worker(r) for r in page.repositories)),
             inbox(),
             notifications(),
             hygiene(),
+            actions_usage(),
         )
         ci_by_repo: dict[str, RepoCi] = {}
         security_by_repo: dict[str, RepoSecurity] = {}
@@ -396,6 +420,8 @@ class GetOverview:
             ci_by_repo[full_name] = ci
             security_by_repo[full_name] = security
             release_by_repo[full_name] = release
+
+        ci_by_repo = await self._attach_failed_jobs(ci_by_repo, token=token, semaphore=semaphore)
 
         repositories = tuple(
             _attach_branch_listing(repo, hygiene_page.branches_by_repo.get(repo.full_name))
@@ -417,10 +443,66 @@ class GetOverview:
             hygiene_by_repo=hygiene_by_repo,
             notifications=notification_items,
             notifications_available=notifications_available,
+            actions_usage=actions_usage_result,
             stale_after=self.stale_after,
             long_run_after=self.long_run_after,
             now=self.clock(),
         )
+
+    async def _attach_failed_jobs(
+        self, ci_by_repo: dict[str, RepoCi], *, token: str, semaphore: asyncio.Semaphore
+    ) -> dict[str, RepoCi]:
+        """Fetch the failed jobs of the newest `max_job_lookups` failed runs across the whole
+        refresh (not per repository), and attach them to the matching `WorkflowRun`s.
+
+        A lookup that fails with `RateLimited`/`GitHubUnavailable` (or the run's jobs endpoint
+        answering 404/403, already handled by the adapter) simply leaves that run's
+        `failed_jobs` empty; it must never fail the overview. `AuthenticationError` still
+        propagates, like every other GitHub call in this refresh.
+        """
+        if self.max_job_lookups <= 0:
+            return ci_by_repo
+
+        candidates = [
+            (full_name, run)
+            for full_name, ci in ci_by_repo.items()
+            for run in ci.runs
+            if run.failed
+        ]
+        candidates.sort(key=lambda pair: pair[1].updated_at, reverse=True)
+        selected = candidates[: self.max_job_lookups]
+        if not selected:
+            return ci_by_repo
+
+        async def fetch_one(
+            full_name: str, run: WorkflowRun
+        ) -> tuple[str, int, tuple[FailedJob, ...]]:
+            owner, name = full_name.split("/", 1)
+            async with semaphore:
+                try:
+                    jobs = await self.api.list_failed_jobs(token, owner, name, run.id)
+                except (RateLimited, GitHubUnavailable) as exc:
+                    log.warning(
+                        "failed job lookup failed repo=%s run=%s: %s", full_name, run.id, exc
+                    )
+                    jobs = ()
+            return full_name, run.id, jobs
+
+        results = await asyncio.gather(*(fetch_one(full_name, run) for full_name, run in selected))
+        jobs_by_run: dict[tuple[str, int], tuple[FailedJob, ...]] = {
+            (full_name, run_id): jobs for full_name, run_id, jobs in results
+        }
+
+        updated: dict[str, RepoCi] = {}
+        for full_name, ci in ci_by_repo.items():
+            runs = tuple(
+                dataclasses.replace(
+                    run, failed_jobs=jobs_by_run.get((full_name, run.id), run.failed_jobs)
+                )
+                for run in ci.runs
+            )
+            updated[full_name] = dataclasses.replace(ci, runs=runs)
+        return updated
 
 
 def validate_preferences(prefs: Preferences) -> None:
@@ -492,3 +574,58 @@ class GetChanges:
     async def __call__(self, session: SessionRecord, overview: Overview) -> Changes:
         snapshot = await self.user_state.get_snapshot(session.user.id)
         return diff_since(overview, snapshot)
+
+
+@dataclass(slots=True)
+class RerunFailedJobs:
+    """Re-run the failed jobs of one workflow run - the only write this app performs.
+
+    Invalidates the user's overview cache afterwards so the next `GetOverview` shows the run
+    as queued instead of the stale failure. Errors (`AccessDenied`, `ActionsUnavailable`,
+    `RunNotRerunnable`, `AuthenticationError`, ...) propagate to the caller unchanged.
+    """
+
+    api: GitHubApi
+    ensure_fresh_token: EnsureFreshToken
+    cache: OverviewCache
+
+    async def __call__(self, session: SessionRecord, owner: str, name: str, run_id: int) -> None:
+        session, token = await self.ensure_fresh_token(session)
+        await self.api.rerun_failed_jobs(token, owner, name, run_id)
+        await self.cache.invalidate(session.user.id)
+        log.info(
+            "rerun requested user=%s repo=%s/%s run_id=%s",
+            session.user.login,
+            owner,
+            name,
+            run_id,
+        )
+
+
+@dataclass(slots=True)
+class ListRepoItems:
+    """Fetch one page of one repository's open pull requests or issues on demand.
+
+    Applies the same `stale`/`age_days`/`idle_days` marking as the overview (via `mark_pr`/
+    `mark_issue`), so an item looks identical whether it came from the overview's capped
+    preview list or from this on-demand full listing.
+    """
+
+    api: GitHubApi
+    ensure_fresh_token: EnsureFreshToken
+    stale_after: timedelta = DEFAULT_STALE_AFTER
+    clock: Clock = utc_now
+
+    async def __call__(
+        self, session: SessionRecord, owner: str, name: str, kind: str, cursor: str | None
+    ) -> RepoItemPage:
+        _, token = await self.ensure_fresh_token(session)
+        page = await self.api.list_repo_items(token, owner, name, kind, cursor, _REPO_ITEMS_LIMIT)
+        now = self.clock()
+        return dataclasses.replace(
+            page,
+            pull_requests=tuple(
+                mark_pr(p, now=now, stale_after=self.stale_after) for p in page.pull_requests
+            ),
+            issues=tuple(mark_issue(i, now=now, stale_after=self.stale_after) for i in page.issues),
+        )

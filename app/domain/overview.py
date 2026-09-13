@@ -8,11 +8,14 @@ from datetime import datetime, timedelta
 
 from app.domain.hygiene import RepoHygiene
 from app.domain.models import (
+    ActionsUsage,
     CiState,
     FailedRun,
     Inbox,
+    Issue,
     Notification,
     Overview,
+    PullRequest,
     RateLimit,
     ReleaseInfo,
     RepoCi,
@@ -28,6 +31,9 @@ from app.domain.pull_requests import PrState, pr_state
 _EMPTY_INBOX = Inbox((), (), (), ())
 _EMPTY_SECURITY = RepoSecurity(None, None, None, None)
 _EMPTY_HYGIENE = RepoHygiene((), applicable=False)
+_EMPTY_ACTIONS_USAGE = ActionsUsage(
+    available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
+)
 DEFAULT_STALE_AFTER = timedelta(days=14)
 DEFAULT_LONG_RUN_AFTER = timedelta(minutes=30)
 
@@ -47,6 +53,7 @@ def classify_ci(runs: Iterable[WorkflowRun], *, error: str | None = None) -> Rep
 
     failed = sum(1 for r in run_tuple if r.failed)
     active = sum(1 for r in run_tuple if r.active)
+    ci_seconds_recent = sum(r.duration_seconds for r in run_tuple)
 
     if failed:
         state = CiState.FAILING
@@ -60,7 +67,7 @@ def classify_ci(runs: Iterable[WorkflowRun], *, error: str | None = None) -> Rep
             state = CiState.PASSING
         else:
             state = CiState.NEUTRAL
-    return RepoCi(state, run_tuple, failed, active)
+    return RepoCi(state, run_tuple, failed, active, ci_seconds_recent=ci_seconds_recent)
 
 
 def skipped_ci(reason: str) -> RepoCi:
@@ -68,15 +75,33 @@ def skipped_ci(reason: str) -> RepoCi:
     return RepoCi(CiState.SKIPPED, (), 0, 0, reason)
 
 
+def mark_pr(pr: PullRequest, *, now: datetime, stale_after: timedelta) -> PullRequest:
+    """Attach the derived 'stale' flag and age/idle day counts to one pull request.
+
+    Reused by `build_overview` (via `_mark_stale`) and by `ListRepoItems`, so the full
+    pull-request lists fetched on demand apply exactly the same rule as the overview.
+    """
+    return dataclasses.replace(
+        pr,
+        stale=(now - pr.updated_at) >= stale_after,
+        age_days=(now - pr.created_at).days,
+        idle_days=(now - pr.updated_at).days,
+    )
+
+
+def mark_issue(issue: Issue, *, now: datetime, stale_after: timedelta) -> Issue:
+    """Attach the derived 'stale' flag and age day count to one issue. See `mark_pr`."""
+    return dataclasses.replace(
+        issue,
+        stale=(now - issue.updated_at) >= stale_after,
+        age_days=(now - issue.created_at).days,
+    )
+
+
 def _mark_stale(repo: Repository, *, now: datetime, stale_after: timedelta) -> Repository:
     """Attach the derived 'stale' flag to a repository's pull requests, issues and branches."""
-    prs = tuple(
-        dataclasses.replace(p, stale=(now - p.updated_at) >= stale_after)
-        for p in repo.pull_requests
-    )
-    issues = tuple(
-        dataclasses.replace(i, stale=(now - i.updated_at) >= stale_after) for i in repo.issues
-    )
+    prs = tuple(mark_pr(p, now=now, stale_after=stale_after) for p in repo.pull_requests)
+    issues = tuple(mark_issue(i, now=now, stale_after=stale_after) for i in repo.issues)
     branches = tuple(
         dataclasses.replace(
             b, stale=b.last_commit_at is not None and (now - b.last_commit_at) >= stale_after
@@ -111,6 +136,7 @@ def build_overview(
     hygiene_by_repo: Mapping[str, RepoHygiene] | None = None,
     notifications: tuple[Notification, ...] = (),
     notifications_available: bool = False,
+    actions_usage: ActionsUsage = _EMPTY_ACTIONS_USAGE,
 ) -> Overview:
     repos: list[RepoOverview] = []
     failures: list[FailedRun] = []
@@ -188,6 +214,8 @@ def build_overview(
         repos_without_license=_repos_missing_check(repos, "license"),
         branches_without_pr=sum(len(r.repository.branches_without_pr) for r in repos),
         stale_branches=sum(1 for r in repos for b in r.repository.branches_without_pr if b.stale),
+        oldest_pr_days=max((p.age_days for p in all_prs), default=0),
+        ci_seconds_recent=sum(r.ci.ci_seconds_recent for r in repos),
     )
     return Overview(
         viewer_login=viewer_login,
@@ -199,6 +227,7 @@ def build_overview(
         inbox=inbox,
         notifications=notifications,
         notifications_available=notifications_available,
+        actions_usage=actions_usage,
     )
 
 

@@ -9,14 +9,17 @@ from app.application.errors import ActionsUnavailable, AuthenticationError
 from app.application.ports import (
     BranchListing,
     HygienePage,
+    RepoItemPage,
     RepositoryPage,
     SessionRecord,
     TokenSet,
 )
 from app.domain.hygiene import HYGIENE_KEYS, HygieneCheck, HygieneFacts, RepoHygiene
 from app.domain.models import (
+    ActionsUsage,
     Branch,
     ChecksState,
+    FailedJob,
     Inbox,
     Issue,
     LastCommit,
@@ -69,6 +72,23 @@ def make_pr(
         checks=checks,
         mergeable=mergeable,
         is_bot=is_bot,
+    )
+
+
+def make_issue(
+    number: int,
+    *,
+    author: str | None = "someone",
+    updated_at: datetime = NOW,
+    created_at: datetime | None = None,
+) -> Issue:
+    return Issue(
+        number=number,
+        title=f"Issue {number}",
+        url=f"u/{number}",
+        author=author,
+        updated_at=updated_at,
+        created_at=created_at if created_at is not None else updated_at,
     )
 
 
@@ -154,10 +174,7 @@ def make_repo(
             )
             for i in range(1, prs + 1)
         ),
-        issues=tuple(
-            Issue(i, f"Issue {i}", f"u/{i}", "someone", issue_updated_at)
-            for i in range(1, issues + 1)
-        ),
+        issues=tuple(make_issue(i, updated_at=issue_updated_at) for i in range(1, issues + 1)),
         last_commit=last_commit,
         branch_count=branch_count if branch_count is not None else len(branches) + 1,
         branches_without_pr=branches,
@@ -172,8 +189,11 @@ def make_run(
     branch: str = "main",
     age_minutes: int = 0,
     created_at: datetime | None = None,
+    started_at: datetime | None = None,
+    failed_jobs: tuple[FailedJob, ...] = (),
 ) -> WorkflowRun:
     updated = NOW - timedelta(minutes=age_minutes)
+    created = created_at if created_at is not None else updated
     return WorkflowRun(
         id=run_id,
         workflow_name=workflow,
@@ -183,8 +203,10 @@ def make_run(
         event="push",
         status=status,
         run_number=run_id,
-        created_at=created_at if created_at is not None else updated,
+        created_at=created,
         updated_at=updated,
+        started_at=started_at if started_at is not None else created,
+        failed_jobs=failed_jobs,
     )
 
 
@@ -258,6 +280,9 @@ class FakeApi:
         commits_since: dict[str, int | None] | None = None,
         notifications: list[Notification] | None = None,
         list_repositories_error: Exception | None = None,
+        failed_jobs_by_run: dict[tuple[str, int], tuple[FailedJob, ...]] | None = None,
+        repo_items: dict[tuple[str, str], RepoItemPage] | None = None,
+        actions_usage_value: ActionsUsage | None = None,
     ) -> None:
         self.repos = repos or []
         self.runs = runs or {}
@@ -290,6 +315,19 @@ class FakeApi:
         self.commits_since_error: Exception | None = None
         self.notifications_error: Exception | None = None
         self.hygiene_error: Exception | None = None
+        self.failed_jobs_by_run = failed_jobs_by_run or {}
+        self.failed_jobs_calls: list[tuple[str, int]] = []
+        self.failed_jobs_error: Exception | None = None
+        self.rerun_calls: list[tuple[str, int]] = []
+        self.rerun_error: Exception | None = None
+        self.repo_items = repo_items or {}
+        self.repo_items_calls: list[tuple[str, str, str | None, int]] = []
+        self.repo_items_error: Exception | None = None
+        self.actions_usage_value = actions_usage_value or ActionsUsage(
+            available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
+        )
+        self.actions_usage_calls = 0
+        self.actions_usage_error: Exception | None = None
 
     async def list_repositories(self, token: str) -> RepositoryPage:
         self.calls += 1
@@ -328,6 +366,36 @@ class FakeApi:
         if self.inbox_error is not None:
             raise self.inbox_error
         return self.inbox
+
+    async def list_failed_jobs(
+        self, token: str, owner: str, name: str, run_id: int
+    ) -> tuple[FailedJob, ...]:
+        full = f"{owner}/{name}"
+        self.failed_jobs_calls.append((full, run_id))
+        if self.failed_jobs_error is not None:
+            raise self.failed_jobs_error
+        return self.failed_jobs_by_run.get((full, run_id), ())
+
+    async def rerun_failed_jobs(self, token: str, owner: str, name: str, run_id: int) -> None:
+        full = f"{owner}/{name}"
+        self.rerun_calls.append((full, run_id))
+        if self.rerun_error is not None:
+            raise self.rerun_error
+
+    async def list_repo_items(
+        self, token: str, owner: str, name: str, kind: str, cursor: str | None, limit: int
+    ) -> RepoItemPage:
+        full = f"{owner}/{name}"
+        self.repo_items_calls.append((full, kind, cursor, limit))
+        if self.repo_items_error is not None:
+            raise self.repo_items_error
+        return self.repo_items.get((full, kind), RepoItemPage())
+
+    async def fetch_actions_usage(self, token: str, login: str) -> ActionsUsage:
+        self.actions_usage_calls += 1
+        if self.actions_usage_error is not None:
+            raise self.actions_usage_error
+        return self.actions_usage_value
 
     async def fetch_security(
         self, token: str, owner: str, name: str

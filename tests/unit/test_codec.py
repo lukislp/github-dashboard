@@ -1,5 +1,6 @@
 import dataclasses
 import json
+from datetime import timedelta
 
 from app.domain.codec import (
     changes_from_dict,
@@ -13,11 +14,13 @@ from app.domain.codec import (
 )
 from app.domain.hygiene import HygieneCheck, RepoHygiene
 from app.domain.models import (
+    ActionsUsage,
     AttentionItem,
     AttentionKind,
     ChangedItem,
     Changes,
     ChecksState,
+    FailedJob,
     FailedRun,
     Inbox,
     LastCommit,
@@ -35,7 +38,7 @@ from app.domain.models import (
 )
 from app.domain.overview import build_overview, classify_ci
 from app.domain.pull_requests import PrState
-from tests.fakes import NOW, make_branch, make_hygiene, make_pr, make_repo, make_run
+from tests.fakes import NOW, make_branch, make_hygiene, make_issue, make_pr, make_repo, make_run
 
 
 def test_overview_roundtrip_through_json():
@@ -45,6 +48,7 @@ def test_overview_roundtrip_through_json():
         checks=ChecksState.FAILURE,
         mergeable=Mergeable.CONFLICTING,
         is_bot=True,
+        created_at=NOW - timedelta(days=5),
     )
     last_commit = LastCommit(
         sha="abc123",
@@ -55,14 +59,21 @@ def test_overview_roundtrip_through_json():
         url="https://github.com/octocat/a/commit/abc123",
     )
     branch = make_branch("feature-old", last_commit_at=NOW, author="ada")
-    repo_a = make_repo("a", prs=0, issues=2, last_commit=last_commit, branches=(branch,))
-    repo_a = dataclasses.replace(repo_a, pull_requests=(pr,), open_pr_count=1)
+    issue = make_issue(2, created_at=NOW, updated_at=NOW)
+    repo_a = make_repo("a", prs=0, issues=0, last_commit=last_commit, branches=(branch,))
+    repo_a = dataclasses.replace(
+        repo_a, pull_requests=(pr,), open_pr_count=1, issues=(issue,), open_issue_count=1
+    )
     repos = [repo_a, make_repo("b", archived=True)]
-    ci = {
-        "octocat/a": classify_ci(
-            [make_run(RunStatus.FAILURE), make_run(RunStatus.QUEUED, run_id=2)]
-        )
-    }
+    failed_run = make_run(
+        RunStatus.FAILURE,
+        started_at=NOW,
+        failed_jobs=(FailedJob(name="build", step="Run tests", url="https://github.com/x/y/1"),),
+    )
+    ci = {"octocat/a": classify_ci([failed_run, make_run(RunStatus.QUEUED, run_id=2)])}
+    actions_usage = ActionsUsage(
+        available=True, minutes_used=120, included_minutes=2000, paid_minutes_used=0
+    )
     inbox = Inbox(
         review_requested=(
             AttentionItem(
@@ -129,6 +140,7 @@ def test_overview_roundtrip_through_json():
         hygiene_by_repo=hygiene_by_repo,
         notifications=notifications,
         notifications_available=True,
+        actions_usage=actions_usage,
     )
 
     restored = overview_from_dict(json.loads(json.dumps(overview_to_dict(original))))
@@ -153,6 +165,31 @@ def test_run_dict_exposes_derived_flags():
     assert payload["rate_limit"] is None
 
 
+def test_run_dict_exposes_started_at_duration_and_failed_jobs():
+    job = FailedJob(name="build", step="Run tests", url="https://github.com/x/y/actions/1")
+    run = make_run(RunStatus.FAILURE, started_at=NOW - timedelta(minutes=3), failed_jobs=(job,))
+    payload = overview_to_dict(
+        build_overview(
+            viewer_login="o",
+            repositories=[make_repo("a")],
+            ci_by_repo={"octocat/a": classify_ci([run])},
+            rate_limit=None,
+            now=NOW,
+        )
+    )
+    ci_dict = payload["repos"][0]["ci"]
+    run_dict = ci_dict["runs"][0]
+    assert run_dict["started_at"] == run.started_at.isoformat()
+    assert run_dict["duration_seconds"] == run.duration_seconds == 180
+    assert run_dict["failed_jobs"] == [{"name": "build", "step": "Run tests", "url": job.url}]
+    assert ci_dict["ci_seconds_recent"] == run.duration_seconds
+
+    restored = overview_from_dict(json.loads(json.dumps(payload)))
+    restored_run = restored.repos[0].ci.runs[0]
+    assert restored_run.started_at == run.started_at
+    assert restored_run.failed_jobs == (job,)
+
+
 def test_pr_dict_exposes_derived_state_and_flags():
     pr = make_pr(
         1,
@@ -172,6 +209,81 @@ def test_pr_dict_exposes_derived_state_and_flags():
     assert pr_dict["is_bot"] is False
     assert pr_dict["stale"] is False
     assert pr_dict["mergeable"] == Mergeable.MERGEABLE.value
+
+
+def test_pr_and_issue_dicts_expose_age_and_idle_days():
+    pr = make_pr(1, created_at=NOW - timedelta(days=10), updated_at=NOW - timedelta(days=2))
+    issue = make_issue(2, created_at=NOW - timedelta(days=7), updated_at=NOW)
+    repo = dataclasses.replace(
+        make_repo("a", issues=0),
+        pull_requests=(pr,),
+        open_pr_count=1,
+        issues=(issue,),
+        open_issue_count=1,
+    )
+    payload = overview_to_dict(
+        build_overview(
+            viewer_login="o", repositories=[repo], ci_by_repo={}, rate_limit=None, now=NOW
+        )
+    )
+    pr_dict = payload["repos"][0]["repository"]["pull_requests"][0]
+    issue_dict = payload["repos"][0]["repository"]["issues"][0]
+    assert pr_dict["age_days"] == 10
+    assert pr_dict["idle_days"] == 2
+    assert issue_dict["age_days"] == 7
+    assert issue_dict["created_at"] == issue.created_at.isoformat()
+
+    restored = overview_from_dict(json.loads(json.dumps(payload)))
+    restored_pr = restored.repos[0].repository.pull_requests[0]
+    restored_issue = restored.repos[0].repository.issues[0]
+    assert (restored_pr.age_days, restored_pr.idle_days) == (10, 2)
+    assert restored_issue.age_days == 7
+
+
+def test_totals_expose_oldest_pr_days_and_ci_seconds_recent():
+    pr = make_pr(1, created_at=NOW - timedelta(days=15))
+    repo = dataclasses.replace(make_repo("a"), pull_requests=(pr,), open_pr_count=1)
+    run = make_run(RunStatus.SUCCESS, started_at=NOW - timedelta(minutes=2))
+    payload = overview_to_dict(
+        build_overview(
+            viewer_login="o",
+            repositories=[repo],
+            ci_by_repo={"octocat/a": classify_ci([run])},
+            rate_limit=None,
+            now=NOW,
+        )
+    )
+    assert payload["totals"]["oldest_pr_days"] == 15
+    assert payload["totals"]["ci_seconds_recent"] == 120
+
+
+def test_actions_usage_dict_round_trips_available_and_unavailable():
+    usage = ActionsUsage(
+        available=True, minutes_used=42, included_minutes=2000, paid_minutes_used=0
+    )
+    payload = overview_to_dict(
+        build_overview(
+            viewer_login="o",
+            repositories=[make_repo("a")],
+            ci_by_repo={},
+            rate_limit=None,
+            now=NOW,
+            actions_usage=usage,
+        )
+    )
+    assert payload["actions_usage"] == {
+        "available": True,
+        "minutes_used": 42,
+        "included_minutes": 2000,
+        "paid_minutes_used": 0,
+    }
+    restored = overview_from_dict(json.loads(json.dumps(payload)))
+    assert restored.actions_usage == usage
+
+    unavailable = overview_from_dict({**json.loads(json.dumps(payload)), "actions_usage": None})
+    assert unavailable.actions_usage == ActionsUsage(
+        available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
+    )
 
 
 def test_inbox_dict_round_trips_and_totals():

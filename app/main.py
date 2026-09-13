@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -75,6 +76,9 @@ def create_app(container: Container | None = None) -> FastAPI:
     app = FastAPI(title="GitHub Dashboard", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_exception_handler(CrossSiteRequest, _cross_site_handler)
+    # Python's mimetypes table has no entry for woff2 on every platform, and StaticFiles would
+    # then serve the bundled IBM Plex files as application/octet-stream.
+    mimetypes.add_type("font/woff2", ".woff2")
     app.mount(
         "/static", StaticFiles(directory=str(Path(__file__).parent / "web" / "static")), "static"
     )

@@ -64,6 +64,16 @@ is dropped for that refresh: its repositories are simply reported as "hygiene no
 with no branch data, rather than failing the whole overview. An authentication failure or an
 exhausted rate limit still propagates and fails the refresh, same as everywhere else.
 
+### Actions usage
+
+Every run's observed `duration_seconds` (`updated_at` minus `run_started_at`, 0 while it is
+still active) is summed into `RepoCi.ci_seconds_recent` and `Totals.ci_seconds_recent`. This
+works with the scopes we have and is the honest number; the billing endpoint
+(`GET /users/{login}/settings/billing/actions`, exposed as `Overview.actions_usage`) is a
+bonus on top of it - it may be unavailable (`actions_usage.available: false`) because the
+requested OAuth scopes do not include `user`, which is not a scope this app otherwise needs.
+Set `ACTIONS_USAGE=false` to skip that call altogether.
+
 ### Branches without a pull request
 
 Each repository also reports its branches (other than the default one) that have no open or
@@ -116,6 +126,8 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> SECRET_KEY
 | `BACKGROUND_REFRESH` | no | `true` | Keep recently active users' overview cache warm in the background (`true`/`false`/`1`/`0`) |
 | `BACKGROUND_REFRESH_SECONDS` | no | `240` | Seconds between background-refresh ticks (minimum `60`) |
 | `BACKGROUND_REFRESH_IDLE_MINUTES` | no | `30` | Only refresh sessions seen within this many minutes (minimum `1`) |
+| `MAX_JOB_LOOKUPS` | no | `20` | Failed runs (newest first, across the whole refresh) whose failed jobs/steps are looked up per refresh (minimum `0`, `0` disables the feature) |
+| `ACTIONS_USAGE` | no | `true` | Fetch GitHub Actions billing usage for the signed-in user (`true`/`false`/`1`/`0`); skipped entirely when `false` |
 | `DB_PATH` | no | `./data/sessions.db` | SQLite session store (single replica) |
 | `REDIS_URL` | no | | Redis for sessions and cache (multiple replicas) |
 
@@ -177,6 +189,13 @@ session store.
   code-scanning alerts, secret-scanning alerts, and a commit comparison for repositories with a
   release), on top of the batched GraphQL query. Set `SECURITY_ALERTS=false` to skip the two
   security REST calls per repository if that cost is too high for a large account.
+- `POST /api/repos/{owner}/{name}/runs/{run_id}/rerun` is the only endpoint that writes to
+  GitHub (it re-runs a run's failed jobs). It needs no scope beyond the `repo` scope already
+  requested, and is guarded by the same same-origin check as every other state-changing
+  endpoint (`PUT /api/preferences`, `POST /api/seen`).
+- Failed jobs and their first failing step are looked up for the newest failed runs across the
+  whole refresh, capped by `MAX_JOB_LOOKUPS` (default 20) rather than per repository, to bound
+  the extra REST cost on accounts with many failing repositories.
 
 ## Per-user state
 

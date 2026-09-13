@@ -23,8 +23,10 @@ from app.application.use_cases import (
     GetChanges,
     GetOverview,
     GetPreferences,
+    ListRepoItems,
     Logout,
     MarkSeen,
+    RerunFailedJobs,
     ResolveSession,
     SavePreferences,
 )
@@ -56,6 +58,8 @@ class Container:
     save_preferences: SavePreferences
     mark_seen: MarkSeen
     get_changes: GetChanges
+    rerun_failed_jobs: RerunFailedJobs
+    list_repo_items: ListRepoItems
     _closables: list[object]
 
     @classmethod
@@ -152,11 +156,23 @@ class Container:
                 long_run_after=timedelta(minutes=settings.long_run_minutes),
                 security_alerts=settings.security_alerts,
                 hygiene_checks=settings.hygiene_checks,
+                max_job_lookups=settings.max_job_lookups,
+                actions_usage_enabled=settings.actions_usage,
             ),
             get_preferences=GetPreferences(user_state=user_state),
             save_preferences=SavePreferences(user_state=user_state),
             mark_seen=MarkSeen(user_state=user_state),
             get_changes=GetChanges(user_state=user_state),
+            rerun_failed_jobs=RerunFailedJobs(
+                api=api,
+                ensure_fresh_token=EnsureFreshToken(oauth=oauth, sessions=sessions, cipher=cipher),
+                cache=cache,
+            ),
+            list_repo_items=ListRepoItems(
+                api=api,
+                ensure_fresh_token=EnsureFreshToken(oauth=oauth, sessions=sessions, cipher=cipher),
+                stale_after=timedelta(days=settings.stale_days),
+            ),
             _closables=[],
         )
 
