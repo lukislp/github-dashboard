@@ -1,9 +1,19 @@
 # github-dashboard
 
+[![CI](https://github.com/lukislp/github-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/lukislp/github-dashboard/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/lukislp/github-dashboard/badge)](https://securityscorecards.dev/viewer/?uri=github.com/lukislp/github-dashboard)
+[![CodeQL](https://github.com/lukislp/github-dashboard/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/lukislp/github-dashboard/security/code-scanning)
+[![Release](https://img.shields.io/github/v/release/lukislp/github-dashboard)](https://github.com/lukislp/github-dashboard/releases)
+[![License: MIT](https://img.shields.io/github/license/lukislp/github-dashboard)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue)](pyproject.toml)
+[![Docker image](https://img.shields.io/badge/ghcr.io-lukislp%2Fgithub--dashboard-blue)](https://github.com/lukislp/github-dashboard/pkgs/container/github-dashboard)
+
 Every repository you can reach on GitHub on one screen: open pull requests, open issues, the last
 five workflow runs of each repository, and the totals across all of them. Multi-user: each person
 signs in with their own GitHub account and sees exactly what that account sees. Nothing is loaded
 without a login.
+
+![Screenshot of the github-dashboard overview page](docs/screenshot.png)
 
 ## What it shows
 
@@ -110,8 +120,8 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> SECRET_KEY
 Locally:
 
 ```bash
-uv venv && uv pip install -e ".[dev]"
-uvicorn app.main:app --reload --port 8000
+uv sync
+uv run uvicorn app.main:app --reload --port 8000
 ```
 
 Docker:
@@ -203,10 +213,34 @@ hygiene.
 ## Development
 
 ```bash
-ruff check app tests && ruff format --check app tests
-pytest -q
-GH_TOKEN=$(gh auth token) pytest -q tests/contract   # optional live check
+uv run ruff check app tests && uv run ruff format --check app tests
+uv run pytest -q
+GH_TOKEN=$(gh auth token) uv run pytest -q tests/contract   # optional live check
 ```
+
+## Releases and images
+
+Versions are cut by [semantic-release](https://semantic-release.gitbook.io/) from
+[Conventional Commit](https://www.conventionalcommits.org/) messages on `main` - see
+[CHANGELOG.md](CHANGELOG.md) for the generated history. Each release publishes a multi-arch
+(`linux/amd64` + `linux/arm64`) image to `ghcr.io/lukislp/github-dashboard`, tagged `latest` and
+`vX.Y.Z`, with an SBOM and SLSA provenance attestation attached and a Sigstore keyless signature
+on the manifest. Verify it before pulling:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp 'https://github.com/lukislp/github-dashboard/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/lukislp/github-dashboard:<tag>
+```
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

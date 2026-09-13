@@ -4,6 +4,7 @@
 data
 tests
 deploy
+docs
 .github
 __pycache__
 *.pyc

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Kubernetes image tags only - Dependabot already covers the Dockerfile, package manifests and GitHub Actions, but has no Kubernetes manager. Own images (ghcr.io/lukislp/*) are excluded here.",
+  "extends": [
+    "config:recommended",
+    ":disableDependencyDashboard"
+  ],
+  "enabledManagers": [
+    "kubernetes"
+  ],
+  "kubernetes": {
+    "managerFilePatterns": [
+      "/^deploy/k8s/.+\\.ya?ml$/"
+    ]
+  },
+  "semanticCommits": "enabled",
+  "semanticCommitType": "chore",
+  "semanticCommitScope": "k8s",
+  "labels": [
+    "dependencies",
+    "kubernetes"
+  ],
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "packageRules": [
+    {
+      "matchPackageNames": [
+        "/^ghcr\\.io/lukislp//"
+      ],
+      "enabled": false
+    },
+    {
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest"
+      ],
+      "groupName": "kubernetes image tags"
+    }
+  ]
+}

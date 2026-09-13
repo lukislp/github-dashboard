@@ -1,6 +1,6 @@
 [project]
 name = "github-dashboard"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Multi-user GitHub overview: repositories, open pull requests, open issues and failed Actions at a glance."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -15,7 +15,7 @@ dependencies = [
   "redis>=5.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.24",
@@ -23,6 +23,21 @@ dev = [
   "fakeredis>=2.24",
   "ruff>=0.6",
 ]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+# Falls back to this version when no git metadata is available (e.g. the Docker build
+# context only copies pyproject.toml/app, never .git) instead of failing the build.
+fallback_version = "0.0.0"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
 
 [tool.ruff]
 line-length = 100
@@ -34,6 +49,3 @@ select = ["E", "F", "I", "B", "UP", "SIM", "ASYNC"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-
-[tool.setuptools.packages.find]
-include = ["app*"]
