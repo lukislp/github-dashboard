@@ -9,3 +9,6 @@
 *.yaml      text eol=lf
 .env*       text eol=lf
 Dockerfile  text eol=lf
+
+# Self-hosted web fonts are binary; never let line-ending normalization touch them.
+*.woff2     binary

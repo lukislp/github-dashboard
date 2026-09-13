@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.templating import Jinja2Templates
 
 from app.web.deps import ContainerDep, SessionDep
-from app.web.security import LANG_COOKIE
+from app.web.security import LANG_COOKIE, THEME_COOKIE
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -25,12 +25,19 @@ def _language(request: Request) -> str:
     return "de" if accept.lower().startswith("de") else "en"
 
 
+def _theme(request: Request) -> str:
+    cookie = request.cookies.get(THEME_COOKIE)
+    return cookie if cookie in ("light", "dark") else "auto"
+
+
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request, session: SessionDep) -> Response:
     if session is None:
         return RedirectResponse("/login", status_code=303)
     return templates.TemplateResponse(
-        request, "index.html", {"lang": _language(request), "user": session.user}
+        request,
+        "index.html",
+        {"lang": _language(request), "theme": _theme(request), "user": session.user},
     )
 
 
@@ -41,7 +48,11 @@ async def login(request: Request, session: SessionDep, error: str | None = None)
     return templates.TemplateResponse(
         request,
         "login.html",
-        {"lang": _language(request), "error": error if error in _LOGIN_ERRORS else None},
+        {
+            "lang": _language(request),
+            "theme": _theme(request),
+            "error": error if error in _LOGIN_ERRORS else None,
+        },
     )
 
 

@@ -151,6 +151,16 @@
 
   const CI_RANK = { failing: 0, running: 1, unavailable: 2, neutral: 3, passing: 4, none: 5, skipped: 6 };
 
+  const SORT_COL_LABEL_KEY = {
+    name: "col_repo",
+    prs: "col_prs",
+    issues: "col_issues",
+    alerts: "col_alerts",
+    hygiene: "col_hygiene",
+    ci: "col_ci",
+    pushed: "col_pushed",
+  };
+
   function needsAttention(item) {
     const hasStaleBranch = (item.repository.branches_without_pr || []).some((b) => b.stale);
     const hasLowHygiene = item.hygiene.applicable && item.hygiene.score < 70;
@@ -1105,8 +1115,19 @@
     });
 
     document.querySelectorAll(".sort").forEach((button) => {
+      const key = button.dataset.sort;
+      const isActive = key === state.sort.key;
+      const dir = isActive ? state.sort.dir : null;
       button.classList.remove("is-asc", "is-desc");
-      if (button.dataset.sort === state.sort.key) button.classList.add("is-" + state.sort.dir);
+      if (isActive) button.classList.add("is-" + dir);
+
+      const th = button.closest("th");
+      if (th) th.setAttribute("aria-sort", isActive ? (dir === "asc" ? "ascending" : "descending") : "none");
+
+      const nextDir = isActive ? (dir === "asc" ? "desc" : "asc") : key === "name" ? "asc" : "desc";
+      const columnLabel = t(SORT_COL_LABEL_KEY[key] || key);
+      const nextDirLabel = t(nextDir === "asc" ? "sort_ascending" : "sort_descending");
+      button.setAttribute("aria-label", `${columnLabel}: ${nextDirLabel}`);
     });
   }
 
