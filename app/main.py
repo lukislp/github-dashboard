@@ -23,6 +23,27 @@ log = logging.getLogger(__name__)
 _PURGE_INTERVAL_SECONDS = 3600
 
 
+class RedactOAuthCallbackQuery(logging.Filter):
+    """Strips the query string of /auth/callback from uvicorn's access log.
+
+    The one-time OAuth `code` and the `state` token are consumed the moment the request is
+    handled, but they have no business sitting in log storage. uvicorn formats the access line
+    from record.args = (client, method, path, http_version, status), so the path is replaced
+    before formatting; every other request is logged unchanged.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if (
+            isinstance(args, tuple)
+            and len(args) == 5
+            and isinstance(args[2], str)
+            and args[2].startswith("/auth/callback?")
+        ):
+            record.args = (*args[:2], "/auth/callback?<redacted>", *args[3:])
+        return True
+
+
 def create_app(container: Container | None = None) -> FastAPI:
     """Build the application. Pass a Container to inject fakes (tests)."""
 
@@ -33,6 +54,7 @@ def create_app(container: Container | None = None) -> FastAPI:
         logging.basicConfig(level=active.settings.log_level)
         # httpx logs every request URL at INFO; keep that out of production logs.
         logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("uvicorn.access").addFilter(RedactOAuthCallbackQuery())
         app.state.container = active
         purge_task = asyncio.create_task(_purge_loop(active))
         try:
