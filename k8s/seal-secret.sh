@@ -8,7 +8,7 @@
 #   SEALED_SECRETS_CERT=cert.pem bash ...  # or use a previously fetched controller certificate
 #
 # Apply afterwards (bootstrap-only, not Flux-managed): kubectl apply -f k8s/02-sealed-secret.yaml
-# Requires: kubectl, kubeseal (https://github.com/bitnami-labs/sealed-secrets), python3.
+# Requires: kubectl, kubeseal (https://github.com/bitnami-labs/sealed-secrets), python 3.
 set -euo pipefail
 
 NAMESPACE="github-dashboard"
@@ -21,7 +21,8 @@ read -r -p "GITHUB_CLIENT_ID: " CLIENT_ID
 [ -n "$CLIENT_ID" ] || { echo "empty client id" >&2; exit 1; }
 read -r -s -p "GITHUB_CLIENT_SECRET (hidden): " CLIENT_SECRET; echo
 [ -n "$CLIENT_SECRET" ] || { echo "empty client secret" >&2; exit 1; }
-SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+PY="$(command -v python3 || command -v python)"
+SECRET_KEY="$("$PY" -c 'import secrets; print(secrets.token_urlsafe(48))')"
 
 CERT_ARGS=()
 if [ -n "${SEALED_SECRETS_CERT:-}" ]; then
