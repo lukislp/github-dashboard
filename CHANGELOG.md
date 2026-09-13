@@ -1,3 +1,10 @@
+## [1.0.2](https://github.com/lukislp/github-dashboard/compare/v1.0.1...v1.0.2) (2026-09-13)
+
+
+### Bug Fixes
+
+* **docker:** apply Debian security updates at build time ([#3](https://github.com/lukislp/github-dashboard/issues/3)) ([19658f9](https://github.com/lukislp/github-dashboard/commit/19658f9a2d9f65d90938156edd81dfa5e9bb588f))
+
 ## [1.0.1](https://github.com/lukislp/github-dashboard/compare/v1.0.0...v1.0.1) (2026-09-13)
 
 
