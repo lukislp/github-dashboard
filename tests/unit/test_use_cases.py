@@ -3,10 +3,11 @@ from datetime import timedelta
 import pytest
 
 from app.application.errors import AccessDenied, AuthenticationError, GitHubUnavailable, RateLimited
-from app.application.ports import BranchListing
+from app.application.ports import BranchListing, TokenSet
 from app.application.use_cases import (
     AccessPolicy,
     CompleteLogin,
+    EnsureFreshToken,
     GetChanges,
     GetOverview,
     GetPreferences,
@@ -70,6 +71,34 @@ async def test_complete_login_creates_encrypted_session():
     assert sessions.records[record.id] == record
 
 
+async def test_complete_login_without_expiry_leaves_new_fields_none():
+    """Without "Expire user access tokens" enabled, GitHub issues a non-expiring token and no
+    refresh token; the session must reflect that (all three new fields stay `None`)."""
+    oauth, sessions = FakeOAuth(), FakeSessions()
+    record = await build_login(oauth, sessions)("code-1")
+
+    assert record.token_expires_at is None
+    assert record.refresh_token_ciphertext is None
+    assert record.refresh_expires_at is None
+
+
+async def test_complete_login_stores_encrypted_refresh_token_and_expiries():
+    expires_at = NOW + timedelta(hours=8)
+    refresh_expires_at = NOW + timedelta(days=180)
+    oauth = FakeOAuth(
+        token_expires_at=expires_at,
+        refresh_token="ghr_secret",
+        refresh_expires_at=refresh_expires_at,
+    )
+    sessions = FakeSessions()
+    record = await build_login(oauth, sessions)("code-1")
+
+    assert record.token_expires_at == expires_at
+    assert record.refresh_expires_at == refresh_expires_at
+    assert record.refresh_token_ciphertext == "enc:ghr_secret"
+    assert sessions.records[record.id] == record
+
+
 async def test_complete_login_rejects_and_revokes_when_not_allowed():
     oauth, sessions = FakeOAuth(), FakeSessions()
     with pytest.raises(AccessDenied):
@@ -102,11 +131,118 @@ async def test_logout_deletes_session_and_revokes_token():
     assert oauth.revoked == ["gho_test"]
 
 
-def build_overview_uc(api: FakeApi, sessions: FakeSessions, cache: FakeCache, ttl: int = 60):
+def build_ensure_fresh_token(oauth: FakeOAuth, sessions: FakeSessions) -> EnsureFreshToken:
+    return EnsureFreshToken(oauth=oauth, sessions=sessions, cipher=PlainCipher(), clock=clock)
+
+
+# -- EnsureFreshToken -----------------------------------------------------------------------
+
+
+async def test_ensure_fresh_token_leaves_non_expiring_token_untouched():
+    oauth, sessions = FakeOAuth(), FakeSessions()
+    record = await build_login(oauth, sessions)("code")
+
+    updated, token = await build_ensure_fresh_token(oauth, sessions)(record)
+
+    assert token == "gho_test"
+    assert updated == record
+    assert oauth.refreshed == []
+
+
+async def test_ensure_fresh_token_leaves_far_from_expiry_token_untouched():
+    oauth = FakeOAuth(token_expires_at=NOW + timedelta(hours=1), refresh_token="ghr_old")
+    sessions = FakeSessions()
+    record = await build_login(oauth, sessions)("code")
+
+    updated, token = await build_ensure_fresh_token(oauth, sessions)(record)
+
+    assert token == "gho_test"
+    assert updated == record
+    assert oauth.refreshed == []
+
+
+async def test_ensure_fresh_token_refreshes_expiring_token_and_persists_it():
+    oauth = FakeOAuth(
+        token_expires_at=NOW + timedelta(minutes=1),
+        refresh_token="ghr_old",
+        refresh_expires_at=NOW + timedelta(days=1),
+    )
+    new_expires_at = NOW + timedelta(hours=8)
+    new_refresh_expires_at = NOW + timedelta(days=180)
+    oauth.next_refresh = TokenSet(
+        access_token="gho_new",
+        expires_at=new_expires_at,
+        refresh_token="ghr_new",
+        refresh_expires_at=new_refresh_expires_at,
+    )
+    sessions = FakeSessions()
+    record = await build_login(oauth, sessions)("code")
+
+    updated, token = await build_ensure_fresh_token(oauth, sessions)(record)
+
+    assert token == "gho_new"
+    assert oauth.refreshed == ["ghr_old"]
+    assert updated.token_ciphertext == "enc:gho_new"
+    assert updated.token_expires_at == new_expires_at
+    assert updated.refresh_token_ciphertext == "enc:ghr_new"
+    assert updated.refresh_expires_at == new_refresh_expires_at
+    # Persisted to the session store, not just returned.
+    assert sessions.records[record.id] == updated
+
+
+async def test_ensure_fresh_token_without_refresh_token_deletes_session_and_raises():
+    oauth = FakeOAuth(token_expires_at=NOW + timedelta(minutes=1))
+    sessions = FakeSessions()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AuthenticationError):
+        await build_ensure_fresh_token(oauth, sessions)(record)
+    assert sessions.records == {}
+    assert oauth.refreshed == []
+
+
+async def test_ensure_fresh_token_with_expired_refresh_token_deletes_session_and_raises():
+    oauth = FakeOAuth(
+        token_expires_at=NOW + timedelta(minutes=1),
+        refresh_token="ghr_old",
+        refresh_expires_at=NOW - timedelta(seconds=1),
+    )
+    sessions = FakeSessions()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AuthenticationError):
+        await build_ensure_fresh_token(oauth, sessions)(record)
+    assert sessions.records == {}
+    assert oauth.refreshed == []
+
+
+async def test_ensure_fresh_token_rejected_refresh_deletes_session_and_raises():
+    oauth = FakeOAuth(
+        token_expires_at=NOW + timedelta(minutes=1),
+        refresh_token="ghr_old",
+        refresh_expires_at=NOW + timedelta(days=1),
+    )
+    oauth.reject_refresh = True
+    sessions = FakeSessions()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AuthenticationError):
+        await build_ensure_fresh_token(oauth, sessions)(record)
+    assert sessions.records == {}
+    assert oauth.refreshed == ["ghr_old"]
+
+
+def build_overview_uc(
+    api: FakeApi,
+    sessions: FakeSessions,
+    cache: FakeCache,
+    ttl: int = 60,
+    oauth: FakeOAuth | None = None,
+):
     return GetOverview(
         api=api,
         sessions=sessions,
-        cipher=PlainCipher(),
+        ensure_fresh_token=build_ensure_fresh_token(oauth or FakeOAuth(), sessions),
         cache=cache,
         cache_ttl_seconds=ttl,
         runs_per_repo=5,
@@ -251,7 +387,7 @@ async def test_get_overview_skips_rest_security_when_disabled():
     uc = GetOverview(
         api=api,
         sessions=sessions,
-        cipher=PlainCipher(),
+        ensure_fresh_token=build_ensure_fresh_token(oauth, sessions),
         cache=cache,
         cache_ttl_seconds=60,
         runs_per_repo=5,
@@ -386,7 +522,7 @@ async def test_get_overview_ignores_hygiene_when_disabled():
     uc = GetOverview(
         api=api,
         sessions=sessions,
-        cipher=PlainCipher(),
+        ensure_fresh_token=build_ensure_fresh_token(oauth, sessions),
         cache=cache,
         cache_ttl_seconds=60,
         runs_per_repo=5,

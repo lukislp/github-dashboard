@@ -86,6 +86,7 @@ GitHub → Settings → Developer settings → OAuth Apps → *New OAuth App*.
 |---|---|
 | Homepage URL | `https://dashboard.example.com` (or `http://localhost:8000`) |
 | Authorization callback URL | `<Homepage URL>/auth/callback` |
+| Expire user access tokens | Optional. When enabled, GitHub issues short-lived (8h) tokens plus a refresh token instead of a non-expiring one; the app refreshes automatically either way (see "Security notes"). |
 
 Copy the client ID and generate a client secret.
 
@@ -159,6 +160,8 @@ session store.
   all sessions.
 - Signing out deletes the session and revokes the token at GitHub.
 - A `401` from GitHub (token revoked in your GitHub settings) deletes the session immediately.
+- Expiring tokens ("Expire user access tokens" in the OAuth App) are supported: the refresh
+  token is stored encrypted alongside the access token and rotated on every refresh.
 - Strict Content-Security-Policy; no inline scripts. The only external resources are the web fonts.
 - No data is shared between users; the cache is keyed by GitHub user ID.
 - `security_events` lets the app read Dependabot, code-scanning and secret-scanning alerts;

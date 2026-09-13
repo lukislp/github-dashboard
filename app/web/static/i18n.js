@@ -13,7 +13,7 @@
       login_tagline:
         "Open pull requests, open issues and the last five workflow runs of every repository you have access to. You sign in with your own GitHub account and see only what that account sees.",
       login_scopes_note:
-        "Requested permissions: repo, read:org, security_events, notifications. security_events reads Dependabot, code-scanning and secret-scanning alerts; notifications reads (but never marks read) your notifications feed. The token is stored encrypted and revoked when you sign out.",
+        "Requested permissions: repo, read:org, security_events, notifications. security_events reads Dependabot, code-scanning and secret-scanning alerts; notifications reads (but never marks read) your notifications feed. The token is stored encrypted, refreshed automatically when GitHub issues expiring tokens, and revoked when you sign out.",
       fact_repos: "Own, collaborator and organisation repositories",
       fact_ci: "Failing workflows are listed first",
       fact_private: "Nothing is shared between users",
@@ -228,7 +228,7 @@
       login_tagline:
         "Offene Pull Requests, offene Issues und die letzten fünf Workflow-Läufe jedes Repositories, auf das du Zugriff hast. Du meldest dich mit deinem eigenen GitHub-Konto an und siehst nur, was dieses Konto sieht.",
       login_scopes_note:
-        "Angeforderte Berechtigungen: repo, read:org, security_events, notifications. security_events liest Dependabot-, Code-Scanning- und Secret-Scanning-Warnungen; notifications liest deinen Benachrichtigungs-Feed (ohne ihn je als gelesen zu markieren). Das Token wird verschlüsselt gespeichert und beim Abmelden widerrufen.",
+        "Angeforderte Berechtigungen: repo, read:org, security_events, notifications. security_events liest Dependabot-, Code-Scanning- und Secret-Scanning-Warnungen; notifications liest deinen Benachrichtigungs-Feed (ohne ihn je als gelesen zu markieren). Das Token wird verschlüsselt gespeichert, bei ablaufenden GitHub-Tokens automatisch erneuert und beim Abmelden widerrufen.",
       fact_repos: "Eigene, Collaborator- und Organisations-Repositories",
       fact_ci: "Fehlschlagende Workflows stehen ganz oben",
       fact_private: "Nichts wird zwischen Nutzern geteilt",

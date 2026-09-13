@@ -21,15 +21,7 @@ class RedisSessionRepository:
         return f"{self._prefix}{session_id}"
 
     async def create(self, record: SessionRecord) -> None:
-        payload = json.dumps(
-            {
-                "id": record.id,
-                "user": user_to_dict(record.user),
-                "token_ciphertext": record.token_ciphertext,
-                "created_at": record.created_at.isoformat(),
-                "expires_at": record.expires_at.isoformat(),
-            }
-        )
+        payload = json.dumps(self._to_dict(record))
         ttl = int((record.expires_at - record.created_at).total_seconds())
         await self._redis.set(self._key(record.id), payload, ex=max(ttl, 1))
 
@@ -37,14 +29,7 @@ class RedisSessionRepository:
         raw = await self._redis.get(self._key(session_id))
         if raw is None:
             return None
-        data = json.loads(raw)
-        return SessionRecord(
-            id=data["id"],
-            user=user_from_dict(data["user"]),
-            token_ciphertext=data["token_ciphertext"],
-            created_at=datetime.fromisoformat(data["created_at"]),
-            expires_at=datetime.fromisoformat(data["expires_at"]),
-        )
+        return self._from_dict(json.loads(raw))
 
     async def delete(self, session_id: str) -> None:
         await self._redis.delete(self._key(session_id))
@@ -52,6 +37,65 @@ class RedisSessionRepository:
     async def purge_expired(self, now: datetime) -> int:
         # Redis expires keys itself (see `ex=` in create).
         return 0
+
+    async def update_tokens(
+        self,
+        session_id: str,
+        *,
+        token_ciphertext: str,
+        token_expires_at: datetime | None,
+        refresh_token_ciphertext: str | None,
+        refresh_expires_at: datetime | None,
+    ) -> None:
+        key = self._key(session_id)
+        raw = await self._redis.get(key)
+        if raw is None:
+            return
+        data = json.loads(raw)
+        data["token_ciphertext"] = token_ciphertext
+        data["token_expires_at"] = token_expires_at.isoformat() if token_expires_at else None
+        data["refresh_token_ciphertext"] = refresh_token_ciphertext
+        data["refresh_expires_at"] = refresh_expires_at.isoformat() if refresh_expires_at else None
+        # KEEPTTL: a refresh must not extend or reset the session's own lifetime.
+        await self._redis.set(key, json.dumps(data), keepttl=True)
+
+    @staticmethod
+    def _to_dict(record: SessionRecord) -> dict:
+        return {
+            "id": record.id,
+            "user": user_to_dict(record.user),
+            "token_ciphertext": record.token_ciphertext,
+            "created_at": record.created_at.isoformat(),
+            "expires_at": record.expires_at.isoformat(),
+            "token_expires_at": (
+                record.token_expires_at.isoformat() if record.token_expires_at else None
+            ),
+            "refresh_token_ciphertext": record.refresh_token_ciphertext,
+            "refresh_expires_at": (
+                record.refresh_expires_at.isoformat() if record.refresh_expires_at else None
+            ),
+        }
+
+    @staticmethod
+    def _from_dict(data: dict) -> SessionRecord:
+        return SessionRecord(
+            id=data["id"],
+            user=user_from_dict(data["user"]),
+            token_ciphertext=data["token_ciphertext"],
+            created_at=datetime.fromisoformat(data["created_at"]),
+            expires_at=datetime.fromisoformat(data["expires_at"]),
+            token_expires_at=(
+                datetime.fromisoformat(data["token_expires_at"])
+                if data.get("token_expires_at")
+                else None
+            ),
+            refresh_token_ciphertext=data.get("refresh_token_ciphertext"),
+            refresh_expires_at=(
+                datetime.fromisoformat(data["refresh_expires_at"])
+                if data.get("refresh_expires_at")
+                else None
+            ),
+        )
 
 
 class RedisOverviewCache:
