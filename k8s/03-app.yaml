@@ -65,13 +65,20 @@ spec:
           readinessProbe:
             # /readyz touches the session store, so a broken volume takes the pod out of the
             # Service instead of serving 500s.
+            # timeoutSeconds is set explicitly: the cluster's arm64 nodes are slow and the
+            # weakest one runs close to its memory limit, so the Kubernetes default of 1s turns
+            # an ordinary load spike into a failed probe (and, for liveness, a container kill).
             httpGet: {path: /readyz, port: http}
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           livenessProbe:
             httpGet: {path: /healthz, port: http}
             initialDelaySeconds: 10
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           volumeMounts:
             - name: data
               mountPath: /data
