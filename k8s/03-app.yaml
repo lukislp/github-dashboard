@@ -48,7 +48,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: github-dashboard
-          image: ghcr.io/lukislp/github-dashboard:1.1.4 # set by the deploy-bump job (CI) on every release
+          image: ghcr.io/lukislp/github-dashboard:1.2.0 # set by the deploy-bump job (CI) on every release
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
