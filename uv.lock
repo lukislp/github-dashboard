@@ -225,7 +225,7 @@ wheels = [
 
 [[package]]
 name = "github-dashboard"
-version = "0.0.1.dev14+g87df386c0.d20260913"
+version = "1.0.1.dev1+g99f04185f"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
