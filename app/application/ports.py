@@ -25,14 +25,36 @@ from app.domain.models import (
 
 
 @dataclass(frozen=True, slots=True)
+class TokenSet:
+    """Result of an OAuth code exchange or a token refresh.
+
+    `expires_at`, `refresh_token` and `refresh_expires_at` are `None` when the OAuth App does
+    not have "Expire user access tokens" enabled: GitHub then issues a non-expiring token and
+    no refresh token at all. Both shapes must be handled.
+    """
+
+    access_token: str
+    expires_at: datetime | None = None
+    refresh_token: str | None = None
+    refresh_expires_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SessionRecord:
-    """A signed-in user. The GitHub token is stored encrypted (see TokenCipher)."""
+    """A signed-in user. The GitHub token is stored encrypted (see TokenCipher).
+
+    `token_expires_at`, `refresh_token_ciphertext` and `refresh_expires_at` stay `None` for a
+    non-expiring token (see `TokenSet`).
+    """
 
     id: str
     user: User
     token_ciphertext: str
     created_at: datetime
     expires_at: datetime
+    token_expires_at: datetime | None = None
+    refresh_token_ciphertext: str | None = None
+    refresh_expires_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,14 +95,23 @@ class HygienePage:
 class GitHubOAuth(Protocol):
     def authorize_url(self, state: str) -> str: ...
 
-    async def exchange_code(self, code: str) -> str:
-        """Exchange the OAuth code for an access token."""
+    async def exchange_code(self, code: str) -> TokenSet:
+        """Exchange the OAuth code for a token set."""
         ...
 
     async def fetch_viewer(self, token: str) -> User: ...
 
     async def revoke_token(self, token: str) -> None:
         """Best effort: invalidate the token at GitHub."""
+        ...
+
+    async def refresh_token(self, refresh_token: str) -> TokenSet:
+        """Exchange a refresh token for a new token set (the old refresh token is invalidated
+        by GitHub in the process).
+
+        Raises `AuthenticationError` when GitHub rejects the refresh token (`bad_refresh_token`
+        or a similar error, or a response with no `access_token`), `GitHubUnavailable` on a
+        transport failure or a 5xx response."""
         ...
 
 
@@ -139,6 +170,19 @@ class SessionRepository(Protocol):
     async def delete(self, session_id: str) -> None: ...
 
     async def purge_expired(self, now: datetime) -> int: ...
+
+    async def update_tokens(
+        self,
+        session_id: str,
+        *,
+        token_ciphertext: str,
+        token_expires_at: datetime | None,
+        refresh_token_ciphertext: str | None,
+        refresh_expires_at: datetime | None,
+    ) -> None:
+        """Replace a session's token material after a refresh. A no-op if the session is gone
+        (e.g. raced with a logout)."""
+        ...
 
 
 class OverviewCache(Protocol):

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
-from datetime import UTC, datetime
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
@@ -17,7 +17,7 @@ from app.application.errors import (
     GitHubUnavailable,
     RateLimited,
 )
-from app.application.ports import BranchListing, HygienePage, RepositoryPage
+from app.application.ports import BranchListing, HygienePage, RepositoryPage, TokenSet
 from app.domain.hygiene import HygieneFacts
 from app.domain.models import (
     AttentionItem,
@@ -323,6 +323,7 @@ class GitHubHttpOAuth:
         scopes: str,
         api_url: str,
         web_url: str,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._client = client
         self._client_id = client_id
@@ -331,6 +332,7 @@ class GitHubHttpOAuth:
         self._scopes = scopes
         self._api_url = api_url
         self._web_url = web_url
+        self._clock = clock
 
     def authorize_url(self, state: str) -> str:
         query = urlencode(
@@ -344,28 +346,64 @@ class GitHubHttpOAuth:
         )
         return f"{self._web_url}/login/oauth/authorize?{query}"
 
-    async def exchange_code(self, code: str) -> str:
+    async def exchange_code(self, code: str) -> TokenSet:
+        payload = await self._request_token(
+            {
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "code": code,
+                "redirect_uri": self._callback_url,
+            },
+            context="token exchange",
+        )
+        return self._token_set_from_payload(payload)
+
+    async def refresh_token(self, refresh_token: str) -> TokenSet:
+        payload = await self._request_token(
+            {
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            context="token refresh",
+        )
+        return self._token_set_from_payload(payload)
+
+    async def _request_token(self, data: dict[str, str], *, context: str) -> dict[str, Any]:
         try:
             response = await self._client.post(
                 f"{self._web_url}/login/oauth/access_token",
-                data={
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                    "code": code,
-                    "redirect_uri": self._callback_url,
-                },
+                data=data,
                 headers={"Accept": "application/json"},
             )
         except httpx.HTTPError as exc:
-            raise GitHubUnavailable("token exchange failed") from exc
-        if response.status_code >= 400:
-            raise GitHubUnavailable(f"token exchange: HTTP {response.status_code}")
-        payload = response.json()
+            raise GitHubUnavailable(f"{context} failed") from exc
+        if response.status_code >= 500:
+            raise GitHubUnavailable(f"{context}: HTTP {response.status_code}")
+        return response.json()
+
+    def _token_set_from_payload(self, payload: dict[str, Any]) -> TokenSet:
         token = payload.get("access_token")
         if not token:
-            log.warning("token exchange rejected: %s", payload.get("error", "unknown"))
+            log.warning("token request rejected: %s", payload.get("error", "unknown"))
             raise AuthenticationError(payload.get("error", "no access token"))
-        return token
+        now = self._clock()
+        expires_in = payload.get("expires_in")
+        expires_at = now + timedelta(seconds=int(expires_in)) if expires_in is not None else None
+        refresh_token = payload.get("refresh_token")
+        refresh_expires_in = payload.get("refresh_token_expires_in")
+        refresh_expires_at = (
+            now + timedelta(seconds=int(refresh_expires_in))
+            if refresh_token and refresh_expires_in is not None
+            else None
+        )
+        return TokenSet(
+            access_token=token,
+            expires_at=expires_at,
+            refresh_token=refresh_token,
+            refresh_expires_at=refresh_expires_at,
+        )
 
     async def fetch_viewer(self, token: str) -> User:
         try:

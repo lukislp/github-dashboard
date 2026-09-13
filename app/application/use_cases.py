@@ -27,6 +27,7 @@ from app.application.ports import (
     SessionRecord,
     SessionRepository,
     TokenCipher,
+    TokenSet,
     UserStateRepository,
 )
 from app.domain.hygiene import RepoHygiene, assess_hygiene
@@ -99,18 +100,24 @@ class CompleteLogin:
     clock: Clock = utc_now
 
     async def __call__(self, code: str) -> SessionRecord:
-        token = await self.oauth.exchange_code(code)
-        user = await self.oauth.fetch_viewer(token)
+        token_set = await self.oauth.exchange_code(code)
+        user = await self.oauth.fetch_viewer(token_set.access_token)
         if not self.policy.allows(user.login):
-            await self.oauth.revoke_token(token)
+            await self.oauth.revoke_token(token_set.access_token)
             raise AccessDenied(user.login)
         now = self.clock()
+        refresh_ciphertext = (
+            self.cipher.encrypt(token_set.refresh_token) if token_set.refresh_token else None
+        )
         record = SessionRecord(
             id=secrets.token_urlsafe(32),
             user=user,
-            token_ciphertext=self.cipher.encrypt(token),
+            token_ciphertext=self.cipher.encrypt(token_set.access_token),
             created_at=now,
             expires_at=now + self.session_ttl,
+            token_expires_at=token_set.expires_at,
+            refresh_token_ciphertext=refresh_ciphertext,
+            refresh_expires_at=token_set.refresh_expires_at,
         )
         await self.sessions.create(record)
         log.info("login user=%s", user.login)
@@ -151,6 +158,71 @@ class Logout:
         log.info("logout user=%s", session.user.login)
 
 
+@dataclass(slots=True)
+class EnsureFreshToken:
+    """Returns a usable access token for a session, refreshing it first when needed.
+
+    Only relevant when the OAuth App has "Expire user access tokens" enabled
+    (`session.token_expires_at` is not `None`); otherwise the token never expires and is
+    returned unchanged. A token that is not yet within `leeway` of expiring is also returned
+    unchanged. Otherwise:
+
+    - if a refresh token is on file and it has not itself expired, it is exchanged for a new
+      token set at GitHub, persisted via `SessionRepository.update_tokens`, and the updated
+      session plus the new plaintext access token are returned;
+    - if the refresh itself is rejected by GitHub (`AuthenticationError`), the session is
+      deleted and the error re-raised;
+    - otherwise (no refresh token, or it has expired) the session is deleted and
+      `AuthenticationError` is raised, exactly as an outright revoked token would.
+    """
+
+    oauth: GitHubOAuth
+    sessions: SessionRepository
+    cipher: TokenCipher
+    clock: Clock = utc_now
+    leeway: timedelta = timedelta(minutes=5)
+
+    async def __call__(self, session: SessionRecord) -> tuple[SessionRecord, str]:
+        expires_at = session.token_expires_at
+        if expires_at is None or expires_at - self.clock() > self.leeway:
+            return session, self.cipher.decrypt(session.token_ciphertext)
+
+        refresh_ciphertext = session.refresh_token_ciphertext
+        refresh_expired = (
+            session.refresh_expires_at is not None and session.refresh_expires_at <= self.clock()
+        )
+        if refresh_ciphertext is None or refresh_expired:
+            await self.sessions.delete(session.id)
+            raise AuthenticationError("access token expired, no usable refresh token")
+
+        refresh_token = self.cipher.decrypt(refresh_ciphertext)
+        try:
+            token_set: TokenSet = await self.oauth.refresh_token(refresh_token)
+        except AuthenticationError:
+            await self.sessions.delete(session.id)
+            raise
+
+        new_token_ciphertext = self.cipher.encrypt(token_set.access_token)
+        new_refresh_ciphertext = (
+            self.cipher.encrypt(token_set.refresh_token) if token_set.refresh_token else None
+        )
+        await self.sessions.update_tokens(
+            session.id,
+            token_ciphertext=new_token_ciphertext,
+            token_expires_at=token_set.expires_at,
+            refresh_token_ciphertext=new_refresh_ciphertext,
+            refresh_expires_at=token_set.refresh_expires_at,
+        )
+        updated_session = dataclasses.replace(
+            session,
+            token_ciphertext=new_token_ciphertext,
+            token_expires_at=token_set.expires_at,
+            refresh_token_ciphertext=new_refresh_ciphertext,
+            refresh_expires_at=token_set.refresh_expires_at,
+        )
+        return updated_session, token_set.access_token
+
+
 @dataclass(frozen=True, slots=True)
 class OverviewResult:
     overview: Overview
@@ -161,7 +233,7 @@ class OverviewResult:
 class GetOverview:
     api: GitHubApi
     sessions: SessionRepository
-    cipher: TokenCipher
+    ensure_fresh_token: EnsureFreshToken
     cache: OverviewCache
     cache_ttl_seconds: int
     runs_per_repo: int
@@ -199,7 +271,7 @@ class GetOverview:
             return OverviewResult(overview, from_cache=False)
 
     async def _load(self, session: SessionRecord) -> Overview:
-        token = self.cipher.decrypt(session.token_ciphertext)
+        session, token = await self.ensure_fresh_token(session)
         page = await self.api.list_repositories(token)
         semaphore = asyncio.Semaphore(self.max_concurrency)
 

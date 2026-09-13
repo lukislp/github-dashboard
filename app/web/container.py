@@ -18,6 +18,7 @@ from app.application.ports import (
 from app.application.use_cases import (
     AccessPolicy,
     CompleteLogin,
+    EnsureFreshToken,
     GetChanges,
     GetOverview,
     GetPreferences,
@@ -138,7 +139,7 @@ class Container:
             get_overview=GetOverview(
                 api=api,
                 sessions=sessions,
-                cipher=cipher,
+                ensure_fresh_token=EnsureFreshToken(oauth=oauth, sessions=sessions, cipher=cipher),
                 cache=cache,
                 cache_ttl_seconds=settings.cache_ttl_seconds,
                 runs_per_repo=settings.runs_per_repo,

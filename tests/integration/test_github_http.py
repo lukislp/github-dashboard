@@ -1,10 +1,17 @@
 import json
+from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
 import respx
 
-from app.application.errors import ActionsUnavailable, AuthenticationError, RateLimited
+from app.application.errors import (
+    ActionsUnavailable,
+    AuthenticationError,
+    GitHubUnavailable,
+    RateLimited,
+)
 from app.domain.models import ChecksState, Mergeable, ReviewDecision, RunStatus, SeverityCounts
 from app.infrastructure.github_http import GitHubHttpApi, GitHubHttpOAuth
 
@@ -930,11 +937,14 @@ async def test_oauth_exchange_and_viewer(client):
     )
 
     assert "client_id=cid" in oauth.authorize_url("st") and "state=st" in oauth.authorize_url("st")
-    token = await oauth.exchange_code("code")
-    user = await oauth.fetch_viewer(token)
-    await oauth.revoke_token(token)
+    token_set = await oauth.exchange_code("code")
+    user = await oauth.fetch_viewer(token_set.access_token)
+    await oauth.revoke_token(token_set.access_token)
 
-    assert token == "gho_x"
+    assert token_set.access_token == "gho_x"
+    assert token_set.expires_at is None
+    assert token_set.refresh_token is None
+    assert token_set.refresh_expires_at is None
     assert user.id == 7 and user.login == "octocat"
     assert revoke.called
 
@@ -955,3 +965,112 @@ async def test_oauth_exchange_without_token_fails(client):
     )
     with pytest.raises(AuthenticationError):
         await oauth.exchange_code("nope")
+
+
+@respx.mock
+async def test_oauth_exchange_parses_expiry_and_refresh_fields(client):
+    """When the OAuth App has "Expire user access tokens" enabled, GitHub adds `expires_in`,
+    `refresh_token` and `refresh_token_expires_in` to the exchange response."""
+    respx.post(f"{WEB}/login/oauth/access_token").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "access_token": "gho_x",
+                "token_type": "bearer",
+                "expires_in": 28800,
+                "refresh_token": "ghr_x",
+                "refresh_token_expires_in": 15811200,
+            },
+        )
+    )
+    fixed_now = datetime(2026, 9, 13, 0, 0, tzinfo=UTC)
+    oauth = GitHubHttpOAuth(
+        client,
+        client_id="c",
+        client_secret="s",
+        callback_url="cb",
+        scopes="repo",
+        api_url=API,
+        web_url=WEB,
+        clock=lambda: fixed_now,
+    )
+
+    token_set = await oauth.exchange_code("code")
+
+    assert token_set.access_token == "gho_x"
+    assert token_set.expires_at == fixed_now + timedelta(seconds=28800)
+    assert token_set.refresh_token == "ghr_x"
+    assert token_set.refresh_expires_at == fixed_now + timedelta(seconds=15811200)
+
+
+@respx.mock
+async def test_oauth_refresh_token_success(client):
+    respx.post(f"{WEB}/login/oauth/access_token").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "access_token": "gho_new",
+                "token_type": "bearer",
+                "expires_in": 28800,
+                "refresh_token": "ghr_new",
+                "refresh_token_expires_in": 15811200,
+            },
+        )
+    )
+    fixed_now = datetime(2026, 9, 13, 0, 0, tzinfo=UTC)
+    oauth = GitHubHttpOAuth(
+        client,
+        client_id="c",
+        client_secret="s",
+        callback_url="cb",
+        scopes="repo",
+        api_url=API,
+        web_url=WEB,
+        clock=lambda: fixed_now,
+    )
+
+    token_set = await oauth.refresh_token("ghr_old")
+
+    assert token_set.access_token == "gho_new"
+    assert token_set.expires_at == fixed_now + timedelta(seconds=28800)
+    assert token_set.refresh_token == "ghr_new"
+    assert token_set.refresh_expires_at == fixed_now + timedelta(seconds=15811200)
+    sent = parse_qs(respx.calls.last.request.content.decode())
+    assert sent["grant_type"] == ["refresh_token"]
+    assert sent["refresh_token"] == ["ghr_old"]
+    assert sent["client_id"] == ["c"]
+    assert sent["client_secret"] == ["s"]
+
+
+@respx.mock
+async def test_oauth_refresh_token_bad_refresh_token_raises_authentication_error(client):
+    respx.post(f"{WEB}/login/oauth/access_token").mock(
+        return_value=httpx.Response(200, json={"error": "bad_refresh_token"})
+    )
+    oauth = GitHubHttpOAuth(
+        client,
+        client_id="c",
+        client_secret="s",
+        callback_url="cb",
+        scopes="repo",
+        api_url=API,
+        web_url=WEB,
+    )
+    with pytest.raises(AuthenticationError):
+        await oauth.refresh_token("ghr_bad")
+
+
+@respx.mock
+async def test_oauth_refresh_token_server_error_raises_github_unavailable(client):
+    respx.post(f"{WEB}/login/oauth/access_token").mock(return_value=httpx.Response(502))
+    oauth = GitHubHttpOAuth(
+        client,
+        client_id="c",
+        client_secret="s",
+        callback_url="cb",
+        scopes="repo",
+        api_url=API,
+        web_url=WEB,
+    )
+    with pytest.raises(GitHubUnavailable):
+        await oauth.refresh_token("ghr_bad")

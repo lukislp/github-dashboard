@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime, timedelta
 
 from app.application.errors import ActionsUnavailable, AuthenticationError
-from app.application.ports import BranchListing, HygienePage, RepositoryPage, SessionRecord
+from app.application.ports import (
+    BranchListing,
+    HygienePage,
+    RepositoryPage,
+    SessionRecord,
+    TokenSet,
+)
 from app.domain.hygiene import HYGIENE_KEYS, HygieneCheck, HygieneFacts, RepoHygiene
 from app.domain.models import (
     Branch,
@@ -182,21 +189,42 @@ def make_run(
 
 
 class FakeOAuth:
-    def __init__(self, user: User = VIEWER, token: str = "gho_test") -> None:
+    def __init__(
+        self,
+        user: User = VIEWER,
+        token: str = "gho_test",
+        *,
+        token_expires_at: datetime | None = None,
+        refresh_token: str | None = None,
+        refresh_expires_at: datetime | None = None,
+    ) -> None:
         self.user = user
         self.token = token
+        self.token_expires_at = token_expires_at
+        self.refresh_token_value = refresh_token
+        self.refresh_expires_at = refresh_expires_at
         self.revoked: list[str] = []
         self.exchanged: list[str] = []
         self.reject_code = False
+        # Configures the result of the next `refresh_token` call(s); `reject_refresh` makes it
+        # raise `AuthenticationError`, matching GitHub's `bad_refresh_token` response.
+        self.refreshed: list[str] = []
+        self.reject_refresh = False
+        self.next_refresh: TokenSet | None = None
 
     def authorize_url(self, state: str) -> str:
         return f"https://github.example/login/oauth/authorize?state={state}"
 
-    async def exchange_code(self, code: str) -> str:
+    async def exchange_code(self, code: str) -> TokenSet:
         self.exchanged.append(code)
         if self.reject_code:
             raise AuthenticationError("bad_verification_code")
-        return self.token
+        return TokenSet(
+            access_token=self.token,
+            expires_at=self.token_expires_at,
+            refresh_token=self.refresh_token_value,
+            refresh_expires_at=self.refresh_expires_at,
+        )
 
     async def fetch_viewer(self, token: str) -> User:
         if token != self.token:
@@ -205,6 +233,14 @@ class FakeOAuth:
 
     async def revoke_token(self, token: str) -> None:
         self.revoked.append(token)
+
+    async def refresh_token(self, refresh_token: str) -> TokenSet:
+        self.refreshed.append(refresh_token)
+        if self.reject_refresh:
+            raise AuthenticationError("bad_refresh_token")
+        if self.next_refresh is not None:
+            return self.next_refresh
+        return TokenSet(access_token=f"refreshed:{refresh_token}")
 
 
 class FakeApi:
@@ -329,6 +365,26 @@ class FakeSessions:
         for key in expired:
             del self.records[key]
         return len(expired)
+
+    async def update_tokens(
+        self,
+        session_id: str,
+        *,
+        token_ciphertext: str,
+        token_expires_at: datetime | None,
+        refresh_token_ciphertext: str | None,
+        refresh_expires_at: datetime | None,
+    ) -> None:
+        record = self.records.get(session_id)
+        if record is None:
+            return
+        self.records[session_id] = dataclasses.replace(
+            record,
+            token_ciphertext=token_ciphertext,
+            token_expires_at=token_expires_at,
+            refresh_token_ciphertext=refresh_token_ciphertext,
+            refresh_expires_at=refresh_expires_at,
+        )
 
 
 class FakeCache:
