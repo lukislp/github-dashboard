@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/lukislp/github-dashboard/compare/v1.0.2...v1.1.0) (2026-09-13)
+
+
+### Features
+
+* refresh expiring GitHub access tokens automatically ([#4](https://github.com/lukislp/github-dashboard/issues/4)) ([ea1f387](https://github.com/lukislp/github-dashboard/commit/ea1f387f403183d8a26c3883e3da69d430b0649e))
+
 ## [1.0.2](https://github.com/lukislp/github-dashboard/compare/v1.0.1...v1.0.2) (2026-09-13)
 
 
