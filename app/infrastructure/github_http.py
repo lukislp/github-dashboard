@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode
@@ -15,10 +17,12 @@ from app.application.errors import (
     GitHubUnavailable,
     RateLimited,
 )
-from app.application.ports import RepositoryPage
+from app.application.ports import BranchListing, HygienePage, RepositoryPage
+from app.domain.hygiene import HygieneFacts
 from app.domain.models import (
     AttentionItem,
     AttentionKind,
+    Branch,
     ChecksState,
     Inbox,
     Issue,
@@ -40,13 +44,34 @@ from app.domain.pull_requests import is_bot_login
 log = logging.getLogger(__name__)
 
 _API_VERSION = "2022-11-28"
+# Repository page size: restored to 50 now that hygiene facts (license, vulnerability alerts,
+# delete-branch-on-merge, branch protection/rulesets, the file probes) and branch refs are
+# fetched by a separate, batched `_HYGIENE_QUERY` instead of being embedded here. Combining
+# everything into one query made it slow (7-9s against a real 37-repository account) and
+# fragile (transient 502s and RESOURCE_LIMITS_EXCEEDED partial errors even at a reported
+# `rateLimit.cost` of only ~13); splitting it keeps this query small and fast, and isolates
+# hygiene's cost/latency and failure modes so a hygiene hiccup can never take the whole
+# overview down.
 _PAGE_SIZE = 50
 _PR_DETAIL_ITEMS = 20
 _ISSUE_DETAIL_ITEMS = 10
+_WORKFLOW_FILE_SUFFIXES = (".yml", ".yaml")
+_HYGIENE_BATCH_SIZE = 25
+# Branch refs are only fetched by the hygiene query now, which is batched and runs separately
+# from the repositories query, so the page limit could be raised from 25 to 50 without
+# reintroducing the resource-limit problems the split was meant to fix.
+_REFS_PAGE_SIZE = 50
+_RETRYABLE_HTTP_STATUSES = frozenset({502, 503, 504})
+_RESOURCE_LIMITS_EXCEEDED = "RESOURCE_LIMITS_EXCEEDED"
 
 _REPOSITORIES_QUERY = """
-query Repositories($cursor: String, $pageSize: Int!, $prDetails: Int!, $issueDetails: Int!) {
-  rateLimit { remaining limit resetAt }
+query Repositories(
+  $cursor: String
+  $pageSize: Int!
+  $prDetails: Int!
+  $issueDetails: Int!
+) {
+  rateLimit { remaining limit resetAt cost }
   viewer {
     login
     repositories(
@@ -58,6 +83,7 @@ query Repositories($cursor: String, $pageSize: Int!, $prDetails: Int!, $issueDet
     ) {
       pageInfo { hasNextPage endCursor }
       nodes {
+        id
         nameWithOwner
         name
         owner { login }
@@ -118,6 +144,51 @@ query Repositories($cursor: String, $pageSize: Int!, $prDetails: Int!, $issueDet
           publishedAt
           url
           isPrerelease
+        }
+      }
+    }
+  }
+}
+"""
+
+_HYGIENE_QUERY = """
+query Hygiene($ids: [ID!]!, $refsPageSize: Int!) {
+  rateLimit { remaining limit resetAt cost }
+  nodes(ids: $ids) {
+    ... on Repository {
+      id
+      nameWithOwner
+      isFork
+      licenseInfo { spdxId name }
+      hasVulnerabilityAlertsEnabled
+      deleteBranchOnMerge
+      branchProtectionRules(first: 1) { totalCount }
+      rulesets(first: 1) { totalCount }
+      workflowsDir: object(expression: "HEAD:.github/workflows") {
+        ... on Tree { entries { name } }
+      }
+      dependabotYml: object(expression: "HEAD:.github/dependabot.yml") { id }
+      dependabotYaml: object(expression: "HEAD:.github/dependabot.yaml") { id }
+      renovateJson: object(expression: "HEAD:renovate.json") { id }
+      renovateJsonGithub: object(expression: "HEAD:.github/renovate.json") { id }
+      renovaterc: object(expression: "HEAD:.renovaterc.json") { id }
+      readmeFile: object(expression: "HEAD:README.md") { id }
+      securityMd: object(expression: "HEAD:SECURITY.md") { id }
+      securityMdGithub: object(expression: "HEAD:.github/SECURITY.md") { id }
+      codeownersFile: object(expression: "HEAD:CODEOWNERS") { id }
+      codeownersFileGithub: object(expression: "HEAD:.github/CODEOWNERS") { id }
+      defaultBranchRef { name }
+      refs(refPrefix: "refs/heads/", first: $refsPageSize) {
+        totalCount
+        nodes {
+          name
+          target {
+            ... on Commit {
+              committedDate
+              author { name user { login } }
+            }
+          }
+          associatedPullRequests(first: 1) { totalCount }
         }
       }
     }
@@ -188,6 +259,12 @@ def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+
+
+class _RetryableHygieneError(Exception):
+    """One hygiene batch hit a transient failure (HTTP 502/503/504, or a GraphQL
+    RESOURCE_LIMITS_EXCEEDED partial error) and should be retried, split into two halves,
+    before its repositories are treated as unavailable for this refresh."""
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -345,6 +422,8 @@ class GitHubHttpApi:
             rl = data.get("rateLimit")
             if rl:
                 rate_limit = RateLimit(rl["remaining"], rl["limit"], _parse_dt(rl.get("resetAt")))
+                if "cost" in rl:
+                    log.debug("repositories query cost=%s", rl["cost"])
             connection = data["viewer"]["repositories"]
             for node in connection["nodes"]:
                 if not node:
@@ -358,6 +437,90 @@ class GitHubHttpApi:
                 break
             cursor = page["endCursor"]
         return RepositoryPage(tuple(repositories), rate_limit, dependabot_by_repo, release_by_repo)
+
+    async def fetch_hygiene(self, token: str, repo_ids: Sequence[str]) -> HygienePage:
+        """Hygiene facts and branch listings for `repo_ids`, in batches of 25.
+
+        Each batch is retried once (after a short wait, split into two halves) on a
+        transient failure; a half that still fails is simply absent from the result, which
+        the use case treats as "hygiene not applicable / no branch data" for this refresh
+        rather than failing the whole overview.
+        """
+        ids = list(repo_ids)
+        batches = [
+            ids[i : i + _HYGIENE_BATCH_SIZE] for i in range(0, len(ids), _HYGIENE_BATCH_SIZE)
+        ]
+        results = await asyncio.gather(*(self._fetch_hygiene_batch(token, b) for b in batches))
+        hygiene_by_repo: dict[str, HygieneFacts] = {}
+        branches_by_repo: dict[str, BranchListing] = {}
+        for batch_hygiene, batch_branches in results:
+            hygiene_by_repo.update(batch_hygiene)
+            branches_by_repo.update(batch_branches)
+        return HygienePage(hygiene_by_repo, branches_by_repo)
+
+    async def _fetch_hygiene_batch(
+        self, token: str, ids: list[str]
+    ) -> tuple[dict[str, HygieneFacts], dict[str, BranchListing]]:
+        if not ids:
+            return {}, {}
+        try:
+            nodes = await self._hygiene_nodes_once(token, ids)
+        except _RetryableHygieneError:
+            await asyncio.sleep(1)
+            return await self._fetch_hygiene_split(token, ids)
+        return _hygiene_from_nodes(nodes)
+
+    async def _fetch_hygiene_split(
+        self, token: str, ids: list[str]
+    ) -> tuple[dict[str, HygieneFacts], dict[str, BranchListing]]:
+        """Retry a failed batch split into two halves, once each. A half that fails again is
+        dropped: its repositories are simply absent from the result."""
+        mid = max(1, len(ids) // 2)
+        halves = [ids[:mid], ids[mid:]] if len(ids) > 1 else [ids]
+        hygiene_by_repo: dict[str, HygieneFacts] = {}
+        branches_by_repo: dict[str, BranchListing] = {}
+        for half in halves:
+            if not half:
+                continue
+            try:
+                nodes = await self._hygiene_nodes_once(token, half)
+            except _RetryableHygieneError:
+                log.warning("hygiene batch degraded for %d repositories after retry", len(half))
+                continue
+            h, b = _hygiene_from_nodes(nodes)
+            hygiene_by_repo.update(h)
+            branches_by_repo.update(b)
+        return hygiene_by_repo, branches_by_repo
+
+    async def _hygiene_nodes_once(self, token: str, ids: list[str]) -> list[dict[str, Any]]:
+        try:
+            response = await self._client.post(
+                f"{self._api_url}/graphql",
+                json={
+                    "query": _HYGIENE_QUERY,
+                    "variables": {"ids": ids, "refsPageSize": _REFS_PAGE_SIZE},
+                },
+                headers=_headers(token),
+            )
+        except httpx.HTTPError as exc:
+            raise GitHubUnavailable("hygiene graphql request failed") from exc
+        if response.status_code in _RETRYABLE_HTTP_STATUSES:
+            raise _RetryableHygieneError(f"HTTP {response.status_code}")
+        _raise_for_status(response, context="hygiene graphql")
+        payload = response.json()
+        errors = payload.get("errors")
+        if errors:
+            types = {e.get("type") for e in errors}
+            if "RATE_LIMITED" in types:
+                raise RateLimited("hygiene graphql")
+            if _RESOURCE_LIMITS_EXCEEDED in types:
+                raise _RetryableHygieneError(_RESOURCE_LIMITS_EXCEEDED)
+            messages = "; ".join(e.get("message", "?") for e in errors)
+            if payload.get("data") is None:
+                raise GitHubUnavailable(f"hygiene graphql: {messages}")
+            log.warning("hygiene graphql partial errors: %s", messages)
+        data = payload.get("data") or {}
+        return [n for n in (data.get("nodes") or []) if n]
 
     async def fetch_security(
         self, token: str, owner: str, name: str
@@ -594,6 +757,94 @@ def _last_commit_from_node(target: dict[str, Any] | None) -> LastCommit | None:
     )
 
 
+def _branch_from_ref_node(node: dict[str, Any]) -> Branch:
+    target = node.get("target") or {}
+    author = target.get("author") or {}
+    user = author.get("user") or {}
+    return Branch(
+        name=node["name"],
+        last_commit_at=_parse_dt(target.get("committedDate")),
+        author=user.get("login") or author.get("name"),
+    )
+
+
+def _branches_without_pr_from_node(
+    node: dict[str, Any], *, default_branch: str | None
+) -> tuple[Branch, ...]:
+    """Branches (other than the default one) with no pull request, oldest commit first."""
+    refs = node.get("refs") or {}
+    branches = [
+        _branch_from_ref_node(ref_node)
+        for ref_node in refs.get("nodes") or []
+        if ref_node
+        and ref_node["name"] != default_branch
+        and int((ref_node.get("associatedPullRequests") or {}).get("totalCount") or 0) == 0
+    ]
+    branches.sort(key=lambda b: (b.last_commit_at is None, b.last_commit_at))
+    return tuple(branches)
+
+
+def _hygiene_facts_from_node(node: dict[str, Any]) -> HygieneFacts:
+    """Plain booleans/counts for `assess_hygiene`, read off one hygiene-query node.
+
+    Archived repositories are never included in the hygiene query (the use case filters them
+    out of the id list before batching), so `is_archived` is always False here.
+    """
+    workflow_entries = (node.get("workflowsDir") or {}).get("entries") or []
+    workflow_file_count = sum(
+        1 for e in workflow_entries if (e.get("name") or "").endswith(_WORKFLOW_FILE_SUFFIXES)
+    )
+    branch_protection_rules = node.get("branchProtectionRules") or {}
+    # `rulesets` can come back nulled out by a partial GraphQL error for tokens/plans that
+    # don't expose it; treat that the same as "no rulesets configured".
+    rulesets = node.get("rulesets") or {}
+    return HygieneFacts(
+        has_readme=node.get("readmeFile") is not None,
+        has_license=node.get("licenseInfo") is not None,
+        workflow_file_count=workflow_file_count,
+        has_dependabot_config=(
+            node.get("dependabotYml") is not None or node.get("dependabotYaml") is not None
+        ),
+        has_renovate_config=(
+            node.get("renovateJson") is not None
+            or node.get("renovateJsonGithub") is not None
+            or node.get("renovaterc") is not None
+        ),
+        branch_protection_rule_count=int(branch_protection_rules.get("totalCount") or 0),
+        ruleset_count=int(rulesets.get("totalCount") or 0),
+        vulnerability_alerts_enabled=bool(node.get("hasVulnerabilityAlertsEnabled", False)),
+        delete_branch_on_merge=bool(node.get("deleteBranchOnMerge", False)),
+        has_security_policy=(
+            node.get("securityMd") is not None or node.get("securityMdGithub") is not None
+        ),
+        has_codeowners=(
+            node.get("codeownersFile") is not None or node.get("codeownersFileGithub") is not None
+        ),
+        is_fork=bool(node.get("isFork", False)),
+    )
+
+
+def _hygiene_from_nodes(
+    nodes: list[dict[str, Any]],
+) -> tuple[dict[str, HygieneFacts], dict[str, BranchListing]]:
+    """Map one hygiene-query response's repository nodes to facts and branch listings,
+    both keyed by `nameWithOwner`."""
+    hygiene_by_repo: dict[str, HygieneFacts] = {}
+    branches_by_repo: dict[str, BranchListing] = {}
+    for node in nodes:
+        full_name = node.get("nameWithOwner")
+        if not full_name:
+            continue
+        hygiene_by_repo[full_name] = _hygiene_facts_from_node(node)
+        default_branch = (node.get("defaultBranchRef") or {}).get("name")
+        refs = node.get("refs") or {}
+        branches_by_repo[full_name] = BranchListing(
+            branch_count=int(refs.get("totalCount") or 0),
+            branches=_branches_without_pr_from_node(node, default_branch=default_branch),
+        )
+    return hygiene_by_repo, branches_by_repo
+
+
 def _repository_from_node(node: dict[str, Any]) -> Repository:
     language = node.get("primaryLanguage") or {}
     default_branch = node.get("defaultBranchRef") or {}
@@ -601,6 +852,7 @@ def _repository_from_node(node: dict[str, Any]) -> Repository:
     issues = node["issues"]
     return Repository(
         full_name=node["nameWithOwner"],
+        node_id=node["id"],
         name=node["name"],
         owner=node["owner"]["login"],
         url=node["url"],

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+from app.domain.hygiene import RepoHygiene
+
 
 class RunStatus(StrEnum):
     """Normalised outcome of a workflow run (GitHub status + conclusion folded into one)."""
@@ -121,8 +123,19 @@ class LastCommit:
 
 
 @dataclass(frozen=True, slots=True)
+class Branch:
+    """A branch (other than the default one) with no pull request pointing at it."""
+
+    name: str
+    last_commit_at: datetime | None
+    author: str | None
+    stale: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class Repository:
     full_name: str
+    node_id: str
     name: str
     owner: str
     url: str
@@ -141,6 +154,8 @@ class Repository:
     pull_requests: tuple[PullRequest, ...]
     issues: tuple[Issue, ...]
     last_commit: LastCommit | None
+    branch_count: int = 0
+    branches_without_pr: tuple[Branch, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +268,7 @@ class RepoOverview:
     ci: RepoCi
     security: RepoSecurity
     release: ReleaseInfo | None
+    hygiene: RepoHygiene
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +341,13 @@ class Totals:
     unreleased_commits: int
     notifications_unread: int
     notifications_by_reason: dict[str, int]
+    hygiene_average: int
+    repos_without_ci: int
+    repos_without_protection: int
+    repos_without_dependency_updates: int
+    repos_without_license: int
+    branches_without_pr: int
+    stale_branches: int
 
 
 @dataclass(frozen=True, slots=True)

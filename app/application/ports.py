@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
+from app.domain.hygiene import HygieneFacts
 from app.domain.models import (
+    Branch,
     Inbox,
     Notification,
     Overview,
@@ -47,6 +49,27 @@ class RepositoryPage:
     release_by_repo: Mapping[str, ReleaseInfo | None] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class BranchListing:
+    """A repository's branch count and its branches without a pull request."""
+
+    branch_count: int
+    branches: tuple[Branch, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HygienePage:
+    """Result of one `fetch_hygiene` call, keyed by repository full name (`nameWithOwner`).
+
+    A repository missing from either mapping means its hygiene batch (or the half of it it
+    fell into after a retry) could not be fetched this refresh; the caller treats that as
+    "hygiene not applicable / no branch data" rather than failing the whole overview.
+    """
+
+    hygiene_by_repo: Mapping[str, HygieneFacts] = field(default_factory=dict)
+    branches_by_repo: Mapping[str, BranchListing] = field(default_factory=dict)
+
+
 class GitHubOAuth(Protocol):
     def authorize_url(self, state: str) -> str: ...
 
@@ -64,6 +87,15 @@ class GitHubOAuth(Protocol):
 class GitHubApi(Protocol):
     async def list_repositories(self, token: str) -> RepositoryPage:
         """All repositories the token can see, with open PR/issue counts."""
+        ...
+
+    async def fetch_hygiene(self, token: str, repo_ids: Sequence[str]) -> HygienePage:
+        """Hygiene facts and branch listings for the given repository ids.
+
+        Fetched in batches (25 ids per GraphQL request) from a separate query so a slow or
+        failing lookup here can never take down the rest of the overview. A repository whose
+        batch could not be recovered (even after the retry-and-split policy) is simply absent
+        from the result."""
         ...
 
     async def list_recent_runs(

@@ -9,9 +9,11 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
+from app.domain.hygiene import HygieneCheck, RepoHygiene
 from app.domain.models import (
     AttentionItem,
     AttentionKind,
+    Branch,
     ChangedItem,
     Changes,
     ChecksState,
@@ -187,9 +189,28 @@ def last_commit_from_dict(d: dict[str, Any] | None) -> LastCommit | None:
     )
 
 
+def branch_to_dict(branch: Branch) -> dict[str, Any]:
+    return {
+        "name": branch.name,
+        "last_commit_at": _dt(branch.last_commit_at),
+        "author": branch.author,
+        "stale": branch.stale,
+    }
+
+
+def branch_from_dict(d: dict[str, Any]) -> Branch:
+    return Branch(
+        name=d["name"],
+        last_commit_at=_parse_dt(d.get("last_commit_at")),
+        author=d.get("author"),
+        stale=d.get("stale", False),
+    )
+
+
 def repository_to_dict(repo: Repository) -> dict[str, Any]:
     return {
         "full_name": repo.full_name,
+        "node_id": repo.node_id,
         "name": repo.name,
         "owner": repo.owner,
         "url": repo.url,
@@ -208,12 +229,15 @@ def repository_to_dict(repo: Repository) -> dict[str, Any]:
         "pull_requests": [pr_to_dict(p) for p in repo.pull_requests],
         "issues": [issue_to_dict(i) for i in repo.issues],
         "last_commit": last_commit_to_dict(repo.last_commit),
+        "branch_count": repo.branch_count,
+        "branches_without_pr": [branch_to_dict(b) for b in repo.branches_without_pr],
     }
 
 
 def repository_from_dict(d: dict[str, Any]) -> Repository:
     return Repository(
         full_name=d["full_name"],
+        node_id=d.get("node_id", ""),
         name=d["name"],
         owner=d["owner"],
         url=d["url"],
@@ -232,6 +256,8 @@ def repository_from_dict(d: dict[str, Any]) -> Repository:
         pull_requests=tuple(pr_from_dict(p) for p in d.get("pull_requests", [])),
         issues=tuple(issue_from_dict(i) for i in d.get("issues", [])),
         last_commit=last_commit_from_dict(d.get("last_commit")),
+        branch_count=d.get("branch_count", 0),
+        branches_without_pr=tuple(branch_from_dict(b) for b in d.get("branches_without_pr", [])),
     )
 
 
@@ -296,6 +322,33 @@ def repo_security_from_dict(d: dict[str, Any] | None) -> RepoSecurity:
         dependabot_total=d.get("dependabot_total"),
         code_scanning=severity_counts_from_dict(d.get("code_scanning")),
         secret_scanning=d.get("secret_scanning"),
+    )
+
+
+def hygiene_check_to_dict(check: HygieneCheck) -> dict[str, Any]:
+    return {"key": check.key, "ok": check.ok, "detail": check.detail}
+
+
+def hygiene_check_from_dict(d: dict[str, Any]) -> HygieneCheck:
+    return HygieneCheck(key=d["key"], ok=d["ok"], detail=d.get("detail"))
+
+
+def repo_hygiene_to_dict(hygiene: RepoHygiene) -> dict[str, Any]:
+    return {
+        "score": hygiene.score,
+        "applicable": hygiene.applicable,
+        "passed": hygiene.passed,
+        "total": hygiene.total,
+        "checks": [hygiene_check_to_dict(c) for c in hygiene.checks],
+    }
+
+
+def repo_hygiene_from_dict(d: dict[str, Any] | None) -> RepoHygiene:
+    if d is None:
+        return RepoHygiene((), applicable=False)
+    return RepoHygiene(
+        checks=tuple(hygiene_check_from_dict(c) for c in d.get("checks", [])),
+        applicable=d.get("applicable", False),
     )
 
 
@@ -411,6 +464,7 @@ def overview_to_dict(overview: Overview) -> dict[str, Any]:
                 "ci": ci_to_dict(r.ci),
                 "security": repo_security_to_dict(r.security),
                 "release": release_info_to_dict(r.release),
+                "hygiene": repo_hygiene_to_dict(r.hygiene),
             }
             for r in overview.repos
         ],
@@ -445,6 +499,7 @@ def overview_from_dict(d: dict[str, Any]) -> Overview:
                 ci_from_dict(r["ci"]),
                 repo_security_from_dict(r.get("security")),
                 release_info_from_dict(r.get("release")),
+                repo_hygiene_from_dict(r.get("hygiene")),
             )
             for r in d["repos"]
         ),

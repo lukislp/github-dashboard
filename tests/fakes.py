@@ -5,8 +5,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from app.application.errors import ActionsUnavailable, AuthenticationError
-from app.application.ports import RepositoryPage, SessionRecord
+from app.application.ports import BranchListing, HygienePage, RepositoryPage, SessionRecord
+from app.domain.hygiene import HYGIENE_KEYS, HygieneCheck, HygieneFacts, RepoHygiene
 from app.domain.models import (
+    Branch,
     ChecksState,
     Inbox,
     Issue,
@@ -63,10 +65,47 @@ def make_pr(
     )
 
 
+def make_branch(
+    name: str,
+    *,
+    last_commit_at: datetime | None = NOW,
+    author: str | None = "someone",
+) -> Branch:
+    return Branch(name=name, last_commit_at=last_commit_at, author=author)
+
+
+def make_hygiene(*, failing: tuple[str, ...] = (), applicable: bool = True) -> RepoHygiene:
+    """A RepoHygiene with all nine checks passing, except the given failing keys."""
+    checks = tuple(HygieneCheck(key, key not in failing) for key in HYGIENE_KEYS)
+    return RepoHygiene(checks, applicable=applicable)
+
+
+def make_hygiene_facts(*, failing: tuple[str, ...] = ()) -> HygieneFacts:
+    """A HygieneFacts where all nine checks pass, except the given failing keys.
+
+    `assess_hygiene(make_hygiene_facts(failing=(...)))` is the raw-facts equivalent of
+    `make_hygiene(failing=(...))`, for tests that exercise the real `fetch_hygiene` path.
+    """
+    return HygieneFacts(
+        has_readme="readme" not in failing,
+        has_license="license" not in failing,
+        workflow_file_count=0 if "ci_workflow" in failing else 1,
+        has_dependabot_config="dependency_updates" not in failing,
+        has_renovate_config=False,
+        branch_protection_rule_count=0 if "branch_protection" in failing else 1,
+        ruleset_count=0,
+        vulnerability_alerts_enabled="vulnerability_alerts" not in failing,
+        delete_branch_on_merge="delete_branch_on_merge" not in failing,
+        has_security_policy="security_policy" not in failing,
+        has_codeowners="codeowners" not in failing,
+    )
+
+
 def make_repo(
     name: str,
     *,
     owner: str = "octocat",
+    node_id: str | None = None,
     prs: int = 0,
     issues: int = 0,
     archived: bool = False,
@@ -78,9 +117,12 @@ def make_repo(
     pr_updated_at: datetime = NOW,
     issue_updated_at: datetime = NOW,
     last_commit: LastCommit | None = None,
+    branches: tuple[Branch, ...] = (),
+    branch_count: int | None = None,
 ) -> Repository:
     return Repository(
         full_name=f"{owner}/{name}",
+        node_id=node_id or f"node_{owner}_{name}",
         name=name,
         owner=owner,
         url=f"https://github.com/{owner}/{name}",
@@ -110,6 +152,8 @@ def make_repo(
             for i in range(1, issues + 1)
         ),
         last_commit=last_commit,
+        branch_count=branch_count if branch_count is not None else len(branches) + 1,
+        branches_without_pr=branches,
     )
 
 
@@ -172,6 +216,8 @@ class FakeApi:
         inbox: Inbox | None = None,
         dependabot_by_repo: dict[str, tuple[SeverityCounts | None, int | None]] | None = None,
         release_by_repo: dict[str, ReleaseInfo | None] | None = None,
+        hygiene_by_repo: dict[str, HygieneFacts] | None = None,
+        branches_by_repo: dict[str, BranchListing] | None = None,
         security: dict[str, tuple[SeverityCounts | None, int | None]] | None = None,
         commits_since: dict[str, int | None] | None = None,
         notifications: list[Notification] | None = None,
@@ -182,6 +228,8 @@ class FakeApi:
         self.inbox = inbox if inbox is not None else Inbox((), (), (), ())
         self.dependabot_by_repo = dependabot_by_repo or {}
         self.release_by_repo = release_by_repo or {}
+        self.hygiene_by_repo = hygiene_by_repo or {}
+        self.branches_by_repo = branches_by_repo or {}
         self.security = security or {}
         self.commits_since = commits_since or {}
         # None means the `notifications` scope is missing, matching the real port method.
@@ -193,11 +241,14 @@ class FakeApi:
         self.security_calls: list[str] = []
         self.commits_since_calls: list[str] = []
         self.notifications_calls = 0
+        # Each entry is the tuple of repository node ids requested by one `fetch_hygiene` call.
+        self.hygiene_calls: list[tuple[str, ...]] = []
         self.token_valid = True
         self.inbox_error: Exception | None = None
         self.security_error: Exception | None = None
         self.commits_since_error: Exception | None = None
         self.notifications_error: Exception | None = None
+        self.hygiene_error: Exception | None = None
 
     async def list_repositories(self, token: str) -> RepositoryPage:
         self.calls += 1
@@ -209,6 +260,16 @@ class FakeApi:
             dict(self.dependabot_by_repo),
             dict(self.release_by_repo),
         )
+
+    async def fetch_hygiene(self, token: str, repo_ids: list[str]) -> HygienePage:
+        self.hygiene_calls.append(tuple(repo_ids))
+        if self.hygiene_error is not None:
+            raise self.hygiene_error
+        id_to_name = {r.node_id: r.full_name for r in self.repos}
+        requested_names = {id_to_name[i] for i in repo_ids if i in id_to_name}
+        hygiene = {n: f for n, f in self.hygiene_by_repo.items() if n in requested_names}
+        branches = {n: b for n, b in self.branches_by_repo.items() if n in requested_names}
+        return HygienePage(hygiene, branches)
 
     async def list_recent_runs(
         self, token: str, owner: str, name: str, limit: int

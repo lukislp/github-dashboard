@@ -54,6 +54,7 @@ def repo_node(
     if last_commit is not None:
         default_branch_ref["target"] = last_commit
     return {
+        "id": f"gid_{name}",
         "nameWithOwner": f"octocat/{name}",
         "name": name,
         "owner": {"login": "octocat"},
@@ -99,6 +100,51 @@ def graphql_page(nodes: list[dict], *, has_next: bool, cursor: str | None) -> di
             },
         }
     }
+
+
+def hygiene_node(
+    name: str,
+    *,
+    node_id: str = "id1",
+    is_fork: bool = False,
+    default_branch: str = "main",
+    refs: dict | None = None,
+) -> dict:
+    return {
+        "id": node_id,
+        "nameWithOwner": f"octocat/{name}",
+        "isFork": is_fork,
+        "licenseInfo": {"spdxId": "MIT", "name": "MIT License"},
+        "hasVulnerabilityAlertsEnabled": True,
+        "deleteBranchOnMerge": True,
+        "branchProtectionRules": {"totalCount": 1},
+        "rulesets": {"totalCount": 0},
+        "workflowsDir": {"entries": [{"name": "ci.yml"}]},
+        "dependabotYml": {"id": "1"},
+        "dependabotYaml": None,
+        "renovateJson": None,
+        "renovateJsonGithub": None,
+        "renovaterc": None,
+        "readmeFile": {"id": "1"},
+        "securityMd": {"id": "1"},
+        "securityMdGithub": None,
+        "codeownersFile": {"id": "1"},
+        "codeownersFileGithub": None,
+        "defaultBranchRef": {"name": default_branch},
+        "refs": refs if refs is not None else {"totalCount": 0, "nodes": []},
+    }
+
+
+def hygiene_response(nodes: list[dict], *, errors: list[dict] | None = None) -> dict:
+    payload: dict = {
+        "data": {
+            "rateLimit": {"remaining": 4900, "limit": 5000, "resetAt": "2026-09-12T13:00:00Z"},
+            "nodes": nodes,
+        }
+    }
+    if errors is not None:
+        payload["errors"] = errors
+    return payload
 
 
 @pytest.fixture
@@ -287,6 +333,280 @@ async def test_latest_release_is_none_when_repository_has_no_release(client):
     page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
 
     assert page.release_by_repo["octocat/a"] is None
+
+
+@respx.mock
+async def test_list_repositories_no_longer_fetches_hygiene_or_branch_data(client):
+    """Hygiene facts and branch data now come from `fetch_hygiene`, a separate query; the
+    repositories query only carries the repository's id and the fields it always had."""
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(
+            200, json=graphql_page([repo_node("a")], has_next=False, cursor=None)
+        )
+    )
+    page = await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    repo = page.repositories[0]
+    assert repo.node_id
+    assert repo.branch_count == 0
+    assert repo.branches_without_pr == ()
+    assert not hasattr(page, "hygiene_by_repo")
+
+
+@respx.mock
+async def test_fetch_hygiene_maps_facts_and_branch_listing(client):
+    node = hygiene_node(
+        "a",
+        refs={
+            "totalCount": 3,
+            "nodes": [
+                {
+                    "name": "main",
+                    "target": {"committedDate": "2026-09-01T10:00:00Z", "author": {}},
+                    "associatedPullRequests": {"totalCount": 0},
+                },
+                {
+                    "name": "has-pr",
+                    "target": {"committedDate": "2026-09-01T10:00:00Z", "author": {}},
+                    "associatedPullRequests": {"totalCount": 1},
+                },
+                {
+                    "name": "orphan",
+                    "target": {
+                        "committedDate": "2026-08-01T10:00:00Z",
+                        "author": {"name": "Ada", "user": {"login": "ada"}},
+                    },
+                    "associatedPullRequests": {"totalCount": 0},
+                },
+            ],
+        },
+    )
+    route = respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=hygiene_response([node]))
+    )
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1"])
+
+    body = json.loads(route.calls[0].request.content)
+    assert body["variables"]["ids"] == ["id1"]
+
+    hygiene = page.hygiene_by_repo["octocat/a"]
+    assert hygiene.has_readme is True
+    assert hygiene.has_license is True
+    assert hygiene.is_fork is False
+    assert hygiene.branch_protection_rule_count == 1
+
+    listing = page.branches_by_repo["octocat/a"]
+    assert listing.branch_count == 3
+    assert [b.name for b in listing.branches] == ["orphan"]
+    assert listing.branches[0].author == "ada"
+
+
+@respx.mock
+async def test_fetch_hygiene_facts_default_to_failing_when_files_are_missing(client):
+    node = hygiene_node("a")
+    node["licenseInfo"] = None
+    node["hasVulnerabilityAlertsEnabled"] = False
+    node["deleteBranchOnMerge"] = False
+    node["branchProtectionRules"] = {"totalCount": 0}
+    node["rulesets"] = {"totalCount": 0}
+    node["workflowsDir"] = None
+    node["dependabotYml"] = None
+    node["dependabotYaml"] = None
+    node["readmeFile"] = None
+    node["securityMd"] = None
+    node["securityMdGithub"] = None
+    node["codeownersFile"] = None
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=hygiene_response([node]))
+    )
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1"])
+
+    hygiene = page.hygiene_by_repo["octocat/a"]
+    assert hygiene.has_readme is False
+    assert hygiene.has_license is False
+    assert hygiene.vulnerability_alerts_enabled is False
+    assert hygiene.delete_branch_on_merge is False
+    assert hygiene.branch_protection_rule_count == 0
+    assert hygiene.has_security_policy is False
+    assert hygiene.has_codeowners is False
+
+
+@respx.mock
+async def test_fetch_hygiene_ruleset_partial_error_is_treated_as_zero(client):
+    node = hygiene_node("a")
+    node["branchProtectionRules"] = {"totalCount": 0}
+    node["rulesets"] = None  # nulled out by a partial GraphQL error for this token/plan
+    payload = hygiene_response(
+        [node],
+        errors=[
+            {
+                "type": "FORBIDDEN",
+                "message": "Resource not accessible",
+                "path": ["nodes", 0, "rulesets"],
+            }
+        ],
+    )
+    respx.post(f"{API}/graphql").mock(return_value=httpx.Response(200, json=payload))
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1"])
+
+    hygiene = page.hygiene_by_repo["octocat/a"]
+    assert hygiene.branch_protection_rule_count == 0
+    assert hygiene.ruleset_count == 0
+
+
+@respx.mock
+async def test_fetch_hygiene_workflow_file_count_ignores_non_yaml_entries(client):
+    node = hygiene_node("a")
+    node["workflowsDir"] = {
+        "entries": [{"name": "ci.yml"}, {"name": "release.yaml"}, {"name": "README.md"}]
+    }
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=hygiene_response([node]))
+    )
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1"])
+
+    assert page.hygiene_by_repo["octocat/a"].workflow_file_count == 2
+
+
+@respx.mock
+async def test_fetch_hygiene_maps_is_fork(client):
+    node = hygiene_node("a", is_fork=True)
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=hygiene_response([node]))
+    )
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1"])
+
+    assert page.hygiene_by_repo["octocat/a"].is_fork is True
+
+
+@respx.mock
+async def test_fetch_hygiene_branches_sorted_oldest_commit_first(client):
+    def ref(name: str, date: str) -> dict:
+        return {
+            "name": name,
+            "target": {"committedDate": date, "author": {"name": "x", "user": None}},
+            "associatedPullRequests": {"totalCount": 0},
+        }
+
+    node = hygiene_node(
+        "a",
+        refs={
+            "totalCount": 3,
+            "nodes": [
+                ref("newer", "2026-09-05T10:00:00Z"),
+                ref("oldest", "2026-08-01T10:00:00Z"),
+                ref("middle", "2026-08-20T10:00:00Z"),
+            ],
+        },
+    )
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=hygiene_response([node]))
+    )
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1"])
+
+    names = [b.name for b in page.branches_by_repo["octocat/a"].branches]
+    assert names == ["oldest", "middle", "newer"]
+
+
+@respx.mock
+async def test_fetch_hygiene_defaults_to_empty_branches_when_refs_missing(client):
+    node = hygiene_node("a")
+    del node["refs"]
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=hygiene_response([node]))
+    )
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1"])
+
+    listing = page.branches_by_repo["octocat/a"]
+    assert listing.branch_count == 0
+    assert listing.branches == ()
+
+
+@respx.mock
+async def test_fetch_hygiene_batches_ids_into_groups_of_25(client):
+    route = respx.post(f"{API}/graphql").mock(
+        side_effect=[
+            httpx.Response(200, json=hygiene_response([])),
+            httpx.Response(200, json=hygiene_response([])),
+        ]
+    )
+    ids = [f"id{i}" for i in range(26)]
+
+    await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ids)
+
+    assert route.call_count == 2
+    sizes = sorted(len(json.loads(c.request.content)["variables"]["ids"]) for c in route.calls)
+    assert sizes == [1, 25]
+
+
+@respx.mock
+async def test_fetch_hygiene_retries_split_on_502_and_recovers(client):
+    route = respx.post(f"{API}/graphql").mock(
+        side_effect=[
+            httpx.Response(502),
+            httpx.Response(200, json=hygiene_response([hygiene_node("a", node_id="id1")])),
+            httpx.Response(200, json=hygiene_response([hygiene_node("b", node_id="id2")])),
+        ]
+    )
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1", "id2"])
+
+    assert route.call_count == 3
+    assert set(page.hygiene_by_repo) == {"octocat/a", "octocat/b"}
+
+
+@respx.mock
+async def test_fetch_hygiene_retries_split_on_resource_limits_exceeded(client):
+    route = respx.post(f"{API}/graphql").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "data": None,
+                    "errors": [{"type": "RESOURCE_LIMITS_EXCEEDED", "message": "too costly"}],
+                },
+            ),
+            httpx.Response(200, json=hygiene_response([hygiene_node("a", node_id="id1")])),
+            httpx.Response(200, json=hygiene_response([hygiene_node("b", node_id="id2")])),
+        ]
+    )
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1", "id2"])
+
+    assert route.call_count == 3
+    assert set(page.hygiene_by_repo) == {"octocat/a", "octocat/b"}
+
+
+@respx.mock
+async def test_fetch_hygiene_degrades_half_that_still_fails_after_retry(client):
+    respx.post(f"{API}/graphql").mock(
+        side_effect=[
+            httpx.Response(503),
+            httpx.Response(200, json=hygiene_response([hygiene_node("a", node_id="id1")])),
+            httpx.Response(503),
+        ]
+    )
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1", "id2"])
+
+    assert set(page.hygiene_by_repo) == {"octocat/a"}
+    assert "octocat/b" not in page.hygiene_by_repo
+    assert "octocat/b" not in page.branches_by_repo
+
+
+@respx.mock
+async def test_fetch_hygiene_raises_rate_limited(client):
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(
+            200, json={"data": None, "errors": [{"type": "RATE_LIMITED", "message": "x"}]}
+        )
+    )
+    with pytest.raises(RateLimited):
+        await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1"])
+
+
+@respx.mock
+async def test_fetch_hygiene_raises_authentication_error(client):
+    respx.post(f"{API}/graphql").mock(return_value=httpx.Response(401))
+    with pytest.raises(AuthenticationError):
+        await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1"])
 
 
 @respx.mock

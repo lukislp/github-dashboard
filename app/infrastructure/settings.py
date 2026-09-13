@@ -30,6 +30,7 @@ class Settings:
     github_web_url: str
     log_level: str
     security_alerts: bool
+    hygiene_checks: bool
 
     @property
     def callback_url(self) -> str:
@@ -110,4 +111,5 @@ class Settings:
             ),
             log_level=env.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             security_alerts=boolean("SECURITY_ALERTS", True),
+            hygiene_checks=boolean("HYGIENE_CHECKS", True),
         )

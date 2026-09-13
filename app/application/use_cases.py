@@ -19,14 +19,17 @@ from app.application.errors import (
     RateLimited,
 )
 from app.application.ports import (
+    BranchListing,
     GitHubApi,
     GitHubOAuth,
+    HygienePage,
     OverviewCache,
     SessionRecord,
     SessionRepository,
     TokenCipher,
     UserStateRepository,
 )
+from app.domain.hygiene import RepoHygiene, assess_hygiene
 from app.domain.models import (
     Changes,
     Inbox,
@@ -60,6 +63,20 @@ Clock = Callable[[], datetime]
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _attach_branch_listing(repo: Repository, listing: BranchListing | None) -> Repository:
+    """Attach a repository's branch count/branches-without-pr from the hygiene fetch.
+
+    `listing` is `None` when the repository's hygiene batch could not be fetched this
+    refresh (archived, disabled, or degraded); the repository then keeps its defaults
+    (`branch_count=0`, `branches_without_pr=()`).
+    """
+    if listing is None:
+        return repo
+    return dataclasses.replace(
+        repo, branch_count=listing.branch_count, branches_without_pr=listing.branches
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +169,7 @@ class GetOverview:
     stale_after: timedelta = DEFAULT_STALE_AFTER
     long_run_after: timedelta = DEFAULT_LONG_RUN_AFTER
     security_alerts: bool = True
+    hygiene_checks: bool = True
     clock: Clock = utc_now
     _locks: dict[int, asyncio.Lock] = field(default_factory=dict)
 
@@ -261,12 +279,33 @@ class GetOverview:
                 return (), False
             return tuple(result), True
 
+        async def hygiene() -> HygienePage:
+            if not self.hygiene_checks:
+                return HygienePage({}, {})
+            repo_ids = [r.node_id for r in page.repositories if not r.is_archived]
+            if not repo_ids:
+                return HygienePage({}, {})
+            # Runs alongside the per-repo REST work, under the same concurrency limit.
+            # AuthenticationError and RateLimited propagate like everywhere else; any other
+            # failure (GitHubUnavailable) must never take the whole overview down, so it
+            # degrades to "no hygiene/branch data this refresh" instead.
+            async with semaphore:
+                try:
+                    return await self.api.fetch_hygiene(token, repo_ids)
+                except GitHubUnavailable as exc:
+                    log.warning("hygiene fetch failed: %s", exc)
+                    return HygienePage({}, {})
+
         (
             worker_results,
             inbox_result,
             (notification_items, notifications_available),
+            hygiene_page,
         ) = await asyncio.gather(
-            asyncio.gather(*(worker(r) for r in page.repositories)), inbox(), notifications()
+            asyncio.gather(*(worker(r) for r in page.repositories)),
+            inbox(),
+            notifications(),
+            hygiene(),
         )
         ci_by_repo: dict[str, RepoCi] = {}
         security_by_repo: dict[str, RepoSecurity] = {}
@@ -276,14 +315,24 @@ class GetOverview:
             security_by_repo[full_name] = security
             release_by_repo[full_name] = release
 
+        repositories = tuple(
+            _attach_branch_listing(repo, hygiene_page.branches_by_repo.get(repo.full_name))
+            for repo in page.repositories
+        )
+        hygiene_by_repo: dict[str, RepoHygiene] = {
+            full_name: assess_hygiene(facts)
+            for full_name, facts in hygiene_page.hygiene_by_repo.items()
+        }
+
         return build_overview(
             viewer_login=session.user.login,
-            repositories=page.repositories,
+            repositories=repositories,
             ci_by_repo=ci_by_repo,
             rate_limit=page.rate_limit,
             inbox=inbox_result,
             security_by_repo=security_by_repo,
             release_by_repo=release_by_repo,
+            hygiene_by_repo=hygiene_by_repo,
             notifications=notification_items,
             notifications_available=notifications_available,
             stale_after=self.stale_after,

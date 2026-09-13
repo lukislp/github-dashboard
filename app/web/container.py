@@ -146,6 +146,7 @@ class Container:
                 stale_after=timedelta(days=settings.stale_days),
                 long_run_after=timedelta(minutes=settings.long_run_minutes),
                 security_alerts=settings.security_alerts,
+                hygiene_checks=settings.hygiene_checks,
             ),
             get_preferences=GetPreferences(user_state=user_state),
             save_preferences=SavePreferences(user_state=user_state),

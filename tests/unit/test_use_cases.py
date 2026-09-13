@@ -3,6 +3,7 @@ from datetime import timedelta
 import pytest
 
 from app.application.errors import AccessDenied, AuthenticationError, GitHubUnavailable, RateLimited
+from app.application.ports import BranchListing
 from app.application.use_cases import (
     AccessPolicy,
     CompleteLogin,
@@ -15,6 +16,7 @@ from app.application.use_cases import (
     SavePreferences,
     validate_preferences,
 )
+from app.domain.hygiene import RepoHygiene, assess_hygiene
 from app.domain.models import (
     AttentionItem,
     AttentionKind,
@@ -35,6 +37,8 @@ from tests.fakes import (
     FakeSessions,
     FakeUserState,
     PlainCipher,
+    make_branch,
+    make_hygiene_facts,
     make_repo,
     make_run,
 )
@@ -359,6 +363,103 @@ async def test_get_overview_degrades_unreleased_commits_to_none_on_error():
     result = await build_overview_uc(api, sessions, cache)(record)
 
     assert result.overview.repos[0].release.unreleased_commits is None
+
+
+async def test_get_overview_includes_hygiene_from_api_by_default():
+    facts = make_hygiene_facts(failing=("readme",))
+    repo = make_repo("a")
+    api = FakeApi(repos=[repo], hygiene_by_repo={"octocat/a": facts})
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.repos[0].hygiene == assess_hygiene(facts)
+    assert api.hygiene_calls == [(repo.node_id,)]
+
+
+async def test_get_overview_ignores_hygiene_when_disabled():
+    facts = make_hygiene_facts(failing=("readme",))
+    api = FakeApi(repos=[make_repo("a")], hygiene_by_repo={"octocat/a": facts})
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = GetOverview(
+        api=api,
+        sessions=sessions,
+        cipher=PlainCipher(),
+        cache=cache,
+        cache_ttl_seconds=60,
+        runs_per_repo=5,
+        max_concurrency=2,
+        hygiene_checks=False,
+        clock=clock,
+    )
+
+    result = await uc(record)
+
+    assert result.overview.repos[0].hygiene == RepoHygiene((), applicable=False)
+    assert api.hygiene_calls == []  # the hygiene query is skipped entirely
+
+
+async def test_get_overview_excludes_archived_repos_from_hygiene_ids():
+    live = make_repo("live")
+    dead = make_repo("dead", archived=True)
+    api = FakeApi(repos=[live, dead])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    await build_overview_uc(api, sessions, cache)(record)
+
+    assert api.hygiene_calls == [(live.node_id,)]
+
+
+async def test_get_overview_attaches_branch_listing_from_hygiene_fetch():
+    branch = make_branch("orphan")
+    listing = BranchListing(branch_count=4, branches=(branch,))
+    repo = make_repo("a")
+    api = FakeApi(repos=[repo], branches_by_repo={"octocat/a": listing})
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    updated = result.overview.repos[0].repository
+    assert updated.branch_count == 4
+    assert updated.branches_without_pr == (branch,)
+
+
+async def test_get_overview_hygiene_failure_leaves_overview_intact():
+    api = FakeApi(repos=[make_repo("a", branch_count=0)])
+    api.hygiene_error = GitHubUnavailable("hygiene down")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.repos[0].hygiene == RepoHygiene((), applicable=False)
+    assert result.overview.repos[0].repository.branch_count == 0
+    assert result.overview.repos[0].repository.branches_without_pr == ()
+
+
+async def test_get_overview_hygiene_rate_limited_propagates():
+    api = FakeApi(repos=[make_repo("a")])
+    api.hygiene_error = RateLimited("hygiene")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(RateLimited):
+        await build_overview_uc(api, sessions, cache)(record)
+
+
+async def test_get_overview_hygiene_authentication_error_propagates():
+    api = FakeApi(repos=[make_repo("a")])
+    api.hygiene_error = AuthenticationError("revoked")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AuthenticationError):
+        await build_overview_uc(api, sessions, cache)(record)
+    assert sessions.records == {}
 
 
 async def test_get_overview_includes_notifications_when_available():
