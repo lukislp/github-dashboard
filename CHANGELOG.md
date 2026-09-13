@@ -1,3 +1,10 @@
+## [1.1.4](https://github.com/lukislp/github-dashboard/compare/v1.1.3...v1.1.4) (2026-09-13)
+
+
+### Bug Fixes
+
+* **k8s:** give probes a 5s timeout so load spikes stop killing pods ([#8](https://github.com/lukislp/github-dashboard/issues/8)) ([785a560](https://github.com/lukislp/github-dashboard/commit/785a560828d18cf824aadf4b15aed6dc0574ebc2))
+
 ## [1.1.3](https://github.com/lukislp/github-dashboard/compare/v1.1.2...v1.1.3) (2026-09-13)
 
 
