@@ -1,0 +1,14 @@
+# Read access only (public repo): the released image tag is written into k8s/03-app.yaml by the
+# deploy-bump job of the CI pipeline (over the semantic-release deploy key), so nothing in the
+# cluster pushes to this repo and no token is referenced here.
+# Bootstrap-only: kubectl apply -f k8s/flux/ once; Flux keeps the rest in sync.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: github-dashboard
+  namespace: flux-system
+spec:
+  interval: 5m
+  url: https://github.com/lukislp/github-dashboard.git
+  ref:
+    branch: main

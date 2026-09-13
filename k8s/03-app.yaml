@@ -1,0 +1,97 @@
+# The dashboard itself: one replica with a Longhorn volume for the SQLite session/preference
+# store, plain HTTP on 8000 behind the shared NGINX Gateway (k8s/05-httproute.yaml).
+# The image tag is rewritten by the CI pipeline's deploy-bump job on every release (over the
+# semantic-release deploy key); Flux only reads this repo.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: github-dashboard-data
+  namespace: github-dashboard
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # Longhorn (cross-node-replicated) instead of local-path: sessions.db also holds the per-user
+  # repo groups/favourites and the "since your last visit" snapshots, which should survive a
+  # node dying without a Velero restore.
+  storageClassName: longhorn
+  resources:
+    requests: {storage: 256Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-dashboard
+  namespace: github-dashboard
+spec:
+  replicas: 1
+  strategy:
+    # Single instance on an RWO volume with a SQLite file - not built for concurrent writers.
+    # For more than one replica set REDIS_URL and drop the volume (see README).
+    type: Recreate
+  selector:
+    matchLabels: {app: github-dashboard}
+  template:
+    metadata:
+      labels: {app: github-dashboard}
+      annotations:
+        # Opt-in to homelab-infra's nightly Velero PVC backup: /data holds sessions plus the
+        # per-user preferences. Small, crash-consistent copy is fine (SQLite in WAL mode).
+        backup.velero.io/backup-volumes: data
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # uid/gid 10001 = the "app" user created in the Dockerfile.
+        runAsUser: 10001
+        runAsGroup: 10001
+        # Makes the freshly provisioned PV writable by the app user on first mount.
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: github-dashboard
+          image: ghcr.io/lukislp/github-dashboard:1.0.0 # set by the deploy-bump job (CI) on every release
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          envFrom:
+            - configMapRef: {name: github-dashboard-config}
+            - secretRef: {name: github-dashboard-secrets}
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          readinessProbe:
+            # /readyz touches the session store, so a broken volume takes the pod out of the
+            # Service instead of serving 500s.
+            httpGet: {path: /readyz, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: github-dashboard-data}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: github-dashboard
+  namespace: github-dashboard
+spec:
+  type: ClusterIP
+  selector: {app: github-dashboard}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

@@ -1,0 +1,45 @@
+# Same strategy as the sibling apps on this cluster: default-deny ingress as a baseline,
+# egress stays open (the app talks to api.github.com/github.com and GitHub's avatar CDN over
+# HTTPS, no fixed IP allow-list is practical). The only ingress ever needed is the shared NGINX
+# Gateway reaching the pod's port 8000 (k8s/05-httproute.yaml).
+#
+# Bootstrap-only, NOT Flux-managed - kustomize-controller's ClusterRole has no
+# "networkpolicies" permission (same reasoning as k8s/00-namespace.yaml / k8s/02-secret.yaml).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: github-dashboard
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: github-dashboard
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - {} # egress otherwise unrestricted - this policy only adds an explicit DNS allowance
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-nginx-gateway-to-app
+  namespace: github-dashboard
+spec:
+  podSelector: { matchLabels: { app: github-dashboard } }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: nginx-gateway } }
+      ports:
+        - { protocol: TCP, port: 8000 }

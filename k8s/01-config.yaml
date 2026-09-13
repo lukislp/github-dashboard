@@ -1,0 +1,28 @@
+# Non-secret runtime configuration. Flux-managed (see k8s/flux-deploy/kustomization.yaml):
+# every value here is the REAL production value, not a placeholder - a placeholder would be
+# silently re-applied over any manual substitution on the next reconcile.
+#
+# BASE_URL is the ONE host the GitHub OAuth App's redirect URI is registered for
+# (<BASE_URL>/auth/callback). The app derives the callback from it, so the dashboard is only
+# reachable through this hostname even though the HTTPRoute also serves the .heim.lan name.
+#
+# ALLOWED_LOGINS limits sign-in to the listed GitHub accounts. This instance is personal; the
+# Gateway it sits behind is internal-only anyway, the allow-list is defence in depth.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: github-dashboard-config
+  namespace: github-dashboard
+data:
+  BASE_URL: "https://github-dashboard.lukas2311-homelab.com"
+  ALLOWED_LOGINS: "lukislp"
+  LOG_LEVEL: "INFO"
+  DB_PATH: "/data/sessions.db"
+  CACHE_TTL_SECONDS: "120"
+  SESSION_TTL_HOURS: "168"
+  RUNS_PER_REPO: "5"
+  STALE_DAYS: "14"
+  LONG_RUN_MINUTES: "30"
+  MAX_CONCURRENCY: "8"
+  SECURITY_ALERTS: "true"
+  HYGIENE_CHECKS: "true"

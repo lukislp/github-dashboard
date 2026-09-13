@@ -1,0 +1,56 @@
+# HTTPRoute for the shared NGINX Gateway Fabric gateway (homelab-infra's cluster/02-gateway.yaml
+# carries the matching github-dashboard-heim / github-dashboard-public listener pair; the
+# Certificate is created by cert-manager from the Gateway's cluster-issuer annotation). Both
+# hostnames are internal-only: heim.lan is LAN-only DNS, the lukas2311-homelab.com name is the
+# vehicle for a trusted certificate on traffic NGINX Proxy Manager terminates and forwards
+# inside the network - never port-forwarded out.
+#
+# Only the lukas2311-homelab.com name completes a GitHub login: the OAuth App's redirect URI is
+# registered for exactly that host (BASE_URL in k8s/01-config.yaml).
+#
+# No BackendTLSPolicy: the app serves plain HTTP on 8000 and trusts the Gateway's
+# X-Forwarded-* headers (uvicorn --proxy-headers) for the https scheme in cookies.
+#
+# Requires a DNS entry for github-dashboard.heim.lan pointing at the Gateway's MetalLB IP and
+# an NGINX Proxy Manager proxy host forwarding github-dashboard.lukas2311-homelab.com to it -
+# both manual steps outside this repo, same as every other service on this Gateway.
+#
+# Bootstrap-only, NOT Flux-managed (no gateway.networking.k8s.io permission in the reconciler
+# ClusterRole).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: github-dashboard
+  namespace: github-dashboard
+spec:
+  parentRefs:
+    - name: studylife-gateway
+      namespace: nginx-gateway
+  hostnames:
+    - github-dashboard.heim.lan
+    - github-dashboard.lukas2311-homelab.com
+  rules:
+    - backendRefs:
+        - name: github-dashboard
+          port: 8000
+---
+# Same modest rate limit as the other personal-scale services on this Gateway.
+apiVersion: gateway.nginx.org/v1alpha1
+kind: RateLimitPolicy
+metadata:
+  name: github-dashboard-rate-limit
+  namespace: github-dashboard
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: github-dashboard
+  rateLimit:
+    local:
+      rules:
+        - zoneSize: 10m
+          key: "$binary_remote_addr"
+          rate: 20r/s
+          burst: 200
+          noDelay: true
+    rejectCode: 503

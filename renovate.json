@@ -10,7 +10,7 @@
   ],
   "kubernetes": {
     "managerFilePatterns": [
-      "/^deploy/k8s/.+\\.ya?ml$/"
+      "/^k8s/.+\\.ya?ml$/"
     ]
   },
   "semanticCommits": "enabled",

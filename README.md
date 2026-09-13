@@ -130,22 +130,26 @@ Docker:
 docker compose up --build
 ```
 
-Kubernetes (single replica with a PersistentVolumeClaim for SQLite):
+Kubernetes (single replica, Longhorn PersistentVolumeClaim for SQLite, Flux keeps it in sync):
 
 ```bash
-kubectl create namespace github-dashboard
-kubectl -n github-dashboard create secret generic github-dashboard-secrets \
-  --from-literal=GITHUB_CLIENT_ID=... \
-  --from-literal=GITHUB_CLIENT_SECRET=... \
-  --from-literal=SECRET_KEY=... \
-  --from-literal=BASE_URL=https://dashboard.example.com
-kubectl apply -k deploy/k8s/base
+kubectl apply -f k8s/00-namespace.yaml
+bash k8s/seal-secret.sh                     # OAuth App credentials -> k8s/02-sealed-secret.yaml
+kubectl apply -f k8s/02-sealed-secret.yaml  # or create the Secret out of band, see k8s/02-secret.yaml
+kubectl apply -f k8s/04-network-policies.yaml -f k8s/05-httproute.yaml
+kubectl apply -f k8s/flux/                  # GitRepository + Kustomization -> k8s/flux-deploy/
 ```
 
-Edit `deploy/k8s/base/ingress.yaml` for your host, ingress class and TLS issuer. For more than one
-replica set `REDIS_URL`, drop the PVC volume and switch the Deployment strategy to `RollingUpdate`.
-The container runs as a non-root user with a read-only root filesystem; `/data` and `/tmp` are the
-only writable paths. `/healthz` is the liveness probe, `/readyz` touches the session store.
+`k8s/` follows the convention of the other apps on this cluster: namespace, Secret, network
+policies and the HTTPRoute are bootstrap objects applied once by hand (the Flux reconciler's
+ClusterRole deliberately cannot manage them); `k8s/flux-deploy/` (ConfigMap, PVC, Deployment,
+Service) is reconciled continuously, including the image tag the CI pipeline's `deploy-bump` job
+writes into `k8s/03-app.yaml` on every release. Adjust `BASE_URL`/`ALLOWED_LOGINS` in
+`k8s/01-config.yaml` and the hostnames in `k8s/05-httproute.yaml` for another cluster. For more
+than one replica set `REDIS_URL`, drop the PVC volume and switch the Deployment strategy to
+`RollingUpdate`. The container runs as a non-root user with a read-only root filesystem; `/data`
+and `/tmp` are the only writable paths. `/healthz` is the liveness probe, `/readyz` touches the
+session store.
 
 ## Security notes
 
