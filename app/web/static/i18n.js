@@ -51,6 +51,10 @@
       kpi_hygiene_sub: "{a} without CI · {b} unprotected · {c} no dependency updates",
       kpi_branches_without_pr: "Branches without PR",
       kpi_branches_without_pr_sub: "{n} stale (no commit for {days} days)",
+      kpi_ci_private: "CI time, private",
+      kpi_ci_public: "CI time, public",
+      kpi_ci_runs_since: "{n} runs since {date}",
+      kpi_ci_truncated: "at least, some repositories exceed 200 runs",
       stale_suffix: "{n} stale",
       search_placeholder: "Filter repositories…",
       owner_all: "All owners",
@@ -94,6 +98,9 @@
       badge_unreleased: "+{n} unreleased",
       badge_unreleased_title: "{n} commits since the last release",
       badge_branches_without_pr: "{n} branches without PR",
+      badge_ci_month_title: "{n} runs this month",
+      badge_ci_month_title_truncated: "{n} runs this month (at least; some repositories exceed 200 runs)",
+      details_runs_month: "This month: {duration} ({n} runs)",
       hygiene_not_applicable: "not rated: archived/fork/unavailable",
       hygiene_not_applicable_detail: "Not rated: archived, a fork, or hygiene data unavailable.",
       hygiene_all_pass: "All checks pass",
@@ -145,7 +152,7 @@
       duration_seconds: "{s} s",
       duration_minutes_seconds: "{m} min {s} s",
       duration_hours_minutes: "{h} h {m} min",
-      footer_ci_time: "CI time (recent) {duration}",
+      footer_ci_time_month: "CI time in {month}: {private} private · {public} public",
       footer_actions_usage: "{used} / {included} Actions minutes used",
       changes_title: "Since your last visit",
       changes_summary: "{total} changes since {time}",
@@ -292,6 +299,10 @@
       kpi_hygiene_sub: "{a} ohne CI · {b} ungeschützt · {c} ohne Abhängigkeits-Updates",
       kpi_branches_without_pr: "Branches ohne PR",
       kpi_branches_without_pr_sub: "{n} veraltet (seit {days} Tagen kein Commit)",
+      kpi_ci_private: "CI-Zeit privat",
+      kpi_ci_public: "CI-Zeit öffentlich",
+      kpi_ci_runs_since: "{n} Läufe seit {date}",
+      kpi_ci_truncated: "mindestens, einige Repositories über 200 Läufe",
       stale_suffix: "{n} veraltet",
       search_placeholder: "Repositories filtern…",
       owner_all: "Alle Owner",
@@ -335,6 +346,9 @@
       badge_unreleased: "+{n} unveröffentlicht",
       badge_unreleased_title: "{n} Commits seit dem letzten Release",
       badge_branches_without_pr: "{n} Branches ohne PR",
+      badge_ci_month_title: "{n} Läufe diesen Monat",
+      badge_ci_month_title_truncated: "{n} Läufe diesen Monat (mindestens; einige Repositories über 200 Läufe)",
+      details_runs_month: "Dieser Monat: {duration} ({n} Läufe)",
       hygiene_not_applicable: "nicht bewertet: archiviert/Fork/nicht verfügbar",
       hygiene_not_applicable_detail: "Nicht bewertet: archiviert, ein Fork, oder Hygiene-Daten nicht verfügbar.",
       hygiene_all_pass: "Alle Prüfungen bestanden",
@@ -386,7 +400,7 @@
       duration_seconds: "{s} s",
       duration_minutes_seconds: "{m} Min. {s} s",
       duration_hours_minutes: "{h} Std. {m} Min.",
-      footer_ci_time: "CI-Zeit (letzte) {duration}",
+      footer_ci_time_month: "CI-Zeit im {month}: {private} privat · {public} öffentlich",
       footer_actions_usage: "{used} / {included} Actions-Minuten verbraucht",
       changes_title: "Seit deinem letzten Besuch",
       changes_summary: "{total} Änderungen seit {time}",
@@ -574,6 +588,21 @@
     return new Intl.NumberFormat(lang).format(n);
   }
 
+  // Day-and-month / month-only labels for the "since 1 September" / "in September" style
+  // strings around the CI usage figures. Always read in UTC: `usage_since` is the first of
+  // the calendar month at UTC midnight, and formatting it in the viewer's local time zone
+  // could shift it back to the last day of the previous month for anyone west of UTC.
+  function formatMonthDay(iso) {
+    const date = new Date(iso);
+    const day = new Intl.DateTimeFormat(lang, { day: "numeric", timeZone: "UTC" }).format(date);
+    const month = new Intl.DateTimeFormat(lang, { month: "long", timeZone: "UTC" }).format(date);
+    return lang === "de" ? `${day}. ${month}` : `${day} ${month}`;
+  }
+
+  function formatMonth(iso) {
+    return new Intl.DateTimeFormat(lang, { month: "long", timeZone: "UTC" }).format(new Date(iso));
+  }
+
   window.I18N = {
     get lang() {
       return lang;
@@ -584,6 +613,8 @@
     formatRelative,
     formatDateTime,
     formatNumber,
+    formatMonthDay,
+    formatMonth,
   };
 
   document.addEventListener("DOMContentLoaded", () => {
