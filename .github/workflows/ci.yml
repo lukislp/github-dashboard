@@ -21,6 +21,12 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # uv must never download an interpreter from python-build-standalone: that is an
+  # external fetch on every single run (it started returning 504 Gateway Timeout on
+  # 2026-09-14 and turned CI red at random). The runner's tool cache already ships the
+  # version below, resolved locally by actions/setup-python - and with downloads off a
+  # missing interpreter fails loudly instead of being pulled in over the network.
+  UV_PYTHON_DOWNLOADS: never
   IMAGE: ghcr.io/lukislp/github-dashboard
 
 # Least-privilege default for GITHUB_TOKEN (CodeQL actions/missing-workflow-permissions):
@@ -38,7 +44,9 @@ jobs:
         with:
           version: "0.5.8"
           cache-suffix: "lint"
-      - run: uv python install 3.12
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
       - run: uv sync --frozen
       - run: uv run ruff check app tests
       - run: uv run ruff format --check app tests
@@ -52,7 +60,9 @@ jobs:
         with:
           version: "0.5.8"
           cache-suffix: "test"
-      - run: uv python install 3.12
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
       - run: uv sync --frozen
       - run: uv run pytest -q
 
