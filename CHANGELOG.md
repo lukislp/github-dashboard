@@ -1,3 +1,10 @@
+## [1.4.1](https://github.com/lukislp/github-dashboard/compare/v1.4.0...v1.4.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* **api:** stop returning raw exception text from the preferences endpoint ([#16](https://github.com/lukislp/github-dashboard/issues/16)) ([445f96f](https://github.com/lukislp/github-dashboard/commit/445f96ff6ba08d6234976f15d84058ac856c12d4))
+
 # [1.4.0](https://github.com/lukislp/github-dashboard/compare/v1.3.0...v1.4.0) (2026-09-14)
 
 
