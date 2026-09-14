@@ -823,22 +823,24 @@
     ];
 
     els.kpis.innerHTML = tiles
-      .map(
-        (tile) => `
-        <div class="kpi ${tile.tone && !loading ? "kpi--" + tile.tone : ""} ${loading ? "is-loading" : ""}">
-          <p class="kpi__label">${esc(tile.label)}</p>
-          <p class="kpi__value">${
-            loading
+      .map((tile) => {
+        const text = loading
+          ? "—"
+          : tile.valueText != null
+            ? tile.valueText
+            : tile.value == null
               ? "—"
-              : tile.valueText != null
-                ? esc(tile.valueText)
-                : tile.value == null
-                  ? "—"
-                  : esc(I18N.formatNumber(tile.value) + (tile.suffix || ""))
-          }</p>
+              : I18N.formatNumber(tile.value) + (tile.suffix || "");
+        // A compound value like "≥86 h 52 min" does not fit a tile at the hero size and would
+        // wrap onto a second line, which makes the strip look ragged.
+        const compact = text.length > 8 ? " kpi--compact" : "";
+        return `
+        <div class="kpi ${tile.tone && !loading ? "kpi--" + tile.tone : ""} ${loading ? "is-loading" : ""}${compact}">
+          <p class="kpi__label">${esc(tile.label)}</p>
+          <p class="kpi__value">${esc(text)}</p>
           <p class="kpi__sub">${loading ? "" : esc(tile.sub)}</p>
-        </div>`
-      )
+        </div>`;
+      })
       .join("");
   }
 

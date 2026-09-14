@@ -280,6 +280,7 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 .kpi:nth-child(n + 7) { border-top: 1px solid var(--line); }
 .kpi__label { font-size: 0.78rem; color: var(--muted); letter-spacing: 0.02em; margin: 0 0 6px; }
 .kpi__value { font-size: 2rem; font-weight: 600; line-height: 1; letter-spacing: -0.02em; margin: 0; }
+.kpi--compact .kpi__value { font-size: 1.45rem; letter-spacing: -0.01em; white-space: nowrap; }
 .kpi__sub {
   font-size: 0.8rem; color: var(--muted); margin: 8px 0 0; font-family: var(--font-mono);
   white-space: normal; overflow: hidden; text-overflow: ellipsis;
