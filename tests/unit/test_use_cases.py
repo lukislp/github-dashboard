@@ -32,9 +32,11 @@ from app.domain.models import (
     Preferences,
     ReleaseInfo,
     RepoGroup,
+    RepoUsage,
     RunStatus,
     SeverityCounts,
 )
+from app.domain.overview import month_start
 from tests.fakes import (
     NOW,
     FakeApi,
@@ -585,6 +587,111 @@ async def test_get_overview_excludes_archived_repos_from_hygiene_ids():
     await build_overview_uc(api, sessions, cache)(record)
 
     assert api.hygiene_calls == [(live.node_id,)]
+
+
+# -- CI usage (monthly wall-clock time) -------------------------------------------------------
+
+
+async def test_get_overview_queries_ci_usage_only_for_repos_with_ci_workflow():
+    has_ci = make_repo("has-ci")
+    no_ci = make_repo("no-ci")
+    api = FakeApi(
+        repos=[has_ci, no_ci],
+        hygiene_by_repo={
+            "octocat/has-ci": make_hygiene_facts(),
+            "octocat/no-ci": make_hygiene_facts(failing=("ci_workflow",)),
+        },
+        usage_by_repo={"octocat/has-ci": RepoUsage(seconds=600, runs=3, truncated=False)},
+    )
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert api.usage_calls == [("octocat/has-ci", month_start(NOW))]
+    by_name = {r.repository.name: r.usage for r in result.overview.repos}
+    assert by_name["has-ci"] == RepoUsage(seconds=600, runs=3, truncated=False)
+    assert by_name["no-ci"] == RepoUsage(seconds=0, runs=0, truncated=False)
+    assert result.overview.usage_since == month_start(NOW)
+    assert result.overview.totals.ci_seconds_month == 600
+    assert result.overview.totals.ci_runs_month == 3
+
+
+async def test_get_overview_skips_ci_usage_for_archived_repos():
+    live = make_repo("live")
+    dead = make_repo("dead", archived=True)
+    api = FakeApi(repos=[live, dead], hygiene_by_repo={"octocat/live": make_hygiene_facts()})
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    await build_overview_uc(api, sessions, cache)(record)
+
+    assert api.usage_calls == [("octocat/live", month_start(NOW))]
+
+
+async def test_get_overview_ci_usage_queries_every_repo_when_hygiene_disabled():
+    # With HYGIENE_CHECKS off there is no ci_workflow hint at all, so every non-archived
+    # repository is queried rather than none of them.
+    a = make_repo("a")
+    b = make_repo("b")
+    api = FakeApi(repos=[a, b])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = GetOverview(
+        api=api,
+        sessions=sessions,
+        ensure_fresh_token=build_ensure_fresh_token(oauth, sessions),
+        cache=cache,
+        cache_ttl_seconds=60,
+        runs_per_repo=5,
+        max_concurrency=2,
+        hygiene_checks=False,
+        clock=clock,
+    )
+
+    await uc(record)
+
+    assert sorted(full for full, _ in api.usage_calls) == ["octocat/a", "octocat/b"]
+
+
+async def test_get_overview_ci_usage_disabled_skips_everything():
+    api = FakeApi(
+        repos=[make_repo("a")],
+        hygiene_by_repo={"octocat/a": make_hygiene_facts()},
+        usage_by_repo={"octocat/a": RepoUsage(seconds=600, runs=3, truncated=False)},
+    )
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache, ci_usage_enabled=False)(record)
+
+    assert api.usage_calls == []
+    assert result.overview.usage_since is None
+    assert result.overview.repos[0].usage == RepoUsage(seconds=0, runs=0, truncated=False)
+    assert result.overview.totals.ci_seconds_month == 0
+    assert result.overview.totals.ci_runs_month == 0
+
+
+async def test_get_overview_ci_usage_degrades_on_rate_limited_or_unavailable():
+    api = FakeApi(repos=[make_repo("a")], hygiene_by_repo={"octocat/a": make_hygiene_facts()})
+    api.usage_error = RateLimited("usage")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.repos[0].usage == RepoUsage(seconds=0, runs=0, truncated=False)
+
+
+async def test_get_overview_ci_usage_propagates_authentication_error():
+    api = FakeApi(repos=[make_repo("a")], hygiene_by_repo={"octocat/a": make_hygiene_facts()})
+    api.usage_error = AuthenticationError("revoked")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(AuthenticationError):
+        await build_overview_uc(api, sessions, cache)(record)
+    assert sessions.records == {}
 
 
 async def test_get_overview_attaches_branch_listing_from_hygiene_fetch():

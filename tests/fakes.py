@@ -31,6 +31,7 @@ from app.domain.models import (
     RateLimit,
     ReleaseInfo,
     Repository,
+    RepoUsage,
     ReviewDecision,
     RunStatus,
     SeverityCounts,
@@ -283,6 +284,7 @@ class FakeApi:
         failed_jobs_by_run: dict[tuple[str, int], tuple[FailedJob, ...]] | None = None,
         repo_items: dict[tuple[str, str], RepoItemPage] | None = None,
         actions_usage_value: ActionsUsage | None = None,
+        usage_by_repo: dict[str, RepoUsage] | None = None,
     ) -> None:
         self.repos = repos or []
         self.runs = runs or {}
@@ -328,6 +330,9 @@ class FakeApi:
         )
         self.actions_usage_calls = 0
         self.actions_usage_error: Exception | None = None
+        self.usage_by_repo = usage_by_repo or {}
+        self.usage_calls: list[tuple[str, datetime]] = []
+        self.usage_error: Exception | None = None
 
     async def list_repositories(self, token: str) -> RepositoryPage:
         self.calls += 1
@@ -396,6 +401,15 @@ class FakeApi:
         if self.actions_usage_error is not None:
             raise self.actions_usage_error
         return self.actions_usage_value
+
+    async def list_run_durations(
+        self, token: str, owner: str, name: str, since: datetime
+    ) -> RepoUsage:
+        full = f"{owner}/{name}"
+        self.usage_calls.append((full, since))
+        if self.usage_error is not None:
+            raise self.usage_error
+        return self.usage_by_repo.get(full, RepoUsage(seconds=0, runs=0, truncated=False))
 
     async def fetch_security(
         self, token: str, owner: str, name: str

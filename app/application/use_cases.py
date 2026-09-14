@@ -45,6 +45,7 @@ from app.domain.models import (
     RepoCi,
     RepoSecurity,
     Repository,
+    RepoUsage,
     Snapshot,
     WorkflowRun,
 )
@@ -55,6 +56,7 @@ from app.domain.overview import (
     classify_ci,
     mark_issue,
     mark_pr,
+    month_start,
     skipped_ci,
 )
 from app.domain.snapshot import diff_since, snapshot_of
@@ -62,6 +64,7 @@ from app.domain.snapshot import diff_since, snapshot_of
 _EMPTY_ACTIONS_USAGE = ActionsUsage(
     available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
 )
+_EMPTY_USAGE = RepoUsage(seconds=0, runs=0, truncated=False)
 _REPO_ITEMS_LIMIT = 50
 
 _MAX_GROUPS = 30
@@ -265,6 +268,7 @@ class GetOverview:
     hygiene_checks: bool = True
     max_job_lookups: int = 20
     actions_usage_enabled: bool = True
+    ci_usage_enabled: bool = True
     clock: Clock = utc_now
     _locks: dict[int, asyncio.Lock] = field(default_factory=dict)
 
@@ -297,14 +301,23 @@ class GetOverview:
         session, token = await self.ensure_fresh_token(session)
         page = await self.api.list_repositories(token)
         semaphore = asyncio.Semaphore(self.max_concurrency)
+        usage_since = month_start(self.clock()) if self.ci_usage_enabled else None
 
-        async def worker(repo: Repository) -> tuple[str, RepoCi, RepoSecurity, ReleaseInfo | None]:
+        async def worker(
+            repo: Repository,
+        ) -> tuple[str, RepoCi, RepoSecurity, ReleaseInfo | None, RepoUsage]:
             dependabot, dependabot_total = page.dependabot_by_repo.get(repo.full_name, (None, None))
             partial_release = page.release_by_repo.get(repo.full_name)
 
             if repo.is_archived:
                 security = RepoSecurity(dependabot, dependabot_total, None, None)
-                return repo.full_name, skipped_ci("archived"), security, partial_release
+                return (
+                    repo.full_name,
+                    skipped_ci("archived"),
+                    security,
+                    partial_release,
+                    _EMPTY_USAGE,
+                )
 
             async with semaphore:
                 try:
@@ -355,7 +368,8 @@ class GetOverview:
                         ahead_by = None
                     release = dataclasses.replace(partial_release, unreleased_commits=ahead_by)
 
-            return repo.full_name, ci, security, release
+            usage = await self._repo_usage(repo, hygiene_task, token, semaphore, usage_since)
+            return repo.full_name, ci, security, release, usage
 
         async def inbox() -> Inbox:
             try:
@@ -400,6 +414,10 @@ class GetOverview:
                 log.warning("actions usage fetch failed: %s", exc)
                 return _EMPTY_ACTIONS_USAGE
 
+        # Started as a Task (not a bare coroutine) so `worker` can `await` it too, without
+        # holding its own semaphore permit while doing so - see `_repo_usage`.
+        hygiene_task: asyncio.Task[HygienePage] = asyncio.ensure_future(hygiene())
+
         (
             worker_results,
             inbox_result,
@@ -410,16 +428,18 @@ class GetOverview:
             asyncio.gather(*(worker(r) for r in page.repositories)),
             inbox(),
             notifications(),
-            hygiene(),
+            hygiene_task,
             actions_usage(),
         )
         ci_by_repo: dict[str, RepoCi] = {}
         security_by_repo: dict[str, RepoSecurity] = {}
         release_by_repo: dict[str, ReleaseInfo | None] = {}
-        for full_name, ci, security, release in worker_results:
+        usage_by_repo: dict[str, RepoUsage] = {}
+        for full_name, ci, security, release, usage in worker_results:
             ci_by_repo[full_name] = ci
             security_by_repo[full_name] = security
             release_by_repo[full_name] = release
+            usage_by_repo[full_name] = usage
 
         ci_by_repo = await self._attach_failed_jobs(ci_by_repo, token=token, semaphore=semaphore)
 
@@ -444,10 +464,45 @@ class GetOverview:
             notifications=notification_items,
             notifications_available=notifications_available,
             actions_usage=actions_usage_result,
+            usage_by_repo=usage_by_repo,
+            usage_since=usage_since,
             stale_after=self.stale_after,
             long_run_after=self.long_run_after,
             now=self.clock(),
         )
+
+    async def _repo_usage(
+        self,
+        repo: Repository,
+        hygiene_task: asyncio.Task[HygienePage],
+        token: str,
+        semaphore: asyncio.Semaphore,
+        since: datetime | None,
+    ) -> RepoUsage:
+        """CI usage of one non-archived repository for the current calendar month.
+
+        Only queried when the repository actually has a CI workflow: with hygiene checks on,
+        that fact comes straight out of the hygiene fetch (awaiting the shared `hygiene_task`
+        - never while holding `semaphore`, or a full house of worker permits could starve
+        hygiene of the one permit it needs to ever complete); with hygiene checks off there is
+        no such hint, so every non-archived repository is queried. `since=None` means
+        `CI_USAGE` is disabled, in which case nothing is queried at all.
+        """
+        if since is None:
+            return _EMPTY_USAGE
+        if self.hygiene_checks:
+            hygiene_page = await hygiene_task
+            facts = hygiene_page.hygiene_by_repo.get(repo.full_name)
+            if facts is None or facts.workflow_file_count <= 0:
+                return _EMPTY_USAGE
+        async with semaphore:
+            try:
+                return await self.api.list_run_durations(token, repo.owner, repo.name, since)
+            except AuthenticationError:
+                raise
+            except (RateLimited, GitHubUnavailable) as exc:
+                log.warning("ci usage fetch failed repo=%s: %s", repo.full_name, exc)
+                return _EMPTY_USAGE
 
     async def _attach_failed_jobs(
         self, ci_by_repo: dict[str, RepoCi], *, token: str, semaphore: asyncio.Semaphore

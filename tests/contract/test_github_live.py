@@ -2,12 +2,14 @@
 
 import os
 import time
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 
 from app.application.errors import ActionsUnavailable
 from app.domain.hygiene import assess_hygiene
+from app.domain.overview import month_start
 from app.infrastructure.github_http import GitHubHttpApi
 
 pytestmark = pytest.mark.skipif(not os.environ.get("GH_TOKEN"), reason="GH_TOKEN not set")
@@ -109,6 +111,17 @@ async def test_live_repositories_and_runs():
         assert isinstance(usage.available, bool)
         if usage.available:
             assert usage.minutes_used is not None and usage.minutes_used >= 0
+
+        # CI usage: wall-clock time of the current calendar month's runs. Never raises for a
+        # disabled/inaccessible Actions tab (404/403 degrade to a zero RepoUsage in the adapter).
+        usage = await api.list_run_durations(
+            token, candidate.owner, candidate.name, month_start(datetime.now(UTC))
+        )
+        assert usage.seconds >= 0 and usage.runs >= 0
+        print(
+            f"list_run_durations: {candidate.full_name} seconds={usage.seconds} "
+            f"runs={usage.runs} truncated={usage.truncated}"
+        )
 
         # One page of the candidate repository's open pull requests, cursor-paginated.
         items_page = await api.list_repo_items(

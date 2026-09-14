@@ -158,6 +158,7 @@ class Container:
                 hygiene_checks=settings.hygiene_checks,
                 max_job_lookups=settings.max_job_lookups,
                 actions_usage_enabled=settings.actions_usage,
+                ci_usage_enabled=settings.ci_usage,
             ),
             get_preferences=GetPreferences(user_state=user_state),
             save_preferences=SavePreferences(user_state=user_state),

@@ -293,12 +293,29 @@ class Notification:
 
 
 @dataclass(frozen=True, slots=True)
+class RepoUsage:
+    """Observed CI wall-clock usage of one repository for the current calendar month.
+
+    Summed from `GitHubApi.list_run_durations` (see `Overview.usage_since` for the window).
+    This is wall-clock time, not billed minutes - see the "Actions time" section in the
+    README for why GitHub's own billing endpoints cannot be used here and how the two relate.
+    `truncated` is True when the repository had more than 200 runs this month: `seconds`/
+    `runs` then undercount the true total.
+    """
+
+    seconds: int
+    runs: int
+    truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class RepoOverview:
     repository: Repository
     ci: RepoCi
     security: RepoSecurity
     release: ReleaseInfo | None
     hygiene: RepoHygiene
+    usage: RepoUsage
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +397,10 @@ class Totals:
     stale_branches: int
     oldest_pr_days: int
     ci_seconds_recent: int
+    ci_seconds_month: int
+    ci_seconds_month_private: int
+    ci_seconds_month_public: int
+    ci_runs_month: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +434,10 @@ class Overview:
     notifications: tuple[Notification, ...]
     notifications_available: bool
     actions_usage: ActionsUsage
+    # The first of the current calendar month, UTC - the start of the window `RepoUsage` and
+    # the `ci_seconds_month*`/`ci_runs_month` totals were summed over. `None` when `CI_USAGE`
+    # is disabled, in which case every repository's `usage` is zero.
+    usage_since: datetime | None
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,5 +1,5 @@
 import dataclasses
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from app.domain.hygiene import HYGIENE_KEYS
 from app.domain.models import (
@@ -13,11 +13,12 @@ from app.domain.models import (
     Notification,
     ReleaseInfo,
     RepoSecurity,
+    RepoUsage,
     ReviewDecision,
     RunStatus,
     SeverityCounts,
 )
-from app.domain.overview import build_overview, classify_ci, skipped_ci
+from app.domain.overview import build_overview, classify_ci, month_start, skipped_ci
 from tests.fakes import NOW, make_branch, make_hygiene, make_issue, make_pr, make_repo, make_run
 
 
@@ -609,3 +610,49 @@ def test_actions_usage_is_passed_through_when_provided():
         actions_usage=usage,
     )
     assert overview.actions_usage == usage
+
+
+# -- CI usage (monthly wall-clock time) -------------------------------------------------------
+
+
+def test_month_start_returns_first_of_month_utc():
+    now = datetime(2026, 9, 14, 15, 30, 45, tzinfo=UTC)
+    assert month_start(now) == datetime(2026, 9, 1, tzinfo=UTC)
+
+
+def test_repo_usage_and_usage_since_default_to_zero_and_none():
+    overview = build_overview(
+        viewer_login="x", repositories=[make_repo("a")], ci_by_repo={}, rate_limit=None, now=NOW
+    )
+    assert overview.repos[0].usage == RepoUsage(seconds=0, runs=0, truncated=False)
+    assert overview.usage_since is None
+    assert overview.totals.ci_seconds_month == 0
+    assert overview.totals.ci_seconds_month_private == 0
+    assert overview.totals.ci_seconds_month_public == 0
+    assert overview.totals.ci_runs_month == 0
+
+
+def test_totals_ci_seconds_month_split_by_visibility():
+    repo_private = make_repo("priv", private=True)
+    repo_public = make_repo("pub", private=False)
+    usage_by_repo = {
+        "octocat/priv": RepoUsage(seconds=300, runs=2, truncated=False),
+        "octocat/pub": RepoUsage(seconds=120, runs=1, truncated=True),
+    }
+    overview = build_overview(
+        viewer_login="x",
+        repositories=[repo_private, repo_public],
+        ci_by_repo={},
+        rate_limit=None,
+        now=NOW,
+        usage_by_repo=usage_by_repo,
+        usage_since=NOW,
+    )
+    assert overview.totals.ci_seconds_month == 420
+    assert overview.totals.ci_seconds_month_private == 300
+    assert overview.totals.ci_seconds_month_public == 120
+    assert overview.totals.ci_runs_month == 3
+    assert overview.usage_since == NOW
+    by_name = {r.repository.name: r.usage for r in overview.repos}
+    assert by_name["priv"] == usage_by_repo["octocat/priv"]
+    assert by_name["pub"] == usage_by_repo["octocat/pub"]

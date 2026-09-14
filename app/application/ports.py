@@ -21,6 +21,7 @@ from app.domain.models import (
     RateLimit,
     ReleaseInfo,
     Repository,
+    RepoUsage,
     SeverityCounts,
     Snapshot,
     User,
@@ -208,6 +209,17 @@ class GitHubApi(Protocol):
         `ActionsUsage.available` is False (all other fields `None`) when the endpoint answers
         403/404 - typically because the token's OAuth scopes do not include `user` - which must
         never be treated as an error."""
+        ...
+
+    async def list_run_durations(
+        self, token: str, owner: str, name: str, since: datetime
+    ) -> RepoUsage:
+        """Observed wall-clock CI time of one repository's workflow runs created since `since`.
+
+        Sums `updated_at - run_started_at` (falling back to `created_at`) over every run that
+        is not still active; active runs contribute nothing. Follows `page=2` at most once (at
+        most 200 runs), setting `truncated` when GitHub reports more via `total_count`. 404/403
+        (Actions disabled, no permission) degrade to a zero `RepoUsage`, never an error."""
         ...
 
 

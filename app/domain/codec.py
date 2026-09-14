@@ -36,6 +36,7 @@ from app.domain.models import (
     RepoOverview,
     RepoSecurity,
     Repository,
+    RepoUsage,
     ReviewDecision,
     RunStatus,
     SeverityCounts,
@@ -480,6 +481,18 @@ def inbox_from_dict(d: dict[str, Any]) -> Inbox:
     )
 
 
+def repo_usage_to_dict(usage: RepoUsage) -> dict[str, Any]:
+    return {"seconds": usage.seconds, "runs": usage.runs, "truncated": usage.truncated}
+
+
+def repo_usage_from_dict(d: dict[str, Any] | None) -> RepoUsage:
+    if d is None:
+        return RepoUsage(seconds=0, runs=0, truncated=False)
+    return RepoUsage(
+        seconds=d.get("seconds", 0), runs=d.get("runs", 0), truncated=d.get("truncated", False)
+    )
+
+
 def actions_usage_to_dict(usage: ActionsUsage) -> dict[str, Any]:
     return {
         "available": usage.available,
@@ -514,6 +527,7 @@ def overview_to_dict(overview: Overview) -> dict[str, Any]:
                 "security": repo_security_to_dict(r.security),
                 "release": release_info_to_dict(r.release),
                 "hygiene": repo_hygiene_to_dict(r.hygiene),
+                "usage": repo_usage_to_dict(r.usage),
             }
             for r in overview.repos
         ],
@@ -534,6 +548,7 @@ def overview_to_dict(overview: Overview) -> dict[str, Any]:
         "notifications": [notification_to_dict(n) for n in overview.notifications],
         "notifications_available": overview.notifications_available,
         "actions_usage": actions_usage_to_dict(overview.actions_usage),
+        "usage_since": _dt(overview.usage_since),
     }
 
 
@@ -550,6 +565,7 @@ def overview_from_dict(d: dict[str, Any]) -> Overview:
                 repo_security_from_dict(r.get("security")),
                 release_info_from_dict(r.get("release")),
                 repo_hygiene_from_dict(r.get("hygiene")),
+                repo_usage_from_dict(r.get("usage")),
             )
             for r in d["repos"]
         ),
@@ -563,6 +579,7 @@ def overview_from_dict(d: dict[str, Any]) -> Overview:
         notifications=tuple(notification_from_dict(n) for n in d.get("notifications", [])),
         notifications_available=d.get("notifications_available", False),
         actions_usage=actions_usage_from_dict(d.get("actions_usage")),
+        usage_since=_parse_dt(d.get("usage_since")),
     )
 
 

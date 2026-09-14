@@ -37,6 +37,7 @@ from app.domain.models import (
     RateLimit,
     ReleaseInfo,
     Repository,
+    RepoUsage,
     ReviewDecision,
     RunStatus,
     SeverityCounts,
@@ -67,6 +68,10 @@ _HYGIENE_BATCH_SIZE = 25
 # reintroducing the resource-limit problems the split was meant to fix.
 _REFS_PAGE_SIZE = 50
 _RETRYABLE_HTTP_STATUSES = frozenset({502, 503, 504})
+# `list_run_durations`: at most two pages of 100 runs (GitHub's REST page-size cap), so at
+# most 200 runs are ever inspected per repository per month.
+_RUN_DURATIONS_PAGE_SIZE = 100
+_RUN_DURATIONS_MAX_PAGES = 2
 _RESOURCE_LIMITS_EXCEEDED = "RESOURCE_LIMITS_EXCEEDED"
 # Job/step conclusions that count as a failure, mirroring `FAILED_STATUSES` for workflow runs.
 _JOB_FAILED_CONCLUSIONS = frozenset({"failure", "timed_out", "startup_failure"})
@@ -737,6 +742,45 @@ class GitHubHttpApi:
             raise ActionsUnavailable("forbidden")
         _raise_for_status(response, context=context)
         return [_run_from_json(r) for r in response.json().get("workflow_runs", [])]
+
+    async def list_run_durations(
+        self, token: str, owner: str, name: str, since: datetime
+    ) -> RepoUsage:
+        """Wall-clock CI time of `owner/name`'s workflow runs created on/after `since`.
+
+        Rides the same conditional-GET cache as every other REST call here, so a repository
+        with no new runs since the last refresh answers `304` and costs nothing. Unlike
+        `list_recent_runs`, an unavailable Actions tab (404/403) is not an error here - the
+        caller just gets a zero `RepoUsage`, same as `fetch_actions_usage`.
+        """
+        context = f"run durations {owner}/{name}"
+        since_filter = f">={since.strftime('%Y-%m-%d')}"
+        runs: list[dict[str, Any]] = []
+        total_count = 0
+        for page in range(1, _RUN_DURATIONS_MAX_PAGES + 1):
+            params: dict[str, Any] = {"created": since_filter, "per_page": _RUN_DURATIONS_PAGE_SIZE}
+            if page > 1:
+                params["page"] = page
+            response = await self._conditional_get(
+                token,
+                f"{self._api_url}/repos/{owner}/{name}/actions/runs",
+                params=params,
+                context=context,
+            )
+            if _optional_or_raise(response, context=context):
+                if page == 1:
+                    return RepoUsage(seconds=0, runs=0, truncated=False)
+                break
+            data = response.json()
+            if page == 1:
+                total_count = int(data.get("total_count", 0))
+            runs.extend(data.get("workflow_runs", []))
+            if total_count <= _RUN_DURATIONS_PAGE_SIZE:
+                break
+
+        seconds = sum(_run_from_json(r).duration_seconds for r in runs)
+        truncated = total_count > _RUN_DURATIONS_PAGE_SIZE * _RUN_DURATIONS_MAX_PAGES
+        return RepoUsage(seconds=seconds, runs=len(runs), truncated=truncated)
 
     async def list_failed_jobs(
         self, token: str, owner: str, name: str, run_id: int

@@ -74,6 +74,34 @@ bonus on top of it - it may be unavailable (`actions_usage.available: false`) be
 requested OAuth scopes do not include `user`, which is not a scope this app otherwise needs.
 Set `ACTIONS_USAGE=false` to skip that call altogether.
 
+### Actions time
+
+GitHub's own Actions billing is not readable by this app for the account it was built for,
+and it is worth being explicit about that rather than showing a number that looks precise but
+is not: on the newer billing platform, `GET /users/{login}/settings/billing/actions`,
+`/settings/billing/usage` and `/settings/billing/shared-storage` all answer `404` for a token
+without the `user` OAuth scope (which this app otherwise has no reason to request), and the
+one endpoint that *does* answer for such a token, `GET /repos/{owner}/{repo}/actions/runs/{id}/
+timing`, reports `billable: 0 ms` for every run on that platform - so even when it is
+reachable, it has nothing in it. `Overview.actions_usage` above is that best-effort attempt;
+this feature does not depend on it and reports nothing where it, too, would report nothing.
+
+Instead, `Totals.ci_seconds_month`/`ci_seconds_month_private`/`ci_seconds_month_public` and
+`Totals.ci_runs_month`, plus a per-repository `RepoOverview.usage` (`RepoUsage.seconds`/`runs`/
+`truncated`), are wall-clock time measured directly from the workflow runs of the **current
+calendar month** (`Overview.usage_since`, the first of the month at midnight UTC). On the
+standard `ubuntu` runners this account uses, wall-clock time is exactly what GitHub bills per
+minute; it is **not** the billed time on `macos` or `windows` runners, which GitHub multiplies
+by ten and two respectively before billing. At most 200 runs per repository per month are
+counted (two pages of 100); a repository that had more than that reports `truncated: true` and
+undercounts the true total for the month.
+
+Only non-archived repositories that actually have a CI workflow are queried at all: with
+`HYGIENE_CHECKS` on, that fact comes straight out of the hygiene fetch (see "Repository
+hygiene" above) for free; with `HYGIENE_CHECKS` off there is no such hint, so every
+non-archived repository is queried instead. Set `CI_USAGE=false` to skip this feature
+altogether - every repository then reports zero and `Overview.usage_since` is `null`.
+
 ### Branches without a pull request
 
 Each repository also reports its branches (other than the default one) that have no open or
@@ -128,6 +156,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> SECRET_KEY
 | `BACKGROUND_REFRESH_IDLE_MINUTES` | no | `30` | Only refresh sessions seen within this many minutes (minimum `1`) |
 | `MAX_JOB_LOOKUPS` | no | `20` | Failed runs (newest first, across the whole refresh) whose failed jobs/steps are looked up per refresh (minimum `0`, `0` disables the feature) |
 | `ACTIONS_USAGE` | no | `true` | Fetch GitHub Actions billing usage for the signed-in user (`true`/`false`/`1`/`0`); skipped entirely when `false` |
+| `CI_USAGE` | no | `true` | Measure each repository's wall-clock Actions time for the current calendar month (`true`/`false`/`1`/`0`, see "Actions time"); skipped entirely when `false` |
 | `DB_PATH` | no | `./data/sessions.db` | SQLite session store (single replica) |
 | `REDIS_URL` | no | | Redis for sessions and cache (multiple replicas) |
 
@@ -187,7 +216,8 @@ session store.
   feature disabled, that part is simply omitted (shown as unavailable, not zero).
 - Each refresh now costs up to 4 REST requests per non-archived repository (workflow runs,
   code-scanning alerts, secret-scanning alerts, and a commit comparison for repositories with a
-  release), on top of the batched GraphQL query. Set `SECURITY_ALERTS=false` to skip the two
+  release), plus up to 2 more for repositories with a CI workflow (`CI_USAGE`, see "Actions
+  time"), on top of the batched GraphQL query. Set `SECURITY_ALERTS=false` to skip the two
   security REST calls per repository if that cost is too high for a large account.
 - `POST /api/repos/{owner}/{name}/runs/{run_id}/rerun` is the only endpoint that writes to
   GitHub (it re-runs a run's failed jobs). It needs no scope beyond the `repo` scope already

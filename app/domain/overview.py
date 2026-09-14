@@ -22,6 +22,7 @@ from app.domain.models import (
     RepoOverview,
     RepoSecurity,
     Repository,
+    RepoUsage,
     RunStatus,
     Totals,
     WorkflowRun,
@@ -34,8 +35,15 @@ _EMPTY_HYGIENE = RepoHygiene((), applicable=False)
 _EMPTY_ACTIONS_USAGE = ActionsUsage(
     available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
 )
+_EMPTY_USAGE = RepoUsage(seconds=0, runs=0, truncated=False)
 DEFAULT_STALE_AFTER = timedelta(days=14)
 DEFAULT_LONG_RUN_AFTER = timedelta(minutes=30)
+
+
+def month_start(now: datetime) -> datetime:
+    """The first of `now`'s calendar month, at midnight, in `now`'s own timezone (UTC in
+    practice - the app always passes a UTC `now`). Used as the CI-usage window's start."""
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
 def classify_ci(runs: Iterable[WorkflowRun], *, error: str | None = None) -> RepoCi:
@@ -137,12 +145,15 @@ def build_overview(
     notifications: tuple[Notification, ...] = (),
     notifications_available: bool = False,
     actions_usage: ActionsUsage = _EMPTY_ACTIONS_USAGE,
+    usage_by_repo: Mapping[str, RepoUsage] | None = None,
+    usage_since: datetime | None = None,
 ) -> Overview:
     repos: list[RepoOverview] = []
     failures: list[FailedRun] = []
     security_by_repo = security_by_repo or {}
     release_by_repo = release_by_repo or {}
     hygiene_by_repo = hygiene_by_repo or {}
+    usage_by_repo = usage_by_repo or {}
 
     for repo in repositories:
         repo = _mark_stale(repo, now=now, stale_after=stale_after)
@@ -151,7 +162,8 @@ def build_overview(
         security = security_by_repo.get(repo.full_name) or _EMPTY_SECURITY
         release = release_by_repo.get(repo.full_name)
         hygiene = hygiene_by_repo.get(repo.full_name) or _EMPTY_HYGIENE
-        repos.append(RepoOverview(repo, ci, security, release, hygiene))
+        usage = usage_by_repo.get(repo.full_name) or _EMPTY_USAGE
+        repos.append(RepoOverview(repo, ci, security, release, hygiene, usage))
         failures.extend(FailedRun(repo.full_name, run) for run in ci.runs if run.failed)
 
     repos.sort(key=_repo_sort_key)
@@ -216,6 +228,10 @@ def build_overview(
         stale_branches=sum(1 for r in repos for b in r.repository.branches_without_pr if b.stale),
         oldest_pr_days=max((p.age_days for p in all_prs), default=0),
         ci_seconds_recent=sum(r.ci.ci_seconds_recent for r in repos),
+        ci_seconds_month=sum(r.usage.seconds for r in repos),
+        ci_seconds_month_private=sum(r.usage.seconds for r in repos if r.repository.is_private),
+        ci_seconds_month_public=sum(r.usage.seconds for r in repos if not r.repository.is_private),
+        ci_runs_month=sum(r.usage.runs for r in repos),
     )
     return Overview(
         viewer_login=viewer_login,
@@ -228,6 +244,7 @@ def build_overview(
         notifications=notifications,
         notifications_available=notifications_available,
         actions_usage=actions_usage,
+        usage_since=usage_since,
     )
 
 
