@@ -17,6 +17,7 @@ from app.application.errors import (
     ActionsUnavailable,
     AuthenticationError,
     GitHubUnavailable,
+    PreferencesInvalid,
     RateLimited,
 )
 from app.application.ports import (
@@ -565,35 +566,35 @@ class GetOverview:
 
 
 def validate_preferences(prefs: Preferences) -> None:
-    """Raise ValueError when `prefs` violates a stored-state limit.
+    """Raise `PreferencesInvalid` when `prefs` violates a stored-state limit.
 
     Limits: at most 30 groups, group names non-empty/at most 40 chars/unique
     case-insensitively, at most 500 repository names in total (groups plus favourites), and
     every repository name must look like `owner/repo`.
     """
     if len(prefs.groups) > _MAX_GROUPS:
-        raise ValueError(f"a maximum of {_MAX_GROUPS} groups is allowed")
+        raise PreferencesInvalid(f"a maximum of {_MAX_GROUPS} groups is allowed")
 
     seen_names: set[str] = set()
     total_repos = len(prefs.favorites)
     for group in prefs.groups:
         if not group.name.strip():
-            raise ValueError("group name must not be empty")
+            raise PreferencesInvalid("group name must not be empty")
         if len(group.name) > _MAX_GROUP_NAME_LEN:
-            raise ValueError(f"group name too long: {group.name!r}")
+            raise PreferencesInvalid(f"group name too long: {group.name!r}")
         key = group.name.casefold()
         if key in seen_names:
-            raise ValueError(f"duplicate group name: {group.name!r}")
+            raise PreferencesInvalid(f"duplicate group name: {group.name!r}")
         seen_names.add(key)
         total_repos += len(group.repos)
 
     if total_repos > _MAX_REPOS_TOTAL:
-        raise ValueError(f"a maximum of {_MAX_REPOS_TOTAL} repositories is allowed")
+        raise PreferencesInvalid(f"a maximum of {_MAX_REPOS_TOTAL} repositories is allowed")
 
     all_repos = (*prefs.favorites, *(repo for group in prefs.groups for repo in group.repos))
     for repo_name in all_repos:
         if not _REPO_NAME_RE.match(repo_name):
-            raise ValueError(f"invalid repository name: {repo_name!r}")
+            raise PreferencesInvalid(f"invalid repository name: {repo_name!r}")
 
 
 @dataclass(slots=True)

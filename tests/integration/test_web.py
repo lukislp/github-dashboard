@@ -211,6 +211,30 @@ def test_put_preferences_rejects_invalid_input(client):
     assert "invalid repository name" in body["detail"]
 
 
+def test_put_preferences_rejects_malformed_json_without_leaking_parser_detail(client):
+    sign_in(client)
+    response = client.put(
+        "/api/preferences",
+        content=b"{not json",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body == {"error": "invalid_json"}
+    # The json module's message ("Expecting property name ... line 1 column 2 (char 1)")
+    # quotes the payload and its offsets - it must not travel to the client.
+    assert "detail" not in body
+
+
+def test_put_preferences_rejects_wrong_shape_without_detail(client):
+    sign_in(client)
+    response = client.put("/api/preferences", json={"groups": "Backend"})
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_preferences"}
+
+
 def test_mark_seen_then_new_pr_shows_up_in_next_changes(client, fakes):
     sign_in(client)
     client.get("/api/overview")  # populate the cache

@@ -13,6 +13,7 @@ from app.application.errors import (
     ActionsUnavailable,
     AuthenticationError,
     GitHubUnavailable,
+    PreferencesInvalid,
     RateLimited,
     RunNotRerunnable,
 )
@@ -96,12 +97,24 @@ async def put_preferences(
 ) -> JSONResponse:
     if session is None:
         return _unauthorized()
+    # Parsing is kept out of the block below on purpose: a malformed body raises
+    # json.JSONDecodeError, a ValueError whose text quotes byte offsets and payload excerpts.
+    # Returning that verbatim is what CodeQL flags as py/stack-trace-exposure.
     try:
         body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    try:
         prefs = preferences_from_dict(body)
         await container.save_preferences(session, prefs)
-    except ValueError as exc:
-        return JSONResponse({"error": "invalid_preferences", "detail": str(exc)}, status_code=400)
+    except PreferencesInvalid as exc:
+        # `detail` is a message this application authored for the client, never exception text.
+        return JSONResponse({"error": "invalid_preferences", "detail": exc.detail}, status_code=400)
+    except (ValueError, TypeError, AttributeError, KeyError):
+        # Anything the codec chokes on (wrong shape, wrong types) - the reason goes to the log,
+        # the client only learns that the payload was rejected.
+        log.exception("preferences rejected user=%s", session.user.login)
+        return JSONResponse({"error": "invalid_preferences"}, status_code=400)
     return JSONResponse(preferences_to_dict(prefs))
 
 
