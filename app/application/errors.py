@@ -27,3 +27,17 @@ class ActionsUnavailable(ApplicationError):
 
 class RunNotRerunnable(ApplicationError):
     """GitHub refused to rerun a workflow run's failed jobs (409: still in progress or too old)."""
+
+
+class PreferencesInvalid(ValueError):
+    """Submitted preferences violate a stored-state limit.
+
+    Carries the client-facing text in `detail` instead of relying on `str(exc)`. The web layer
+    must only ever return `detail`, so that an unrelated `ValueError` raised further down (a
+    JSON parser complaint, a codec failure) can never leak internals into an HTTP response.
+    Subclasses `ValueError` so existing callers that expect one keep working.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
