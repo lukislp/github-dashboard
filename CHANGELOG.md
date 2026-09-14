@@ -1,3 +1,10 @@
+# [1.4.0](https://github.com/lukislp/github-dashboard/compare/v1.3.0...v1.4.0) (2026-09-14)
+
+
+### Features
+
+* Actions time of the current month, split by repository visibility ([#15](https://github.com/lukislp/github-dashboard/issues/15)) ([f1a48ce](https://github.com/lukislp/github-dashboard/commit/f1a48ced66bb0e678833cea27426e2d236b1accb))
+
 # [1.3.0](https://github.com/lukislp/github-dashboard/compare/v1.2.0...v1.3.0) (2026-09-13)
 
 
