@@ -1,3 +1,10 @@
+## [1.4.2](https://github.com/lukislp/github-dashboard/compare/v1.4.1...v1.4.2) (2026-09-14)
+
+
+### Bug Fixes
+
+* **k8s:** raise the memory limit above the refresh peak ([#17](https://github.com/lukislp/github-dashboard/issues/17)) ([9bd2399](https://github.com/lukislp/github-dashboard/commit/9bd239903113369d345f57eb2474074b586cce53))
+
 ## [1.4.1](https://github.com/lukislp/github-dashboard/compare/v1.4.0...v1.4.1) (2026-09-14)
 
 
