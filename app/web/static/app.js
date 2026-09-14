@@ -317,6 +317,24 @@
     return t("duration_seconds", { s: sec });
   }
 
+  // This month's Actions wall-clock time, split private/public. `totals.ci_seconds_month_*`
+  // already carries the summed seconds; the run count and the truncation flag are not split by
+  // visibility server-side, so they are derived here from each repository's own `usage`
+  // (truncated per figure: a truncated public repository must never mark the private figure).
+  function ciUsageSplit(d) {
+    const totals = d.totals;
+    const result = {
+      private: { seconds: totals.ci_seconds_month_private ?? 0, runs: 0, truncated: false },
+      public: { seconds: totals.ci_seconds_month_public ?? 0, runs: 0, truncated: false },
+    };
+    for (const r of d.repos) {
+      const bucket = r.repository.is_private ? result.private : result.public;
+      bucket.runs += r.usage ? r.usage.runs : 0;
+      if (r.usage && r.usage.truncated) bucket.truncated = true;
+    }
+    return result;
+  }
+
   // ---------- pull request / issue age ----------
 
   function prAgeMarkup(pr) {
@@ -689,6 +707,23 @@
 
     const unreleasedTone = (totals.repos_unreleased ?? 0) > 0 ? "warning" : "good";
 
+    const ciUsage = d ? ciUsageSplit(d) : null;
+    const ciSinceLabel = d && d.usage_since ? I18N.formatMonthDay(d.usage_since) : "";
+    function ciUsageTile(key, label, tone, figure) {
+      const seconds = figure ? figure.seconds : 0;
+      const runs = figure ? figure.runs : 0;
+      const truncated = figure ? figure.truncated : false;
+      let sub = ciSinceLabel ? t("kpi_ci_runs_since", { n: I18N.formatNumber(runs), date: ciSinceLabel }) : "";
+      if (truncated) sub = sub ? sub + " · " + t("kpi_ci_truncated") : t("kpi_ci_truncated");
+      return {
+        key,
+        label,
+        valueText: (truncated ? "≥" : "") + formatDuration(seconds),
+        sub,
+        tone,
+      };
+    }
+
     const notifAvailable = d ? d.notifications_available : false;
     let notifValue = notifAvailable ? totals.notifications_unread ?? 0 : null;
     let notifSub;
@@ -781,17 +816,31 @@
         sub: t("kpi_branches_without_pr_sub", { n: totals.stale_branches ?? 0, days: d ? d.stale_days : 14 }),
         tone: (totals.stale_branches ?? 0) > 0 ? "warning" : null,
       },
+      // Private CI minutes are the ones that cost money, so that tile leads and carries the
+      // accent; public minutes are free and shown only for context, so it stays neutral.
+      ciUsageTile("ci_private", t("kpi_ci_private"), "accent", ciUsage && ciUsage.private),
+      ciUsageTile("ci_public", t("kpi_ci_public"), null, ciUsage && ciUsage.public),
     ];
 
     els.kpis.innerHTML = tiles
-      .map(
-        (tile) => `
-        <div class="kpi ${tile.tone && !loading ? "kpi--" + tile.tone : ""} ${loading ? "is-loading" : ""}">
+      .map((tile) => {
+        const text = loading
+          ? "—"
+          : tile.valueText != null
+            ? tile.valueText
+            : tile.value == null
+              ? "—"
+              : I18N.formatNumber(tile.value) + (tile.suffix || "");
+        // A compound value like "≥86 h 52 min" does not fit a tile at the hero size and would
+        // wrap onto a second line, which makes the strip look ragged.
+        const compact = text.length > 8 ? " kpi--compact" : "";
+        return `
+        <div class="kpi ${tile.tone && !loading ? "kpi--" + tile.tone : ""} ${loading ? "is-loading" : ""}${compact}">
           <p class="kpi__label">${esc(tile.label)}</p>
-          <p class="kpi__value">${loading || tile.value == null ? "—" : esc(I18N.formatNumber(tile.value) + (tile.suffix || ""))}</p>
+          <p class="kpi__value">${esc(text)}</p>
           <p class="kpi__sub">${loading ? "" : esc(tile.sub)}</p>
-        </div>`
-      )
+        </div>`;
+      })
       .join("");
   }
 
@@ -1140,6 +1189,11 @@
       branchesWithoutPr > 0
         ? `<span class="badge ${branchesStale ? "badge--warning" : ""}">${esc(t("badge_branches_without_pr", { n: branchesWithoutPr }))}</span>`
         : "";
+    const usage = item.usage;
+    const ciUsageBadge =
+      usage && usage.seconds > 0
+        ? `<span class="badge" title="${esc(t(usage.truncated ? "badge_ci_month_title_truncated" : "badge_ci_month_title", { n: I18N.formatNumber(usage.runs) }))}">${esc(formatDuration(usage.seconds))}</span>`
+        : "";
     const alertsCell = repo.is_archived
       ? `<span class="num is-zero">–</span>`
       : alertsCellMarkup(item.security);
@@ -1170,7 +1224,7 @@
             ${newTag}
             ${badges.join("")}
           </div>
-          <div class="repo-meta">${favoriteStar}${lang}${stars}${unreleasedBadge}${branchesBadge}</div>
+          <div class="repo-meta">${favoriteStar}${lang}${stars}${unreleasedBadge}${branchesBadge}${ciUsageBadge}</div>
         </td>
         <td class="col-num"><span class="num-cell"><span class="num ${prCount ? "is-hot" : "is-zero"}">${prCount}</span>${dots}</span></td>
         <td class="col-num"><span class="num ${repo.open_issue_count ? "is-hot" : "is-zero"}">${repo.open_issue_count}</span></td>
@@ -1257,6 +1311,20 @@
       ci.ci_seconds_recent > 0
         ? `${esc(t("details_runs"))} · ${esc(formatDuration(ci.ci_seconds_recent))}`
         : esc(t("details_runs"));
+    // Distinct from `runsHeading` above: that duration covers only the handful of runs listed
+    // right below it, while this one is the repository's whole current-month total (which can
+    // include runs never shown in that list) - keeping them visually apart avoids the two
+    // figures being mistaken for one another.
+    const usage = item.usage;
+    const monthLine =
+      usage && usage.seconds > 0
+        ? `<p class="ci-month-line mono">${esc(
+            t("details_runs_month", {
+              duration: (usage.truncated ? "≥" : "") + formatDuration(usage.seconds),
+              n: I18N.formatNumber(usage.runs),
+            })
+          )}</p>`
+        : "";
 
     const release = item.release;
     const releaseList = release
@@ -1329,7 +1397,7 @@
           <div class="details">
             <div><h4>${esc(t("details_prs"))} · ${prCount}</h4>${prList}</div>
             <div><h4>${esc(t("details_issues"))} · ${repo.open_issue_count}</h4>${issueList}</div>
-            <div><h4>${runsHeading}</h4>${runList}</div>
+            <div><h4>${runsHeading}</h4>${monthLine}${runList}</div>
             <div><h4>${esc(t("details_release"))}</h4>${releaseList}</div>
             <div><h4>${esc(t("details_security"))}</h4>${securityList}</div>
             <div><h4>${hygieneHeading}</h4>${hygieneList}</div>
@@ -1434,8 +1502,18 @@
     if (d.rate_limit) {
       parts.push(t("footer_rate", { remaining: I18N.formatNumber(d.rate_limit.remaining), limit: I18N.formatNumber(d.rate_limit.limit) }));
     }
-    if (d.totals.ci_seconds_recent > 0) {
-      parts.push(t("footer_ci_time", { duration: formatDuration(d.totals.ci_seconds_recent) }));
+    // The month's whole-account CI total belongs here, next to the other whole-account
+    // figures; the five-run total (`ci_seconds_recent`) only makes sense inside a repository
+    // and is shown there instead (see `runsHeading` in detailRow).
+    if (d.usage_since) {
+      const usage = ciUsageSplit(d);
+      parts.push(
+        t("footer_ci_time_month", {
+          month: I18N.formatMonth(d.usage_since),
+          private: (usage.private.truncated ? "≥" : "") + formatDuration(usage.private.seconds),
+          public: (usage.public.truncated ? "≥" : "") + formatDuration(usage.public.seconds),
+        })
+      );
     }
     if (d.actions_usage && d.actions_usage.available) {
       parts.push(

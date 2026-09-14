@@ -31,6 +31,7 @@ from app.domain.models import (
     ReleaseInfo,
     RepoGroup,
     RepoSecurity,
+    RepoUsage,
     ReviewDecision,
     RunStatus,
     SeverityCounts,
@@ -128,6 +129,10 @@ def test_overview_roundtrip_through_json():
         "octocat/a": make_hygiene(failing=("codeowners", "security_policy")),
         "octocat/b": make_hygiene(applicable=False),
     }
+    usage_by_repo = {
+        "octocat/a": RepoUsage(seconds=754, runs=12, truncated=True),
+        "octocat/b": RepoUsage(seconds=0, runs=0, truncated=False),
+    }
     original = build_overview(
         viewer_login="octocat",
         repositories=repos,
@@ -141,6 +146,8 @@ def test_overview_roundtrip_through_json():
         notifications=notifications,
         notifications_available=True,
         actions_usage=actions_usage,
+        usage_by_repo=usage_by_repo,
+        usage_since=NOW.replace(day=1),
     )
 
     restored = overview_from_dict(json.loads(json.dumps(overview_to_dict(original))))
@@ -284,6 +291,33 @@ def test_actions_usage_dict_round_trips_available_and_unavailable():
     assert unavailable.actions_usage == ActionsUsage(
         available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
     )
+
+
+def test_repo_usage_and_usage_since_dict_round_trip():
+    usage = RepoUsage(seconds=754, runs=12, truncated=True)
+    since = NOW.replace(day=1)
+    payload = overview_to_dict(
+        build_overview(
+            viewer_login="o",
+            repositories=[make_repo("a")],
+            ci_by_repo={},
+            rate_limit=None,
+            now=NOW,
+            usage_by_repo={"octocat/a": usage},
+            usage_since=since,
+        )
+    )
+    assert payload["repos"][0]["usage"] == {"seconds": 754, "runs": 12, "truncated": True}
+    assert payload["usage_since"] == since.isoformat()
+    assert payload["totals"]["ci_seconds_month"] == 754
+    assert payload["totals"]["ci_runs_month"] == 12
+
+    restored = overview_from_dict(json.loads(json.dumps(payload)))
+    assert restored.repos[0].usage == usage
+    assert restored.usage_since == since
+
+    empty = overview_from_dict({**json.loads(json.dumps(payload)), "usage_since": None})
+    assert empty.usage_since is None
 
 
 def test_inbox_dict_round_trips_and_totals():

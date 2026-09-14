@@ -14,7 +14,14 @@ from app.application.errors import (
     RateLimited,
     RunNotRerunnable,
 )
-from app.domain.models import ChecksState, Mergeable, ReviewDecision, RunStatus, SeverityCounts
+from app.domain.models import (
+    ChecksState,
+    Mergeable,
+    RepoUsage,
+    ReviewDecision,
+    RunStatus,
+    SeverityCounts,
+)
 from app.infrastructure.github_http import GitHubHttpApi, GitHubHttpOAuth
 from app.infrastructure.http_cache import ConditionalCache, fingerprint
 
@@ -1552,3 +1559,193 @@ async def test_fetch_actions_usage_raises_authentication_error_on_401(client):
     )
     with pytest.raises(AuthenticationError):
         await GitHubHttpApi(client, api_url=API).fetch_actions_usage("tok", "octocat")
+
+
+# -- CI usage (list_run_durations) -----------------------------------------------------------
+
+
+def _usage_run_json(
+    run_id: int,
+    *,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    created_at: str = "2026-09-01T09:00:00Z",
+    run_started_at: str | None = "2026-09-01T09:00:00Z",
+    updated_at: str = "2026-09-01T09:05:00Z",
+) -> dict:
+    data = {
+        "id": run_id,
+        "name": "CI",
+        "html_url": f"u{run_id}",
+        "head_branch": "main",
+        "event": "push",
+        "status": status,
+        "conclusion": conclusion,
+        "run_number": run_id,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+    if run_started_at is not None:
+        data["run_started_at"] = run_started_at
+    return data
+
+
+@respx.mock
+async def test_list_run_durations_sums_only_completed_runs(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total_count": 2,
+                "workflow_runs": [
+                    _usage_run_json(1, updated_at="2026-09-01T09:05:00Z"),  # 5 minutes
+                    _usage_run_json(
+                        2,
+                        status="in_progress",
+                        conclusion=None,
+                        run_started_at="2026-09-02T09:00:00Z",
+                        updated_at="2026-09-02T09:10:00Z",  # active - contributes nothing
+                    ),
+                ],
+            },
+        )
+    )
+    usage = await GitHubHttpApi(client, api_url=API).list_run_durations(
+        "tok", "octocat", "a", datetime(2026, 9, 1, tzinfo=UTC)
+    )
+    assert usage.seconds == 5 * 60
+    assert usage.runs == 2
+    assert usage.truncated is False
+
+
+@respx.mock
+async def test_list_run_durations_missing_run_started_at_falls_back_to_created_at(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total_count": 1,
+                "workflow_runs": [
+                    _usage_run_json(
+                        1,
+                        run_started_at=None,
+                        created_at="2026-09-01T09:00:00Z",
+                        updated_at="2026-09-01T09:05:00Z",
+                    )
+                ],
+            },
+        )
+    )
+    usage = await GitHubHttpApi(client, api_url=API).list_run_durations(
+        "tok", "octocat", "a", datetime(2026, 9, 1, tzinfo=UTC)
+    )
+    assert usage.seconds == 5 * 60
+    assert usage.runs == 1
+
+
+@respx.mock
+async def test_list_run_durations_follows_second_page_and_sets_truncated(client):
+    route = respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "total_count": 250,
+                    "workflow_runs": [_usage_run_json(i) for i in range(1, 101)],
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "total_count": 250,
+                    "workflow_runs": [_usage_run_json(i) for i in range(101, 201)],
+                },
+            ),
+        ]
+    )
+    usage = await GitHubHttpApi(client, api_url=API).list_run_durations(
+        "tok", "octocat", "a", datetime(2026, 9, 1, tzinfo=UTC)
+    )
+    assert route.call_count == 2
+    assert route.calls[1].request.url.params["page"] == "2"
+    assert usage.runs == 200
+    assert usage.seconds == 200 * 5 * 60
+    assert usage.truncated is True
+
+
+@respx.mock
+async def test_list_run_durations_skips_second_page_when_not_needed(client):
+    route = respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        return_value=httpx.Response(
+            200, json={"total_count": 1, "workflow_runs": [_usage_run_json(1)]}
+        )
+    )
+    usage = await GitHubHttpApi(client, api_url=API).list_run_durations(
+        "tok", "octocat", "a", datetime(2026, 9, 1, tzinfo=UTC)
+    )
+    assert route.call_count == 1
+    assert usage.truncated is False
+
+
+@respx.mock
+async def test_list_run_durations_zero_on_404(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs").mock(return_value=httpx.Response(404))
+    usage = await GitHubHttpApi(client, api_url=API).list_run_durations(
+        "tok", "octocat", "a", datetime(2026, 9, 1, tzinfo=UTC)
+    )
+    assert usage == RepoUsage(seconds=0, runs=0, truncated=False)
+
+
+@respx.mock
+async def test_list_run_durations_zero_on_403(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        return_value=httpx.Response(403, headers={"x-ratelimit-remaining": "500"})
+    )
+    usage = await GitHubHttpApi(client, api_url=API).list_run_durations(
+        "tok", "octocat", "a", datetime(2026, 9, 1, tzinfo=UTC)
+    )
+    assert usage == RepoUsage(seconds=0, runs=0, truncated=False)
+
+
+@respx.mock
+async def test_list_run_durations_raises_authentication_error_on_401(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs").mock(return_value=httpx.Response(401))
+    with pytest.raises(AuthenticationError):
+        await GitHubHttpApi(client, api_url=API).list_run_durations(
+            "tok", "octocat", "a", datetime(2026, 9, 1, tzinfo=UTC)
+        )
+
+
+@respx.mock
+async def test_list_run_durations_sends_created_and_per_page_filter(client):
+    respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        return_value=httpx.Response(200, json={"total_count": 0, "workflow_runs": []})
+    )
+    await GitHubHttpApi(client, api_url=API).list_run_durations(
+        "tok", "octocat", "a", datetime(2026, 9, 1, tzinfo=UTC)
+    )
+    assert respx.calls.last.request.url.params["created"] == ">=2026-09-01"
+    assert respx.calls.last.request.url.params["per_page"] == "100"
+
+
+@respx.mock
+async def test_list_run_durations_second_call_reuses_cached_body_on_304(client):
+    route = respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                headers={"etag": 'W/"abc"'},
+                json={"total_count": 1, "workflow_runs": [_usage_run_json(1)]},
+            ),
+            httpx.Response(304),
+        ]
+    )
+    cache = ConditionalCache()
+    api = GitHubHttpApi(client, api_url=API, cache=cache)
+
+    first = await api.list_run_durations("tok", "octocat", "a", datetime(2026, 9, 1, tzinfo=UTC))
+    second = await api.list_run_durations("tok", "octocat", "a", datetime(2026, 9, 1, tzinfo=UTC))
+
+    assert route.call_count == 2
+    assert route.calls[1].request.headers["if-none-match"] == 'W/"abc"'
+    assert second == first == RepoUsage(seconds=5 * 60, runs=1, truncated=False)
