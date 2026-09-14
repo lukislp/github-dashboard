@@ -60,8 +60,16 @@ spec:
             - name: http
               containerPort: 8000
           resources:
+            # The memory limit was 256Mi and the pod was OOMKilled on 2026-09-14. Measured over
+            # three hours: the working set idles at 51Mi but jumps to 237-248Mi whenever the
+            # overview is refreshed, because the whole GitHub response set is held in memory
+            # while it is assembled. Every refresh therefore came within 8Mi of the limit and
+            # one of them crossed it. The baseline returns to 51Mi after each spike, so this is
+            # a transient allocation and not a leak. 512Mi leaves the refresh roughly a factor
+            # of two of headroom; the request stays at 128Mi, so nothing extra is reserved on
+            # the node and only the ceiling moves.
             requests: {cpu: 50m, memory: 128Mi}
-            limits: {cpu: 500m, memory: 256Mi}
+            limits: {cpu: 500m, memory: 512Mi}
           readinessProbe:
             # /readyz touches the session store, so a broken volume takes the pod out of the
             # Service instead of serving 500s.
