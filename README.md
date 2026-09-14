@@ -23,6 +23,9 @@ without a login.
   Each row expands into the open pull requests, open issues and recent runs of that repository,
   plus its Dependabot/code-scanning/secret-scanning alert counts and release status.
 - **Failed runs feed** across all repositories, newest first.
+- **CI time this month**, split into private and public, per repository and as account totals;
+  measured by timing the runs ourselves, because GitHub's own Actions billing endpoints refuse
+  to answer for this app (see "Actions time" below).
 - UI in English and German (toggle in the header), light and dark mode follow the system.
 
 **When is a repository "failing"?** When at least one of its last `RUNS_PER_REPO` (default 5)
