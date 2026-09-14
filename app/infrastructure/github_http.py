@@ -744,7 +744,7 @@ class GitHubHttpApi:
         return [_run_from_json(r) for r in response.json().get("workflow_runs", [])]
 
     async def list_run_durations(
-        self, token: str, owner: str, name: str, since: datetime
+        self, token: str, owner: str, name: str, since: datetime, max_pages: int | None = None
     ) -> RepoUsage:
         """Wall-clock CI time of `owner/name`'s workflow runs created on/after `since`.
 
@@ -752,12 +752,17 @@ class GitHubHttpApi:
         with no new runs since the last refresh answers `304` and costs nothing. Unlike
         `list_recent_runs`, an unavailable Actions tab (404/403) is not an error here - the
         caller just gets a zero `RepoUsage`, same as `fetch_actions_usage`.
+
+        `max_pages` bounds the cost per repository; the caller spends more of it on private
+        repositories, because only those consume the account's Actions quota and the figure is
+        worthless as a lower bound there.
         """
+        pages = _RUN_DURATIONS_MAX_PAGES if max_pages is None else max(1, max_pages)
         context = f"run durations {owner}/{name}"
         since_filter = f">={since.strftime('%Y-%m-%d')}"
         runs: list[dict[str, Any]] = []
         total_count = 0
-        for page in range(1, _RUN_DURATIONS_MAX_PAGES + 1):
+        for page in range(1, pages + 1):
             params: dict[str, Any] = {"created": since_filter, "per_page": _RUN_DURATIONS_PAGE_SIZE}
             if page > 1:
                 params["page"] = page
@@ -779,7 +784,7 @@ class GitHubHttpApi:
                 break
 
         seconds = sum(_run_from_json(r).duration_seconds for r in runs)
-        truncated = total_count > _RUN_DURATIONS_PAGE_SIZE * _RUN_DURATIONS_MAX_PAGES
+        truncated = total_count > _RUN_DURATIONS_PAGE_SIZE * pages
         return RepoUsage(seconds=seconds, runs=len(runs), truncated=truncated)
 
     async def list_failed_jobs(

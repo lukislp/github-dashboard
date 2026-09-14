@@ -332,6 +332,7 @@ class FakeApi:
         self.actions_usage_error: Exception | None = None
         self.usage_by_repo = usage_by_repo or {}
         self.usage_calls: list[tuple[str, datetime]] = []
+        self.usage_pages: dict[str, int | None] = {}
         self.usage_error: Exception | None = None
 
     async def list_repositories(self, token: str) -> RepositoryPage:
@@ -403,10 +404,11 @@ class FakeApi:
         return self.actions_usage_value
 
     async def list_run_durations(
-        self, token: str, owner: str, name: str, since: datetime
+        self, token: str, owner: str, name: str, since: datetime, max_pages: int | None = None
     ) -> RepoUsage:
         full = f"{owner}/{name}"
         self.usage_calls.append((full, since))
+        self.usage_pages[full] = max_pages
         if self.usage_error is not None:
             raise self.usage_error
         return self.usage_by_repo.get(full, RepoUsage(seconds=0, runs=0, truncated=False))

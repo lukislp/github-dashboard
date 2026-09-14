@@ -497,7 +497,11 @@ class GetOverview:
                 return _EMPTY_USAGE
         async with semaphore:
             try:
-                return await self.api.list_run_durations(token, repo.owner, repo.name, since)
+                # Private repositories are the only ones that consume the Actions quota, and
+                # a lower bound is useless when the whole point is "how much am I using". They
+                # are also few, so they get five times the page budget of a public repository.
+                pages = 10 if repo.is_private else 2
+                return await self.api.list_run_durations(token, repo.owner, repo.name, since, pages)
             except AuthenticationError:
                 raise
             except (RateLimited, GitHubUnavailable) as exc:

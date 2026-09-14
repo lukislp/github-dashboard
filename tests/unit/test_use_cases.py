@@ -1158,3 +1158,22 @@ async def test_list_repo_items_forwards_next_cursor():
     page = await build_list_items_uc(api, sessions)(record, "octocat", "a", "pull_requests", None)
 
     assert page.next_cursor == "next-page"
+
+
+async def test_private_repositories_get_a_deeper_run_history_than_public_ones():
+    """Only private repositories consume the Actions quota, so a capped lower bound is useless
+    there - they are also few, which is why they may cost more requests than public ones."""
+    api = FakeApi(
+        repos=[make_repo("secret", private=True), make_repo("open")],
+        hygiene_by_repo={
+            "octocat/secret": make_hygiene_facts(),
+            "octocat/open": make_hygiene_facts(),
+        },
+    )
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    await build_overview_uc(api, sessions, cache)(record)
+
+    assert api.usage_pages["octocat/secret"] == 10
+    assert api.usage_pages["octocat/open"] == 2

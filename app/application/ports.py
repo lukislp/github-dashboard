@@ -212,7 +212,7 @@ class GitHubApi(Protocol):
         ...
 
     async def list_run_durations(
-        self, token: str, owner: str, name: str, since: datetime
+        self, token: str, owner: str, name: str, since: datetime, max_pages: int | None = None
     ) -> RepoUsage:
         """Observed wall-clock CI time of one repository's workflow runs created since `since`.
 
