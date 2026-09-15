@@ -19,7 +19,7 @@ small - but it is the same for every change, including the maintainer's own.
 - **Conventional Commits.** The version and the changelog are generated from the commit messages
   (`feat:` = minor release, `fix:` = patch release, `build:`/`ci:`/`docs:`/`test:` = no release).
   Squash-merge keeps the PR title as the commit message, so give the PR a Conventional Commit
-  title. Commit messages are plain English without tool or AI attribution.
+  title.
 - **Tests for new functionality.** New features and bug fixes come with tests under `tests/`
   (`tests/unit`, `tests/integration`, and `tests/contract` for the real GitHub API). A PR that
   adds behaviour without a test is asked to add one.
