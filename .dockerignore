@@ -3,6 +3,8 @@
 .env
 data
 tests
+fuzz
+requirements_fuzz.*
 k8s
 docs
 .github

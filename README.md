@@ -298,9 +298,22 @@ happens to see traffic for.
 ## Development
 
 ```bash
-uv run ruff check app tests && uv run ruff format --check app tests
+uv run ruff check app tests fuzz && uv run ruff format --check app tests fuzz
 uv run pytest -q
 GH_TOKEN=$(gh auth token) uv run pytest -q tests/contract   # optional live check
+```
+
+`fuzz/fuzz_parsers.py` is an [Atheris](https://github.com/google/atheris) harness over the code
+that turns outside input into domain objects - the environment loader in
+`app/infrastructure/settings.py` and the encoders/decoders in `app/domain/codec.py`. It asserts
+the bounds `Settings.from_env` documents, that the codec round trips, and that the decoders
+reject a corrupted cache entry by raising something the callers already handle. CI runs it for
+30 seconds on every push; to run it locally (Linux only - there is no atheris wheel for
+Windows):
+
+```bash
+pip install --require-hashes -r requirements_fuzz.txt
+PYTHONPATH=. python fuzz/fuzz_parsers.py -max_total_time=60
 ```
 
 ## Releases and images
