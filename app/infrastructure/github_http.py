@@ -176,6 +176,7 @@ query Hygiene($ids: [ID!]!, $refsPageSize: Int!) {
       deleteBranchOnMerge
       branchProtectionRules(first: 1) { totalCount }
       rulesets(first: 1) { totalCount }
+      collaborators(first: 1) { totalCount }
       workflowsDir: object(expression: "HEAD:.github/workflows") {
         ... on Tree { entries { name } }
       }
@@ -1063,6 +1064,15 @@ def _hygiene_facts_from_node(node: dict[str, Any]) -> HygieneFacts:
     # `rulesets` can come back nulled out by a partial GraphQL error for tokens/plans that
     # don't expose it; treat that the same as "no rulesets configured".
     rulesets = node.get("rulesets") or {}
+    # `collaborators` needs push access and is nulled out by a partial GraphQL error
+    # otherwise. Unlike `rulesets` that is not the same as "zero": keep it as None so
+    # `assess_hygiene` can tell "nobody else has access" from "we were not told".
+    collaborators = node.get("collaborators")
+    collaborator_count = (
+        int(collaborators["totalCount"])
+        if collaborators and collaborators.get("totalCount") is not None
+        else None
+    )
     return HygieneFacts(
         has_readme=node.get("readmeFile") is not None,
         has_license=node.get("licenseInfo") is not None,
@@ -1085,6 +1095,7 @@ def _hygiene_facts_from_node(node: dict[str, Any]) -> HygieneFacts:
         has_codeowners=(
             node.get("codeownersFile") is not None or node.get("codeownersFileGithub") is not None
         ),
+        collaborator_count=collaborator_count,
         is_fork=bool(node.get("isFork", False)),
     )
 

@@ -34,9 +34,9 @@ The five runs are drawn as a small history strip in the table; hover shows workf
 
 ### Repository hygiene
 
-Each non-archived, non-forked repository gets a hygiene score (0-100%) from nine checks, read
-from a second, separately batched GraphQL query (`nodes(ids: ...)`, 25 repositories per
-request) that runs concurrently with the per-repository REST calls, under the same
+Each non-archived, non-forked repository gets a hygiene score (0-100%) from up to nine
+checks, read from a second, separately batched GraphQL query (`nodes(ids: ...)`, 25
+repositories per request) that runs concurrently with the per-repository REST calls, under the same
 concurrency limit. Keeping it out of the main repositories query means a slow or failing
 hygiene lookup can never take down the rest of the overview (see "Architecture" below):
 
@@ -49,9 +49,18 @@ hygiene lookup can never take down the rest of the overview (see "Architecture" 
 6. **vulnerability_alerts** - Dependabot alerts are enabled for the repository.
 7. **delete_branch_on_merge** - merged branches are deleted automatically.
 8. **security_policy** - a `SECURITY.md` exists (root or `.github/`).
-9. **codeowners** - a `CODEOWNERS` file exists (root or `.github/`).
+9. **codeowners** - a `CODEOWNERS` file exists (root or `.github/`). **Conditional**: this
+   check is only evaluated for repositories more than one person can contribute to (GitHub's
+   `collaborators` count is above one). A CODEOWNERS file only does one thing - request a
+   review automatically when *someone else* opens a pull request - and GitHub never requests a
+   review from a pull request's own author, so in a one-person repository the file would sit
+   there with no effect. Where the check does not apply it is left out of the check list
+   entirely, so it counts in neither the numerator nor the denominator of the score. This is
+   not a way to hide a failing check: the other eight always apply, and `codeowners` returns
+   by itself as soon as a second person has access. If GitHub does not report the collaborator
+   count (the field needs push access), the check is skipped rather than guessed.
 
-Archived repositories and forks still have all nine checks computed but are marked "not
+Archived repositories and forks still have their checks computed but are marked "not
 applicable" with a fixed score of 100, so the UI can grey them out instead of penalising them
 (archived repositories are skipped from the hygiene query entirely; forks are still fetched,
 since applicability there depends on a field the query itself returns). Set
