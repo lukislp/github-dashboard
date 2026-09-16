@@ -1,3 +1,10 @@
+# [1.5.0](https://github.com/lukislp/github-dashboard/compare/v1.4.2...v1.5.0) (2026-09-16)
+
+
+### Features
+
+* **fuzz:** add an Atheris harness over the settings loader and the codec ([#22](https://github.com/lukislp/github-dashboard/issues/22)) ([2386327](https://github.com/lukislp/github-dashboard/commit/2386327634b943cc0b02cc1a6ff475be6922b4dc))
+
 ## [1.4.2](https://github.com/lukislp/github-dashboard/compare/v1.4.1...v1.4.2) (2026-09-14)
 
 
