@@ -137,6 +137,7 @@ def hygiene_node(
         "deleteBranchOnMerge": True,
         "branchProtectionRules": {"totalCount": 1},
         "rulesets": {"totalCount": 0},
+        "collaborators": {"totalCount": 1},
         "workflowsDir": {"entries": [{"name": "ci.yml"}]},
         "dependabotYml": {"id": "1"},
         "dependabotYaml": None,
@@ -447,6 +448,31 @@ async def test_fetch_hygiene_facts_default_to_failing_when_files_are_missing(cli
     assert hygiene.branch_protection_rule_count == 0
     assert hygiene.has_security_policy is False
     assert hygiene.has_codeowners is False
+
+
+@respx.mock
+async def test_fetch_hygiene_reads_the_collaborator_count(client):
+    node = hygiene_node("a")
+    node["collaborators"] = {"totalCount": 3}
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=hygiene_response([node]))
+    )
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1"])
+
+    assert page.hygiene_by_repo["octocat/a"].collaborator_count == 3
+
+
+@respx.mock
+async def test_fetch_hygiene_collaborators_partial_error_stays_unknown(client):
+    """`collaborators` needs push access; a nulled field must not read as "zero people"."""
+    node = hygiene_node("a")
+    node["collaborators"] = None
+    respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(200, json=hygiene_response([node]))
+    )
+    page = await GitHubHttpApi(client, api_url=API).fetch_hygiene("tok", ["id1"])
+
+    assert page.hygiene_by_repo["octocat/a"].collaborator_count is None
 
 
 @respx.mock

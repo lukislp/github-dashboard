@@ -14,6 +14,7 @@ def _facts(**overrides) -> HygieneFacts:
         delete_branch_on_merge=True,
         has_security_policy=True,
         has_codeowners=True,
+        collaborator_count=2,
         is_archived=False,
         is_fork=False,
     )
@@ -61,6 +62,58 @@ def test_partial_failure_rounds_score():
     assert hygiene.passed == 8
     assert hygiene.score == 89
     assert hygiene.failing_keys == ("codeowners",)
+
+
+def test_codeowners_check_is_absent_without_other_contributors():
+    """A one-person repository is not asked for a CODEOWNERS file it cannot use."""
+    hygiene = assess_hygiene(_facts(collaborator_count=1, has_codeowners=False))
+    assert hygiene.total == 8
+    assert "codeowners" not in [c.key for c in hygiene.checks]
+    assert hygiene.failing_keys == ()
+    assert hygiene.score == 100
+
+
+def test_codeowners_check_applies_with_a_second_contributor():
+    hygiene = assess_hygiene(_facts(collaborator_count=2, has_codeowners=False))
+    assert hygiene.total == 9
+    assert hygiene.failing_keys == ("codeowners",)
+
+
+def test_codeowners_check_passes_with_a_second_contributor_and_a_file():
+    hygiene = assess_hygiene(_facts(collaborator_count=2, has_codeowners=True))
+    assert hygiene.total == 9
+    assert hygiene.score == 100
+
+
+def test_unknown_collaborator_count_omits_the_codeowners_check():
+    """GitHub nulls `collaborators` without push access; never demand the file on a guess."""
+    hygiene = assess_hygiene(_facts(collaborator_count=None, has_codeowners=False))
+    assert hygiene.total == 8
+    assert "codeowners" not in [c.key for c in hygiene.checks]
+
+
+def test_dropping_codeowners_does_not_inflate_a_failing_repository():
+    """The other eight checks keep their meaning: all failing is still a score of 0."""
+    hygiene = assess_hygiene(
+        _facts(
+            collaborator_count=1,
+            has_readme=False,
+            has_license=False,
+            workflow_file_count=0,
+            has_dependabot_config=False,
+            has_renovate_config=False,
+            branch_protection_rule_count=0,
+            ruleset_count=0,
+            vulnerability_alerts_enabled=False,
+            delete_branch_on_merge=False,
+            has_security_policy=False,
+            has_codeowners=False,
+        )
+    )
+    assert hygiene.total == 8
+    assert hygiene.passed == 0
+    assert hygiene.score == 0
+    assert hygiene.failing_keys == HYGIENE_KEYS[:-1]
 
 
 def test_archived_repo_is_not_applicable_but_score_is_100():

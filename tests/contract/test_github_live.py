@@ -42,7 +42,8 @@ async def test_live_repositories_and_runs():
         )
 
         # Hygiene facts are computed for every non-archived repository requested; a non-fork
-        # one always has all nine checks evaluated and is marked applicable.
+        # one is marked applicable. The `codeowners` check is conditional, so the total is
+        # eight for a repository nobody else can contribute to and nine otherwise.
         applicable_candidate = next(
             r for r in page.repositories if not r.is_archived and not r.is_fork
         )
@@ -50,7 +51,7 @@ async def test_live_repositories_and_runs():
         assert facts is not None, "hygiene batch for this repository was not recovered"
         hygiene = assess_hygiene(facts)
         assert hygiene.applicable is True
-        assert hygiene.total == 9
+        assert hygiene.total in (8, 9)
         assert 0 <= hygiene.score <= 100
 
         # Branches without a pull request: sanity-check the shape only, since the actual

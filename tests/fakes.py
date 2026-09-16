@@ -108,11 +108,16 @@ def make_hygiene(*, failing: tuple[str, ...] = (), applicable: bool = True) -> R
     return RepoHygiene(checks, applicable=applicable)
 
 
-def make_hygiene_facts(*, failing: tuple[str, ...] = ()) -> HygieneFacts:
+def make_hygiene_facts(
+    *, failing: tuple[str, ...] = (), collaborator_count: int | None = 2
+) -> HygieneFacts:
     """A HygieneFacts where all nine checks pass, except the given failing keys.
 
     `assess_hygiene(make_hygiene_facts(failing=(...)))` is the raw-facts equivalent of
     `make_hygiene(failing=(...))`, for tests that exercise the real `fetch_hygiene` path.
+
+    The default of two collaborators keeps the conditional `codeowners` check in place, so
+    the two helpers stay equivalent; pass 1 for a one-person repository, which drops it.
     """
     return HygieneFacts(
         has_readme="readme" not in failing,
@@ -126,6 +131,7 @@ def make_hygiene_facts(*, failing: tuple[str, ...] = ()) -> HygieneFacts:
         delete_branch_on_merge="delete_branch_on_merge" not in failing,
         has_security_policy="security_policy" not in failing,
         has_codeowners="codeowners" not in failing,
+        collaborator_count=collaborator_count,
     )
 
 

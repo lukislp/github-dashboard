@@ -12,7 +12,7 @@ from app.domain.codec import (
     snapshot_from_dict,
     snapshot_to_dict,
 )
-from app.domain.hygiene import HygieneCheck, RepoHygiene
+from app.domain.hygiene import HygieneCheck, RepoHygiene, assess_hygiene
 from app.domain.models import (
     ActionsUsage,
     AttentionItem,
@@ -39,7 +39,16 @@ from app.domain.models import (
 )
 from app.domain.overview import build_overview, classify_ci
 from app.domain.pull_requests import PrState
-from tests.fakes import NOW, make_branch, make_hygiene, make_issue, make_pr, make_repo, make_run
+from tests.fakes import (
+    NOW,
+    make_branch,
+    make_hygiene,
+    make_hygiene_facts,
+    make_issue,
+    make_pr,
+    make_repo,
+    make_run,
+)
 
 
 def test_overview_roundtrip_through_json():
@@ -448,6 +457,31 @@ def test_hygiene_dict_exposes_score_and_round_trips():
         checks=tuple(HygieneCheck(c["key"], c["ok"], c["detail"]) for c in hygiene["checks"]),
         applicable=True,
     )
+
+
+def test_hygiene_round_trips_when_the_codeowners_check_does_not_apply():
+    """A one-person repository carries eight checks; the payload must survive that."""
+    original = assess_hygiene(make_hygiene_facts(failing=("readme",), collaborator_count=1))
+    assert original.total == 8
+
+    payload = overview_to_dict(
+        build_overview(
+            viewer_login="o",
+            repositories=[make_repo("a")],
+            ci_by_repo={},
+            rate_limit=None,
+            now=NOW,
+            hygiene_by_repo={"octocat/a": original},
+        )
+    )
+    hygiene = payload["repos"][0]["hygiene"]
+    assert hygiene["total"] == 8
+    assert hygiene["passed"] == 7
+    assert hygiene["score"] == 88  # round(100 * 7 / 8)
+    assert "codeowners" not in {c["key"] for c in hygiene["checks"]}
+
+    restored = overview_from_dict(json.loads(json.dumps(payload)))
+    assert restored.repos[0].hygiene == original
 
 
 def test_hygiene_missing_from_payload_defaults_to_not_applicable():
