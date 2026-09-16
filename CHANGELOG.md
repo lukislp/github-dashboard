@@ -1,3 +1,10 @@
+# [1.6.0](https://github.com/lukislp/github-dashboard/compare/v1.5.0...v1.6.0) (2026-09-16)
+
+
+### Features
+
+* **hygiene:** only check CODEOWNERS where other people can contribute ([#23](https://github.com/lukislp/github-dashboard/issues/23)) ([01e580d](https://github.com/lukislp/github-dashboard/commit/01e580d34cee3f4c7f8b08a1a93561fc8545c005))
+
 # [1.5.0](https://github.com/lukislp/github-dashboard/compare/v1.4.2...v1.5.0) (2026-09-16)
 
 
