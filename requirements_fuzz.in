@@ -1,0 +1,4 @@
+# Fuzz harness (fuzz/), Linux only - the atheris wheel does not exist for Windows.
+# requirements_fuzz.txt is hand-pinned to the manylinux wheels for CPython 3.14 and 3.12,
+# because pip-compile would only record the wheel of the Python it runs under.
+atheris>=3.1

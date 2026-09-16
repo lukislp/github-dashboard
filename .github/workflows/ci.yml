@@ -48,8 +48,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --frozen
-      - run: uv run ruff check app tests
-      - run: uv run ruff format --check app tests
+      - run: uv run ruff check app tests fuzz
+      - run: uv run ruff format --check app tests fuzz
 
   test:
     runs-on: ubuntu-latest
@@ -65,6 +65,30 @@ jobs:
           python-version: "3.12"
       - run: uv sync --frozen
       - run: uv run pytest -q
+
+  # Atheris pass over the code that turns outside input into domain objects: the environment
+  # loader and the codec round trips. fuzz/fuzz_parsers.py imports only app.domain and
+  # app.infrastructure.settings, both standard library only, so this job installs atheris and
+  # nothing else - no uv sync, no app dependencies.
+  #
+  # Deliberately NOT a release gate (get-version below does not wait for it), same as the
+  # shared hacs-ci.yml: a fixed fuzz budget is a bounded search for new inputs, not a verdict
+  # on this particular commit. A finding shows up as a red check to act on, not as a blocked
+  # release.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements_fuzz.txt
+      - run: pip install --require-hashes -r requirements_fuzz.txt
+      - run: python fuzz/fuzz_parsers.py -max_total_time=30 -rss_limit_mb=1024
+        env:
+          PYTHONPATH: .
 
   # ---------------------------------------------------------------------
   # Version / image / release - push to main only.
