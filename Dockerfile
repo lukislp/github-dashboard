@@ -14,6 +14,11 @@ ENV PYTHONUNBUFFERED=1 \
 # plain-http port 80 is blocked on some build hosts.
 RUN sed -i 's#http://deb.debian.org#https://deb.debian.org#' /etc/apt/sources.list.d/debian.sources     && apt-get update     && apt-get -y --no-install-recommends upgrade     && apt-get clean     && rm -rf /var/lib/apt/lists/*
 
+# pip is bundled into python:3.12-slim via ensurepip but never invoked anywhere in this
+# image - dependencies are installed exclusively through uv sync below. Removing it here
+# drops its CVEs from the Trivy gate instead of just carrying an unused, vulnerable binary.
+RUN python3 -m pip uninstall --yes --break-system-packages pip setuptools wheel 2>/dev/null || true
+
 COPY --from=uv /uv /uvx /usr/local/bin/
 
 WORKDIR /app
