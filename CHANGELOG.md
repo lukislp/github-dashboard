@@ -1,3 +1,10 @@
+## [1.6.1](https://github.com/lukislp/github-dashboard/compare/v1.6.0...v1.6.1) (2026-09-19)
+
+
+### Bug Fixes
+
+* **docker:** drop the unused pip install to clear its Trivy CVEs ([#27](https://github.com/lukislp/github-dashboard/issues/27)) ([cbd9c51](https://github.com/lukislp/github-dashboard/commit/cbd9c51e423a22e05d9fe946512869dd451dbc7d))
+
 # [1.6.0](https://github.com/lukislp/github-dashboard/compare/v1.5.0...v1.6.0) (2026-09-16)
 
 
