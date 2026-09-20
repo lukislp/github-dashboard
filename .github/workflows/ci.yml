@@ -397,14 +397,14 @@ jobs:
             exit 0
           fi
           git diff --stat
-        - name: Sign and push the image tag bump
-          uses: lukislp/ci-workflows/.github/actions/signed-bot-commit@045f17628d155f7e56c2f6ebdbd473b31e247112 # v1.6.0
-          with:
-            signing-key: ${{ secrets.DEPLOY_SIGNING_KEY }}
-            committer-name: "github-dashboard-deploy"
-            committer-email: "155678024+lukislp@users.noreply.github.com"
-            commit-message: "chore(deploy): image ${{ env.NEXT_VERSION }} [skip ci]"
-            branch: main
+      - name: Sign and push the image tag bump
+        uses: lukislp/ci-workflows/.github/actions/signed-bot-commit@045f17628d155f7e56c2f6ebdbd473b31e247112 # v1.6.0
+        with:
+          signing-key: ${{ secrets.DEPLOY_SIGNING_KEY }}
+          committer-name: "github-dashboard-deploy"
+          committer-email: "155678024+lukislp@users.noreply.github.com"
+          commit-message: "chore(deploy): image ${{ env.NEXT_VERSION }} [skip ci]"
+          branch: main
 
 # secrets: SEMANTIC_RELEASE_DEPLOY_KEY (repository secret, a write-enabled SSH deploy key) is
 # required for get-version/semantic-release/deploy-bump to push to the protected main branch.
