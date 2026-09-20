@@ -1,3 +1,10 @@
+## [1.6.2](https://github.com/lukislp/github-dashboard/compare/v1.6.1...v1.6.2) (2026-09-20)
+
+
+### Bug Fixes
+
+* **docker:** bump astral-sh/uv from 0.12.13 to 0.12.17 ([#28](https://github.com/lukislp/github-dashboard/issues/28)) ([7c5e88c](https://github.com/lukislp/github-dashboard/commit/7c5e88c50ec0a52f79a64da5587c3388299c319f))
+
 ## [1.6.1](https://github.com/lukislp/github-dashboard/compare/v1.6.0...v1.6.1) (2026-09-19)
 
 
