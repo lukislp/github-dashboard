@@ -1,3 +1,11 @@
+## [1.6.3](https://github.com/lukislp/github-dashboard/compare/v1.6.2...v1.6.3) (2026-09-20)
+
+
+### Bug Fixes
+
+* **ci:** bump docker/setup-buildx-action from 4.3.0 to 4.4.1 ([#31](https://github.com/lukislp/github-dashboard/issues/31)) ([20ea4ee](https://github.com/lukislp/github-dashboard/commit/20ea4ee8987399d969bbf1fd3f119e05227eff51))
+* **deps:** bump ruff from 0.16.7 to 0.16.8 ([#29](https://github.com/lukislp/github-dashboard/issues/29)) ([ff1fef9](https://github.com/lukislp/github-dashboard/commit/ff1fef90b820d7abbeed05442dab017d811b08a0))
+
 ## [1.6.2](https://github.com/lukislp/github-dashboard/compare/v1.6.1...v1.6.2) (2026-09-20)
 
 
