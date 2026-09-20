@@ -1,3 +1,10 @@
+## [1.6.4](https://github.com/lukislp/github-dashboard/compare/v1.6.3...v1.6.4) (2026-09-20)
+
+
+### Bug Fixes
+
+* **ci:** bump docker/build-push-action from 7.3.0 to 7.4.0 ([#30](https://github.com/lukislp/github-dashboard/issues/30)) ([c5544d2](https://github.com/lukislp/github-dashboard/commit/c5544d2306708fe632db2183ecc77e58271f47ae))
+
 ## [1.6.3](https://github.com/lukislp/github-dashboard/compare/v1.6.2...v1.6.3) (2026-09-20)
 
 
