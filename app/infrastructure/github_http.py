@@ -898,14 +898,25 @@ class GitHubHttpApi:
         )
 
     async def _graphql(self, token: str, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-        try:
-            response = await self._client.post(
-                f"{self._api_url}/graphql",
-                json={"query": query, "variables": variables},
-                headers=_headers(token),
-            )
-        except httpx.HTTPError as exc:
-            raise GitHubUnavailable("graphql request failed") from exc
+        # The repositories query in particular has grown heavy enough (46 repos, each with
+        # PRs/issues/vulnerability alerts/refs) that GitHub's own GraphQL edge occasionally
+        # times out with a bare 502/503/504 rather than a GraphQL error - the hygiene query
+        # already handles this by splitting its batch, but a plain retry-with-backoff covers
+        # every other caller of this shared helper too. Confirmed live 2026-09-21: 6+
+        # consecutive `list_repositories` calls failed with 502/504 with no retry in between.
+        for attempt in range(3):
+            try:
+                response = await self._client.post(
+                    f"{self._api_url}/graphql",
+                    json={"query": query, "variables": variables},
+                    headers=_headers(token),
+                )
+            except httpx.HTTPError as exc:
+                raise GitHubUnavailable("graphql request failed") from exc
+            if response.status_code in _RETRYABLE_HTTP_STATUSES and attempt < 2:
+                await asyncio.sleep(1 * (attempt + 1))
+                continue
+            break
         _raise_for_status(response, context="graphql")
         payload = response.json()
         errors = payload.get("errors")
