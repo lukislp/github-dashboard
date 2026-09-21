@@ -1,3 +1,10 @@
+## [1.6.5](https://github.com/lukislp/github-dashboard/compare/v1.6.4...v1.6.5) (2026-09-21)
+
+
+### Bug Fixes
+
+* **github:** retry the graphql helper on a transient 502/503/504 ([#35](https://github.com/lukislp/github-dashboard/issues/35)) ([66bb2cb](https://github.com/lukislp/github-dashboard/commit/66bb2cba2106991ea9958446eac160851eade903))
+
 ## [1.6.4](https://github.com/lukislp/github-dashboard/compare/v1.6.3...v1.6.4) (2026-09-20)
 
 
