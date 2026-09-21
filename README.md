@@ -329,7 +329,8 @@ PYTHONPATH=. python fuzz/fuzz_parsers.py -max_total_time=60
 
 Versions are cut by [semantic-release](https://semantic-release.gitbook.io/) from
 [Conventional Commit](https://www.conventionalcommits.org/) messages on `main` - see
-[CHANGELOG.md](CHANGELOG.md) for the generated history. Each release publishes a multi-arch
+[the Releases page](https://github.com/lukislp/github-dashboard/releases) for the generated
+history. Each release publishes a multi-arch
 (`linux/amd64` + `linux/arm64`) image to `ghcr.io/lukislp/github-dashboard`, tagged `latest` and
 `vX.Y.Z`, with an SBOM and SLSA provenance attestation attached and a Sigstore keyless signature
 on the manifest. Verify it before pulling:
