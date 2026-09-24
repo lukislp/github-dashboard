@@ -126,7 +126,7 @@ jobs:
       # GITHUB_TOKEN https remote exactly as before. Needed in get-version too:
       # @semantic-release/git's verifyConditions runs `git push --dry-run` even in dry-run mode.
       - name: Push as the semantic-release deploy key (if configured)
-        uses: lukislp/ci-workflows/.github/actions/deploy-key-push@045f17628d155f7e56c2f6ebdbd473b31e247112 # v1.6.0
+        uses: lukislp/ci-workflows/.github/actions/deploy-key-push@a5f01cccfa7a63023b5a2f67993f771d856c0ee4 # v1.7.1
         with:
           deploy-key: ${{ secrets.SEMANTIC_RELEASE_DEPLOY_KEY }}
       - id: semrel
@@ -332,7 +332,7 @@ jobs:
           fetch-depth: 0
           ref: main
       - name: Push as the semantic-release deploy key (if configured)
-        uses: lukislp/ci-workflows/.github/actions/deploy-key-push@045f17628d155f7e56c2f6ebdbd473b31e247112 # v1.6.0
+        uses: lukislp/ci-workflows/.github/actions/deploy-key-push@a5f01cccfa7a63023b5a2f67993f771d856c0ee4 # v1.7.1
         with:
           deploy-key: ${{ secrets.SEMANTIC_RELEASE_DEPLOY_KEY }}
       - id: semrel
@@ -382,7 +382,7 @@ jobs:
       # Same deploy-key push as the release jobs - the default branch only takes direct pushes
       # from that key, so this job cannot fall back to GITHUB_TOKEN.
       - name: Push as the semantic-release deploy key
-        uses: lukislp/ci-workflows/.github/actions/deploy-key-push@045f17628d155f7e56c2f6ebdbd473b31e247112 # v1.6.0
+        uses: lukislp/ci-workflows/.github/actions/deploy-key-push@a5f01cccfa7a63023b5a2f67993f771d856c0ee4 # v1.7.1
         with:
           deploy-key: ${{ secrets.SEMANTIC_RELEASE_DEPLOY_KEY }}
           required: "true"
