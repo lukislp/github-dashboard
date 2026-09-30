@@ -150,16 +150,22 @@ A refresh is never all-or-nothing:
   copy for seven days beyond `CACHE_TTL_SECONDS`. For 30 seconds after such a failure,
   non-forced requests reuse that outcome rather than starting yet another refresh; the
   *Refresh* button always forces a new attempt.
-- **Progressive loading.** `GET /api/overview?progressive=1` answers immediately with whatever
-  the running refresh has delivered so far; `pending` lists the sections still missing
-  (`repositories` first - nothing is shown before that query is in - then the rest, fetched
-  concurrently), and the page polls every 1.5 s, rendering each answer, until it is empty. A
-  cell whose data is still on its way shows a loading marker rather than "unavailable", and
-  "Changes since your last visit" is only computed and marked seen once the overview is
-  complete. The refresh runs as one task per user and process; `/api/seen` and the background
-  warm-up always wait for it to complete. With several replicas behind a non-sticky load
-  balancer, a poll may land on a replica that is not running the refresh and is then answered
-  from the shared cache once it has completed.
+- **Progressive loading.** `GET /api/overview/stream` (server-sent events) pushes one
+  `overview` event - the same body as `GET /api/overview` - every time a part of the running
+  refresh has come back from GitHub, the moment it has: the repositories first (nothing is
+  shown before that query is in), then each repository's runs/alerts/release as its requests
+  return, hygiene, the inbox, notifications and the rest as they land, and finally the
+  complete overview followed by `done` (or `failed` with the error, then `done`). `pending`
+  in each event lists the sections still missing; a cell whose data is still on its way shows
+  a loading marker rather than "unavailable", and "Changes since your last visit" is only
+  computed and marked seen once the overview is complete. A comment line every 15 s keeps
+  proxies from cutting a quiet stream. Where the stream cannot be used, the page falls back
+  to `GET /api/overview?progressive=1`, which answers immediately with the newest state, and
+  polls it every 1.5 s until `pending` is empty. The refresh runs as one task per user and
+  process; `/api/seen` and the background warm-up always wait for it to complete. With
+  several replicas behind a non-sticky load balancer, a stream or poll may land on a replica
+  that is not running the refresh and is then answered from the shared cache once it has
+  completed.
 
 ## Setup
 

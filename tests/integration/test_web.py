@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
@@ -18,6 +19,7 @@ from app.domain.models import RunStatus
 from app.infrastructure.settings import Settings
 from app.main import create_app
 from app.web.container import Container
+from app.web.routes_api import _with_heartbeat
 from app.web.security import SESSION_COOKIE, STATE_COOKIE
 from tests.fakes import (
     FakeApi,
@@ -529,3 +531,106 @@ def test_bundled_fonts_are_served_with_the_right_media_type(client):
     response = client.get("/static/fonts/ibm-plex-sans-400-latin.woff2")
     assert response.status_code == 200
     assert response.headers["content-type"] == "font/woff2"
+
+
+# -- server-sent events -------------------------------------------------------------------------
+
+
+def _read_events(
+    client: TestClient, params: dict[str, str] | None = None
+) -> list[tuple[str, dict]]:
+    """Consume /api/overview/stream to its end and return (event name, parsed data) pairs."""
+    events: list[tuple[str, dict]] = []
+    with client.stream("GET", "/api/overview/stream", params=params) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers["cache-control"] == "no-store"
+        name, data = None, None
+        for line in response.iter_lines():
+            if line.startswith("event: "):
+                name = line[len("event: ") :]
+            elif line.startswith("data: "):
+                data = json.loads(line[len("data: ") :])
+            elif line == "" and name is not None:
+                events.append((name, data))
+                name, data = None, None
+    return events
+
+
+def test_overview_stream_requires_a_session(client):
+    assert client.get("/api/overview/stream").status_code == 401
+
+
+def test_overview_stream_pushes_states_until_complete(client, fakes):
+    sign_in(client)
+
+    events = _read_events(client, {"refresh": "true"})
+
+    names = [name for name, _ in events]
+    assert names[-1] == "done"
+    overviews = [data for name, data in events if name == "overview"]
+    assert overviews, names
+    assert "failed" not in names
+    assert overviews[-1]["pending"] == []
+    assert {r["repository"]["full_name"] for r in overviews[-1]["repos"]} == {
+        "octocat/red",
+        "octocat/green",
+    }
+    assert overviews[-1]["preferences"] == {"groups": [], "favorites": []}
+    assert overviews[-1]["user"]["login"] == "octocat"
+    assert fakes["api"].calls == 1
+
+
+def test_overview_stream_serves_a_fresh_cache_as_one_event(client, fakes):
+    sign_in(client)
+    client.get("/api/overview")
+
+    events = _read_events(client)
+
+    assert [name for name, _ in events] == ["overview", "done"]
+    assert events[0][1]["from_cache"] is True
+    assert fakes["api"].calls == 1
+
+
+def test_overview_stream_reports_a_failed_refresh(client, fakes):
+    sign_in(client)
+    fakes["api"].list_repositories_error = GitHubUnavailable("down")
+
+    events = _read_events(client)
+
+    assert events == [("failed", {"error": "github_unavailable"}), ("done", {})]
+
+
+def test_overview_stream_reports_a_revoked_token(client, fakes):
+    sign_in(client)
+    fakes["api"].token_valid = False
+
+    events = _read_events(client)
+
+    assert events == [("failed", {"error": "unauthorized"}), ("done", {})]
+
+
+def test_overview_stream_ends_with_the_stale_fallback(client, fakes):
+    sign_in(client)
+    first = client.get("/api/overview").json()
+    fakes["api"].list_repositories_error = RateLimited("graphql")
+
+    events = _read_events(client, {"refresh": "true"})
+
+    overviews = [data for name, data in events if name == "overview"]
+    assert [name for name, _ in events][-1] == "done"
+    assert overviews[-1]["stale_reason"] == "rate_limited"
+    assert overviews[-1]["generated_at"] == first["generated_at"]
+
+
+async def test_stream_heartbeat_fills_silence_and_passes_events_through():
+    async def slow():
+        yield "event: a\n\n"
+        await asyncio.sleep(0.08)
+        yield "event: b\n\n"
+
+    chunks = [chunk async for chunk in _with_heartbeat(slow(), 0.02)]
+
+    assert chunks[0] == "event: a\n\n"
+    assert chunks[-1] == "event: b\n\n"
+    assert chunks.count(": ping\n\n") >= 2

@@ -7,7 +7,7 @@ import dataclasses
 import logging
 import re
 import secrets
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -271,6 +271,10 @@ class _Refresh:
     started_at: datetime
     task: asyncio.Task[Overview] = field(init=False)
     latest: Overview | None = None
+    # Bumped on every publish; `changed` wakes streaming subscribers (see `GetOverview.stream`)
+    # on each publish and once more when the task is done.
+    version: int = 0
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,6 +377,11 @@ class GetOverview:
 
         def publish(overview: Overview) -> None:
             refresh.latest = overview
+            refresh.version += 1
+            # set() wakes everyone waiting right now; clear() straight after makes the next
+            # wait block until the next publish. Nothing awaits in between, so no wake is lost.
+            refresh.changed.set()
+            refresh.changed.clear()
 
         refresh.task = asyncio.create_task(self._refresh(session, publish))
         refresh.task.add_done_callback(lambda _: self._finish(user_id, refresh))
@@ -382,6 +391,9 @@ class GetOverview:
     def _finish(self, user_id: int, refresh: _Refresh) -> None:
         if self._refreshes.get(user_id) is refresh:
             del self._refreshes[user_id]
+        # Left set: a subscriber arriving from now on must not wait for a publish that will
+        # never come.
+        refresh.changed.set()
         if refresh.task.cancelled():
             return
         # Retrieving the exception here also keeps asyncio from logging "exception was never
@@ -391,6 +403,49 @@ class GetOverview:
             self._failures.pop(user_id, None)
         elif isinstance(error, ApplicationError):
             self._failures[user_id] = _Failure(self.clock(), error)
+
+    async def stream(
+        self, session: SessionRecord, *, force_refresh: bool = False
+    ) -> AsyncIterator[OverviewResult]:
+        """Yield the overview as it takes shape: every state the refresh publishes, the moment
+        it is published, ending with the complete overview.
+
+        Same decisions as `__call__`: a fresh cached overview is yielded once without a
+        refresh, a refresh that just failed is not repeated within `failure_cooldown`, and a
+        refresh that fails ends the stream with the stale fallback or raises exactly as
+        `__call__` would (`AuthenticationError`, `RateLimited`, `GitHubUnavailable`). A
+        subscriber that joins a running refresh first gets its newest state, then the rest.
+        """
+        user_id = session.user.id
+        refresh = self._refreshes.get(user_id)
+        if refresh is None and not force_refresh:
+            cached = await self.cache.get(user_id)
+            if cached is not None:
+                yield OverviewResult(cached, from_cache=True)
+                return
+            failure = self._failures.get(user_id)
+            if failure is not None and self.clock() - failure.at < self.failure_cooldown:
+                yield await self._stale_or_raise(user_id, failure.error)
+                return
+        if refresh is None:
+            refresh = self._start(session)
+
+        seen = 0
+        while True:
+            if refresh.version > seen and refresh.latest is not None:
+                seen = refresh.version
+                yield OverviewResult(refresh.latest, from_cache=False)
+            if refresh.task.done():
+                break
+            await refresh.changed.wait()
+
+        if refresh.task.cancelled():
+            raise GitHubUnavailable("refresh cancelled")
+        error = refresh.task.exception()
+        if error is not None:
+            if not isinstance(error, ApplicationError):
+                raise GitHubUnavailable("refresh failed") from error
+            yield await self._stale_or_raise(user_id, error)
 
     async def _complete(
         self, refresh: _Refresh, user_id: int, *, stale_fallback: bool

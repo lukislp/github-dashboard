@@ -1588,10 +1588,82 @@
     }
   }
 
-  // Progressive loading: the server answers each request at once with the newest state of the
-  // running refresh and lists the sections still being fetched in `pending`. We render whatever
-  // has arrived (once the repository list is there) and poll every POLL_MS until `pending` is
-  // empty; only then is the outcome (stale / degraded / fine) reported in the banner.
+  // One state of the running refresh, as the server delivers it (over the event stream or a
+  // poll): render whatever has arrived once the repository list is there, and report the
+  // outcome (stale / degraded / fine) in the banner once nothing is pending any more.
+  // Returns true when this state was the complete one.
+  function applyOverview(data) {
+    const pending = data.pending || [];
+    // While the repository list itself is pending the body is only an empty placeholder.
+    if (!pending.includes("repositories")) {
+      data.runs_per_repo = Math.max(...data.repos.map((r) => r.ci.runs.length), 0) || 5;
+      state.data = data;
+      renderAll();
+    }
+    if (!pending.length) {
+      showOutcomeBanner(data);
+      return true;
+    }
+    setBanner("info", t("loading_sections", { sections: sectionNames(pending) }));
+    return false;
+  }
+
+  // Progressive loading over server-sent events: the server pushes every state of the
+  // running refresh the moment a part has come back from GitHub. Resolves true once the
+  // stream has ended (complete, or a failure it reported), false when the connection could
+  // not be used at all or dropped midway - the caller then falls back to polling, which
+  // picks the still-running refresh up where the stream left it.
+  function loadViaStream(force) {
+    if (typeof EventSource === "undefined") return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const source = new EventSource("/api/overview/stream" + (force ? "?refresh=1" : ""));
+      const finish = (ok) => {
+        source.close();
+        resolve(ok);
+      };
+      source.addEventListener("overview", (event) => {
+        applyOverview(JSON.parse(event.data));
+      });
+      source.addEventListener("failed", (event) => {
+        const body = JSON.parse(event.data);
+        if (body.error === "unauthorized") {
+          window.location.assign("/login?error=expired");
+        } else {
+          setBanner("error", t(body.error === "rate_limited" ? "err_rate_limited" : "err_github"), true);
+        }
+        finish(true);
+      });
+      source.addEventListener("done", () => finish(true));
+      // The built-in error event: refused (e.g. a 401), blocked by a proxy, or dropped.
+      source.onerror = () => finish(false);
+    });
+  }
+
+  // Fallback without the event stream: ask for the newest state every POLL_MS until nothing
+  // is pending any more.
+  async function loadViaPolling(force) {
+    let url = force ? "/api/overview?refresh=1&progressive=1" : "/api/overview?progressive=1";
+    for (;;) {
+      const response = await fetch(url, {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      });
+      if (response.status === 401) {
+        window.location.assign("/login?error=expired");
+        return;
+      }
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        const key = body.error === "rate_limited" ? "err_rate_limited" : "err_github";
+        setBanner("error", t(key), true);
+        return;
+      }
+      if (applyOverview(await response.json())) return;
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+      url = "/api/overview?progressive=1";
+    }
+  }
+
   async function load(force) {
     if (state.loading) return;
     state.loading = true;
@@ -1600,38 +1672,8 @@
     if (!state.data) setBanner("info", t("loading"));
 
     try {
-      let url = force ? "/api/overview?refresh=1&progressive=1" : "/api/overview?progressive=1";
-      for (;;) {
-        const response = await fetch(url, {
-          headers: { Accept: "application/json" },
-          credentials: "same-origin",
-        });
-        if (response.status === 401) {
-          window.location.assign("/login?error=expired");
-          return;
-        }
-        if (!response.ok) {
-          const body = await response.json().catch(() => ({}));
-          const key = body.error === "rate_limited" ? "err_rate_limited" : "err_github";
-          setBanner("error", t(key), true);
-          return;
-        }
-        const data = await response.json();
-        const pending = data.pending || [];
-        // While the repository list itself is pending the body is only an empty placeholder.
-        if (!pending.includes("repositories")) {
-          data.runs_per_repo = Math.max(...data.repos.map((r) => r.ci.runs.length), 0) || 5;
-          state.data = data;
-          renderAll();
-        }
-        if (!pending.length) {
-          showOutcomeBanner(data);
-          return;
-        }
-        setBanner("info", t("loading_sections", { sections: sectionNames(pending) }));
-        await new Promise((resolve) => setTimeout(resolve, POLL_MS));
-        url = "/api/overview?progressive=1";
-      }
+      // A refresh the stream already started is joined by the poll, never started twice.
+      if (!(await loadViaStream(force))) await loadViaPolling(false);
     } catch (_) {
       setBanner("error", t("err_network"), true);
     } finally {
