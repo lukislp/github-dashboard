@@ -1494,3 +1494,128 @@ async def test_get_changes_is_empty_while_the_overview_is_still_pending():
     assert settled.since is not None
     assert in_flight.since is None
     assert in_flight.new_prs == ()
+
+
+# ---------- streaming ----------
+
+
+async def _collect(uc: GetOverview, record, **kwargs) -> list:
+    return [result async for result in uc.stream(record, **kwargs)]
+
+
+async def test_stream_serves_the_fresh_cache_as_a_single_state():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+    await uc(record)
+
+    states = await _collect(uc, record)
+
+    assert len(states) == 1
+    assert states[0].from_cache is True
+    assert api.calls == 1
+
+
+async def test_stream_yields_every_published_state_the_moment_it_lands():
+    api = FakeApi(
+        repos=[make_repo("a"), make_repo("b")],
+        runs={"octocat/a": [make_run(RunStatus.SUCCESS)]},
+        hygiene_by_repo={"octocat/a": make_hygiene_facts(), "octocat/b": make_hygiene_facts()},
+    )
+    api.runs_gate = asyncio.Event()
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+
+    collector = asyncio.create_task(_collect(uc, record, force_refresh=True))
+    await _settle()
+    api.runs_gate.set()
+    states = await collector
+
+    # First state: repositories in, everything else still on its way; last: complete.
+    assert Section.REPOSITORIES not in states[0].overview.pending
+    assert Section.CI in states[0].overview.pending
+    assert states[-1].overview.pending == ()
+    assert len(states) >= 3
+    # Every state is newer than the one before, and every one carries both repositories.
+    versions = [s.overview.generated_at for s in states]
+    assert versions == sorted(versions)
+    assert all(len(s.overview.repos) == 2 for s in states)
+    by_name = {r.repository.full_name: r for r in states[-1].overview.repos}
+    assert by_name["octocat/a"].ci.state == CiState.PASSING
+    assert cache.entries[record.user.id] == states[-1].overview
+    assert api.calls == 1
+
+
+async def test_stream_joining_a_running_refresh_starts_from_its_newest_state():
+    api = FakeApi(repos=[make_repo("a")], runs={"octocat/a": [make_run(RunStatus.SUCCESS)]})
+    api.runs_gate = asyncio.Event()
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+
+    await uc(record, wait=False)  # starts the refresh
+    await _settle()
+    collector = asyncio.create_task(_collect(uc, record))
+    await _settle()
+    api.runs_gate.set()
+    states = await collector
+
+    assert Section.REPOSITORIES not in states[0].overview.pending
+    assert states[-1].overview.pending == ()
+    assert api.calls == 1
+
+
+async def test_stream_ends_with_the_stale_fallback_when_the_refresh_fails():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+    await uc(record)
+    cache.expire(record.user.id)
+    api.list_repositories_error = GitHubUnavailable("down")
+
+    states = await _collect(uc, record)
+
+    assert len(states) == 1
+    assert states[0].overview.stale_reason == StaleReason.GITHUB_UNAVAILABLE
+    assert states[0].from_cache is True
+
+
+async def test_stream_raises_when_the_refresh_fails_and_nothing_was_cached():
+    api = FakeApi(repos=[make_repo("a")], list_repositories_error=RateLimited("graphql"))
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+
+    with pytest.raises(RateLimited):
+        await _collect(uc, record)
+
+
+async def test_stream_raises_for_a_revoked_token_and_deletes_the_session():
+    api = FakeApi(repos=[make_repo("a")])
+    api.token_valid = False
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+
+    with pytest.raises(AuthenticationError):
+        await _collect(uc, record)
+    assert sessions.records == {}
+
+
+async def test_stream_respects_the_failure_cooldown():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+    await uc(record)
+    cache.expire(record.user.id)
+    api.list_repositories_error = GitHubUnavailable("down")
+    await _collect(uc, record)
+
+    again = await _collect(uc, record)
+
+    assert api.calls == 2
+    assert again[0].overview.stale_reason == StaleReason.GITHUB_UNAVAILABLE

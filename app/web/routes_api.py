@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import re
+from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.application.errors import (
     AccessDenied,
@@ -17,6 +21,8 @@ from app.application.errors import (
     RateLimited,
     RunNotRerunnable,
 )
+from app.application.ports import SessionRecord
+from app.application.use_cases import OverviewResult
 from app.domain.codec import (
     changes_to_dict,
     issue_to_dict,
@@ -26,11 +32,18 @@ from app.domain.codec import (
     preferences_to_dict,
     user_to_dict,
 )
+from app.domain.models import Preferences
+from app.web.container import Container
 from app.web.deps import ContainerDep, SameOriginDep, SessionDep
 from app.web.routes_auth import clear_session_cookie
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
+
+# Seconds of silence on the overview stream after which a comment line is sent, so a proxy
+# between the browser and this process never mistakes a long GitHub query for a dead
+# connection (nginx and Cloudflare both cut idle upstreams well after this).
+_STREAM_HEARTBEAT_SECONDS = 15
 
 # Same shape GitHub allows for owner/repo path segments: letters, digits, `.`, `_`, `-`.
 _OWNER_OR_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
@@ -84,8 +97,17 @@ async def overview(
         return JSONResponse({"error": "github_unavailable"}, status_code=502)
 
     preferences = await container.get_preferences(session)
-    changes = await container.get_changes(session, result.overview)
+    body = await _overview_body(container, session, result, preferences)
+    return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
+
+async def _overview_body(
+    container: Container,
+    session: SessionRecord,
+    result: OverviewResult,
+    preferences: Preferences,
+) -> dict[str, Any]:
+    changes = await container.get_changes(session, result.overview)
     body = overview_to_dict(result.overview)
     body["from_cache"] = result.from_cache
     body["cache_ttl_seconds"] = container.settings.cache_ttl_seconds
@@ -93,7 +115,74 @@ async def overview(
     body["user"] = user_to_dict(session.user)
     body["preferences"] = preferences_to_dict(preferences)
     body["changes"] = changes_to_dict(changes)
-    return JSONResponse(body, headers={"Cache-Control": "no-store"})
+    return body
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    """One server-sent event. JSON never contains a raw newline, so one `data:` line is enough."""
+    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+
+async def _with_heartbeat(events: AsyncIterator[str], interval: float) -> AsyncIterator[str]:
+    """Pass `events` through, inserting an SSE comment whenever `interval` seconds pass
+    without one. Cancels the pending read when the consumer goes away."""
+    pending: asyncio.Future[str] | None = None
+    try:
+        while True:
+            pending = asyncio.ensure_future(anext(events))
+            while True:
+                done, _ = await asyncio.wait({pending}, timeout=interval)
+                if done:
+                    break
+                yield ": ping\n\n"
+            try:
+                chunk = pending.result()
+            except StopAsyncIteration:
+                return
+            pending = None
+            yield chunk
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+
+@router.get("/overview/stream", response_model=None)
+async def overview_stream(
+    container: ContainerDep, session: SessionDep, refresh: bool = False
+) -> Response:
+    """The overview as server-sent events, one `overview` event per state the running refresh
+    publishes (same body as `GET /api/overview`), the moment it is published - so a part
+    that has come back from GitHub is on screen right away instead of at the next poll.
+
+    Ends with `done` after the complete overview (or the stale fallback), or with a `failed`
+    event carrying `{"error": "unauthorized" | "rate_limited" | "github_unavailable"}` and then
+    `done`. `refresh=1` forces a new fetch, as for `GET /api/overview`. A comment line is sent
+    every `_STREAM_HEARTBEAT_SECONDS` of silence.
+    """
+    if session is None:
+        return _unauthorized()
+    preferences = await container.get_preferences(session)
+
+    async def events() -> AsyncIterator[str]:
+        try:
+            async for result in container.get_overview.stream(session, force_refresh=refresh):
+                yield _sse(
+                    "overview", await _overview_body(container, session, result, preferences)
+                )
+        except AuthenticationError:
+            yield _sse("failed", {"error": "unauthorized"})
+        except RateLimited:
+            yield _sse("failed", {"error": "rate_limited"})
+        except GitHubUnavailable:
+            log.exception("overview stream failed user=%s", session.user.login)
+            yield _sse("failed", {"error": "github_unavailable"})
+        yield _sse("done", {})
+
+    return StreamingResponse(
+        _with_heartbeat(events(), _STREAM_HEARTBEAT_SECONDS),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/preferences")
