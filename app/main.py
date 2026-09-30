@@ -123,7 +123,9 @@ async def _refresh_active_sessions(container: Container, now: datetime) -> None:
             if session is None:
                 container.activity.forget(session_id)
                 continue
-            await container.get_overview(session, force_refresh=True)
+            # No stale fallback here: the warm-up must surface the failure so a rate limit
+            # stops the cycle instead of quietly serving old data as if it had refreshed.
+            await container.get_overview(session, force_refresh=True, stale_fallback=False)
             refreshed.add(user_id)
         except AuthenticationError:
             container.activity.forget(session_id)

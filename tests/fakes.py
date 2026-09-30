@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from datetime import UTC, datetime, timedelta
 
@@ -318,6 +319,7 @@ class FakeApi:
         # Each entry is the tuple of repository node ids requested by one `fetch_hygiene` call.
         self.hygiene_calls: list[tuple[str, ...]] = []
         self.token_valid = True
+        self.runs_error: Exception | None = None
         self.inbox_error: Exception | None = None
         self.security_error: Exception | None = None
         self.commits_since_error: Exception | None = None
@@ -340,6 +342,9 @@ class FakeApi:
         self.usage_calls: list[tuple[str, datetime]] = []
         self.usage_pages: dict[str, int | None] = {}
         self.usage_error: Exception | None = None
+        # When set, `list_recent_runs` blocks until the event is set - lets a test observe a
+        # progressive refresh while its per-repository stage is still running.
+        self.runs_gate: asyncio.Event | None = None
 
     async def list_repositories(self, token: str) -> RepositoryPage:
         self.calls += 1
@@ -369,8 +374,12 @@ class FakeApi:
     ) -> list[WorkflowRun]:
         full = f"{owner}/{name}"
         self.run_calls.append(full)
+        if self.runs_gate is not None:
+            await self.runs_gate.wait()
         if full in self.unavailable:
             raise ActionsUnavailable("disabled")
+        if self.runs_error is not None:
+            raise self.runs_error
         return self.runs.get(full, [])[:limit]
 
     async def search_inbox(self, token: str) -> Inbox:
@@ -485,16 +494,29 @@ class FakeSessions:
 
 
 class FakeCache:
+    """`entries` holds fresh overviews; `expire(user_id)` moves one to stale-only, as the
+    real caches do once the TTL has passed."""
+
     def __init__(self) -> None:
         self.entries: dict[int, Overview] = {}
+        self.stale: dict[int, Overview] = {}
 
     async def get(self, user_id: int) -> Overview | None:
         return self.entries.get(user_id)
 
+    async def get_stale(self, user_id: int) -> Overview | None:
+        return self.entries.get(user_id) or self.stale.get(user_id)
+
     async def set(self, user_id: int, overview: Overview, ttl_seconds: int) -> None:
         self.entries[user_id] = overview
+        self.stale[user_id] = overview
 
     async def invalidate(self, user_id: int) -> None:
+        self.entries.pop(user_id, None)
+        self.stale.pop(user_id, None)
+
+    def expire(self, user_id: int) -> None:
+        """Simulate the freshness TTL running out: `get` stops, `get_stale` continues."""
         self.entries.pop(user_id, None)
 
 

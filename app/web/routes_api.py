@@ -56,12 +56,25 @@ async def me(session: SessionDep) -> JSONResponse:
 
 @router.get("/overview")
 async def overview(
-    container: ContainerDep, session: SessionDep, refresh: bool = False
+    container: ContainerDep,
+    session: SessionDep,
+    refresh: bool = False,
+    progressive: bool = False,
 ) -> JSONResponse:
+    """The viewer's overview.
+
+    `refresh=1` forces a new fetch from GitHub instead of serving the cache. `progressive=1`
+    answers right away with whatever the current refresh has delivered so far - `pending`
+    in the body lists the sections still missing (an empty list means complete), and the
+    client polls again until it is empty. Without it the request blocks until the overview
+    is complete. Either way, when a refresh fails outright the last complete overview is
+    served with `stale_reason` set (and `from_cache` true) rather than an error, when there
+    is one.
+    """
     if session is None:
         return _unauthorized()
     try:
-        result = await container.get_overview(session, force_refresh=refresh)
+        result = await container.get_overview(session, force_refresh=refresh, wait=not progressive)
     except AuthenticationError:
         return _unauthorized()
     except RateLimited:

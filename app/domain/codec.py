@@ -39,8 +39,10 @@ from app.domain.models import (
     RepoUsage,
     ReviewDecision,
     RunStatus,
+    Section,
     SeverityCounts,
     Snapshot,
+    StaleReason,
     Totals,
     User,
     WorkflowRun,
@@ -549,7 +551,17 @@ def overview_to_dict(overview: Overview) -> dict[str, Any]:
         "notifications_available": overview.notifications_available,
         "actions_usage": actions_usage_to_dict(overview.actions_usage),
         "usage_since": _dt(overview.usage_since),
+        "pending": [section.value for section in overview.pending],
+        "degraded": [section.value for section in overview.degraded],
+        "stale_reason": overview.stale_reason.value if overview.stale_reason else None,
     }
+
+
+def _sections_from_list(values: Any) -> tuple[Section, ...]:
+    """Decode a section list, dropping names this version does not know (a cache entry
+    written by a newer build must not make the whole overview unreadable)."""
+    known = {section.value: section for section in Section}
+    return tuple(known[v] for v in (values or []) if isinstance(v, str) and v in known)
 
 
 def overview_from_dict(d: dict[str, Any]) -> Overview:
@@ -580,6 +592,13 @@ def overview_from_dict(d: dict[str, Any]) -> Overview:
         notifications_available=d.get("notifications_available", False),
         actions_usage=actions_usage_from_dict(d.get("actions_usage")),
         usage_since=_parse_dt(d.get("usage_since")),
+        pending=_sections_from_list(d.get("pending")),
+        degraded=_sections_from_list(d.get("degraded")),
+        stale_reason=(
+            StaleReason(d["stale_reason"])
+            if d.get("stale_reason") in {reason.value for reason in StaleReason}
+            else None
+        ),
     )
 
 

@@ -34,8 +34,10 @@ from app.domain.models import (
     RepoUsage,
     ReviewDecision,
     RunStatus,
+    Section,
     SeverityCounts,
     Snapshot,
+    StaleReason,
 )
 from app.domain.overview import build_overview, classify_ci
 from app.domain.pull_requests import PrState
@@ -579,6 +581,73 @@ def test_notification_dict_round_trips():
     assert payload["notifications"][0]["reason"] == "mention"
     restored = overview_from_dict(json.loads(json.dumps(payload)))
     assert restored.notifications == (notification,)
+
+
+def _plain_overview(**kwargs):
+    return build_overview(
+        viewer_login="o",
+        repositories=[make_repo("a")],
+        ci_by_repo={},
+        rate_limit=None,
+        now=NOW,
+        **kwargs,
+    )
+
+
+def test_overview_dict_exposes_pending_degraded_and_stale_reason_and_round_trips():
+    original = _plain_overview(
+        # Out of declaration order and with a duplicate: the payload is normalised.
+        pending=(Section.HYGIENE, Section.CI, Section.CI),
+        degraded=[Section.INBOX],
+        stale_reason=StaleReason.RATE_LIMITED,
+    )
+    payload = overview_to_dict(original)
+
+    assert payload["pending"] == ["ci", "hygiene"]
+    assert payload["degraded"] == ["inbox"]
+    assert payload["stale_reason"] == "rate_limited"
+
+    restored = overview_from_dict(json.loads(json.dumps(payload)))
+    assert restored == original
+    assert restored.pending == (Section.CI, Section.HYGIENE)
+    assert restored.degraded == (Section.INBOX,)
+    assert restored.stale_reason is StaleReason.RATE_LIMITED
+
+
+def test_overview_dict_defaults_progress_fields_to_empty():
+    payload = overview_to_dict(_plain_overview())
+
+    assert payload["pending"] == []
+    assert payload["degraded"] == []
+    assert payload["stale_reason"] is None
+
+
+def test_overview_from_dict_tolerates_a_cache_entry_without_progress_fields():
+    """A cache entry written before `pending`/`degraded`/`stale_reason` existed."""
+    payload = overview_to_dict(_plain_overview())
+    for key in ("pending", "degraded", "stale_reason"):
+        del payload[key]
+
+    restored = overview_from_dict(json.loads(json.dumps(payload)))
+
+    assert restored.pending == ()
+    assert restored.degraded == ()
+    assert restored.stale_reason is None
+    assert restored == _plain_overview()
+
+
+def test_overview_from_dict_drops_unknown_sections_and_stale_reasons():
+    """A cache entry written by a newer build must not make the overview unreadable."""
+    payload = overview_to_dict(_plain_overview())
+    payload["pending"] = ["ci", "brand_new_section", 7, None]
+    payload["degraded"] = ["not_a_section"]
+    payload["stale_reason"] = "solar_flare"
+
+    restored = overview_from_dict(json.loads(json.dumps(payload)))
+
+    assert restored.pending == (Section.CI,)
+    assert restored.degraded == ()
+    assert restored.stale_reason is None
 
 
 def test_preferences_roundtrip_through_json():

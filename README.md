@@ -73,8 +73,10 @@ account-wide `hygiene_average`, both computed only over applicable repositories.
 502/503/504, or GitHub's `RESOURCE_LIMITS_EXCEEDED` partial error), it is retried once after a
 one-second wait, split into two halves of up to 13 repositories each. A half that still fails
 is dropped for that refresh: its repositories are simply reported as "hygiene not applicable"
-with no branch data, rather than failing the whole overview. An authentication failure or an
-exhausted rate limit still propagates and fails the refresh, same as everywhere else.
+with no branch data, rather than failing the whole overview - and the `hygiene` section is
+listed in `Overview.degraded` (see "Partial results, retries and stale data" below). An
+exhausted rate limit degrades the same way; only an authentication failure still fails the
+refresh.
 
 ### Actions usage
 
@@ -126,6 +128,39 @@ reflects the true total. If a repository's hygiene batch could not be recovered 
 (see "Graceful degradation" above), it is reported with `branch_count` 0 and no branches
 instead.
 
+### Partial results, retries and stale data
+
+A refresh is never all-or-nothing:
+
+- **Retries.** Every read to GitHub, REST and GraphQL alike, is attempted up to three times
+  (waiting one, then two seconds) on a transport failure - a timeout or a dropped connection -
+  or an HTTP 502/503/504. A GraphQL answer of `data: null` whose errors carry no `type` (that
+  is how GitHub reports its own execution timeouts) is retried the same way; typed errors
+  (`NOT_FOUND`, `INSUFFICIENT_SCOPES`, ...) are permanent and are not. The repositories query
+  fetches 25 repositories per page, so a page that fails is small and retried on its own. The
+  one write, re-running failed jobs, is sent exactly once.
+- **Degraded sections.** A part GitHub still cannot deliver - workflow runs, security alerts,
+  release comparison, hygiene, the inbox, notifications, Actions usage, CI time, the failed-job
+  lookup - degrades to its empty default and is named in `Overview.degraded`; the page shows a
+  warning listing those parts (with a retry) instead of a blank error. Only the repositories
+  query itself is fatal.
+- **Stale fallback.** When it is, the last complete overview is served from the cache with
+  `stale_reason` set (`github_unavailable` or `rate_limited`) and `from_cache: true`, so a
+  reload never shows an empty page as long as one refresh ever succeeded. The cache keeps that
+  copy for seven days beyond `CACHE_TTL_SECONDS`. For 30 seconds after such a failure,
+  non-forced requests reuse that outcome rather than starting yet another refresh; the
+  *Refresh* button always forces a new attempt.
+- **Progressive loading.** `GET /api/overview?progressive=1` answers immediately with whatever
+  the running refresh has delivered so far; `pending` lists the sections still missing
+  (`repositories` first - nothing is shown before that query is in - then the rest, fetched
+  concurrently), and the page polls every 1.5 s, rendering each answer, until it is empty. A
+  cell whose data is still on its way shows a loading marker rather than "unavailable", and
+  "Changes since your last visit" is only computed and marked seen once the overview is
+  complete. The refresh runs as one task per user and process; `/api/seen` and the background
+  warm-up always wait for it to complete. With several replicas behind a non-sticky load
+  balancer, a poll may land on a replica that is not running the refresh and is then answered
+  from the shared cache once it has completed.
+
 ## Setup
 
 ### 1. Create a GitHub OAuth App
@@ -155,7 +190,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> SECRET_KEY
 | `BASE_URL` | yes | | Public URL; callback is `<BASE_URL>/auth/callback` |
 | `GITHUB_SCOPES` | no | `repo read:org security_events notifications` | `repo` is needed for private repositories and their runs; `security_events` for code/secret-scanning alerts; `notifications` for the notifications feed |
 | `ALLOWED_LOGINS` | no | *(everyone)* | Comma-separated GitHub logins allowed to sign in |
-| `CACHE_TTL_SECONDS` | no | `120` | How long an overview is served from cache |
+| `CACHE_TTL_SECONDS` | no | `120` | How long an overview is served from cache as fresh (the last complete one is kept for seven days more as a fallback for a failed refresh) |
 | `SESSION_TTL_HOURS` | no | `168` | Login lifetime |
 | `RUNS_PER_REPO` | no | `5` | Recent runs inspected per repository |
 | `MAX_CONCURRENCY` | no | `8` | Parallel GitHub requests per refresh |
@@ -272,7 +307,7 @@ tests/
 ```
 
 Dependencies point inwards only. Repositories with their open PR/issue counts, Dependabot alert
-counts and latest release come from one paginated GraphQL query (50 repositories per page).
+counts and latest release come from one paginated GraphQL query (25 repositories per page).
 Hygiene facts (license/workflows/dependency-update config/branch protection/rulesets/security
 policy/CODEOWNERS) and branches without a pull request come from a second, separately batched
 GraphQL query (`nodes(ids: ...)`, 25 repository ids and 50 branch refs per request), run

@@ -1,9 +1,18 @@
+import asyncio
+import threading
+import time
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.application.errors import AccessDenied, ActionsUnavailable, RunNotRerunnable
+from app.application.errors import (
+    AccessDenied,
+    ActionsUnavailable,
+    GitHubUnavailable,
+    RateLimited,
+    RunNotRerunnable,
+)
 from app.application.ports import RepoItemPage
 from app.domain.models import RunStatus
 from app.infrastructure.settings import Settings
@@ -17,6 +26,7 @@ from tests.fakes import (
     FakeSessions,
     FakeUserState,
     PlainCipher,
+    make_hygiene_facts,
     make_issue,
     make_pr,
     make_repo,
@@ -39,6 +49,11 @@ def fakes():
         runs={
             "octocat/red": [make_run(RunStatus.FAILURE)],
             "octocat/green": [make_run(RunStatus.SUCCESS)],
+        },
+        # Hygiene facts for every live repository, so a normal load degrades nothing.
+        hygiene_by_repo={
+            "octocat/red": make_hygiene_facts(),
+            "octocat/green": make_hygiene_facts(),
         },
     )
     return {
@@ -162,6 +177,105 @@ def test_tampered_cookie_is_ignored(client):
     sign_in(client)
     client.cookies.set(SESSION_COOKIE, "not-a-signed-value")
     assert client.get("/api/me").status_code == 401
+
+
+# -- stale fallback and progressive loading ---------------------------------------------------
+
+
+def test_overview_body_reports_nothing_pending_degraded_or_stale_on_a_normal_load(client):
+    sign_in(client)
+    body = client.get("/api/overview").json()
+
+    assert body["pending"] == []
+    assert body["degraded"] == []
+    assert body["stale_reason"] is None
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [(GitHubUnavailable("down"), "github_unavailable"), (RateLimited("x"), "rate_limited")],
+)
+def test_overview_serves_the_last_complete_overview_when_a_refresh_fails(
+    client, fakes, error, reason
+):
+    sign_in(client)
+    first = client.get("/api/overview")
+    assert first.status_code == 200
+    assert first.json()["stale_reason"] is None
+
+    fakes["api"].list_repositories_error = error
+    response = client.get("/api/overview?refresh=true")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stale_reason"] == reason
+    assert body["from_cache"] is True
+    assert body["pending"] == []
+    assert body["generated_at"] == first.json()["generated_at"]
+    assert body["totals"] == first.json()["totals"]
+
+
+def _poll_until_complete(client: TestClient, response, *, max_polls: int = 50):
+    """Re-request the progressive overview until `pending` is empty or the status is not 200."""
+    for _ in range(max_polls):
+        if response.status_code != 200 or response.json()["pending"] == []:
+            break
+        time.sleep(0.05)
+        response = client.get("/api/overview", params={"progressive": "true"})
+    return response
+
+
+def test_progressive_overview_answers_at_once_and_completes_on_polling(client, fakes):
+    sign_in(client)
+    first = client.get("/api/overview", params={"refresh": "true", "progressive": "true"})
+    assert first.status_code == 200
+    assert first.json()["from_cache"] is False
+
+    final = _poll_until_complete(client, first)
+
+    assert final.status_code == 200
+    body = final.json()
+    assert body["pending"] == []
+    assert body["degraded"] == []
+    assert body["stale_reason"] is None
+    assert sorted(r["repository"]["name"] for r in body["repos"]) == ["green", "red"]
+    assert body["totals"]["failed_runs"] == 1
+    assert fakes["api"].calls == 1  # polling never started a second refresh
+
+
+def test_progressive_overview_reports_the_failure_when_nothing_is_cached(client, fakes):
+    sign_in(client)
+    fakes["api"].list_repositories_error = GitHubUnavailable("down")
+
+    first = client.get("/api/overview", params={"progressive": "true"})
+    final = _poll_until_complete(client, first)
+
+    assert final.status_code == 502
+    assert final.json() == {"error": "github_unavailable"}
+
+
+def test_mark_seen_waits_for_a_running_progressive_refresh(client, fakes):
+    sign_in(client)
+    gate = asyncio.Event()
+    fakes["api"].runs_gate = gate  # holds the refresh at its per-repository stage
+    started = client.get("/api/overview", params={"refresh": "true", "progressive": "true"})
+    assert started.status_code == 200
+    assert "ci" in started.json()["pending"]
+
+    results: list = []
+    poster = threading.Thread(target=lambda: results.append(client.post("/api/seen")))
+    poster.start()
+    time.sleep(0.1)
+    assert poster.is_alive(), "seen must block until the refresh is complete"
+    # Release the refresh from inside the app's event loop; the fake's Event belongs to it.
+    client.portal.call(gate.set)
+    poster.join(timeout=5)
+
+    assert not poster.is_alive()
+    assert results[0].status_code == 200
+    assert "seen_at" in results[0].json()
+    assert fakes["api"].calls == 1
+    assert client.get("/api/overview", params={"progressive": "true"}).json()["pending"] == []
 
 
 # -- per-user state: preferences and changes-since-last-visit -----------------------------

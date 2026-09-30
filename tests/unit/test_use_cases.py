@@ -1,3 +1,5 @@
+import asyncio
+import dataclasses
 from datetime import timedelta
 
 import pytest
@@ -34,9 +36,11 @@ from app.domain.models import (
     RepoGroup,
     RepoUsage,
     RunStatus,
+    Section,
     SeverityCounts,
+    StaleReason,
 )
-from app.domain.overview import month_start
+from app.domain.overview import PENDING_CI_ERROR, month_start
 from tests.fakes import (
     NOW,
     FakeApi,
@@ -722,14 +726,16 @@ async def test_get_overview_hygiene_failure_leaves_overview_intact():
     assert result.overview.repos[0].repository.branches_without_pr == ()
 
 
-async def test_get_overview_hygiene_rate_limited_propagates():
+async def test_get_overview_hygiene_rate_limited_degrades_like_any_other_section():
     api = FakeApi(repos=[make_repo("a")])
     api.hygiene_error = RateLimited("hygiene")
     oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
     record = await build_login(oauth, sessions)("code")
 
-    with pytest.raises(RateLimited):
-        await build_overview_uc(api, sessions, cache)(record)
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.degraded == (Section.HYGIENE,)
+    assert result.overview.repos[0].hygiene == RepoHygiene((), applicable=False)
 
 
 async def test_get_overview_hygiene_authentication_error_propagates():
@@ -1177,3 +1183,314 @@ async def test_private_repositories_get_a_deeper_run_history_than_public_ones():
 
     assert api.usage_pages["octocat/secret"] == 10
     assert api.usage_pages["octocat/open"] == 2
+
+
+# ---------- degraded sections, stale fallback, progressive refresh ----------
+
+
+async def _settle() -> None:
+    """Let a background refresh over in-memory fakes run to its next blocking point."""
+    for _ in range(25):
+        await asyncio.sleep(0)
+
+
+async def test_get_overview_complete_refresh_reports_nothing_pending_or_degraded():
+    api = FakeApi(repos=[make_repo("a")], hygiene_by_repo={"octocat/a": make_hygiene_facts()})
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.pending == ()
+    assert result.overview.degraded == ()
+    assert result.overview.stale_reason is None
+
+
+async def test_get_overview_names_every_section_github_could_not_deliver():
+    # "b" is absent from the hygiene answer, as a dropped batch leaves it: degraded too.
+    api = FakeApi(
+        repos=[make_repo("a"), make_repo("b")],
+        hygiene_by_repo={"octocat/a": make_hygiene_facts()},
+    )
+    api.runs_error = GitHubUnavailable("runs down")
+    api.security_error = GitHubUnavailable("security down")
+    api.inbox_error = GitHubUnavailable("inbox down")
+    api.notifications_error = RateLimited("notifications")
+    api.actions_usage_error = GitHubUnavailable("billing down")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache)(record)
+
+    assert result.overview.degraded == (
+        Section.CI,
+        Section.SECURITY,
+        Section.HYGIENE,
+        Section.INBOX,
+        Section.NOTIFICATIONS,
+        Section.ACTIONS_USAGE,
+    )
+    assert result.overview.pending == ()
+    assert result.overview.stale_reason is None
+    assert {r.ci.error for r in result.overview.repos} == {"github_error"}
+
+
+async def test_get_overview_degrades_release_compare_ci_usage_and_failed_jobs():
+    release = ReleaseInfo(
+        tag="v1.0.0",
+        name=None,
+        published_at=NOW,
+        url="u",
+        is_prerelease=False,
+        unreleased_commits=None,
+    )
+    api = FakeApi(
+        repos=[make_repo("a")],
+        runs={"octocat/a": [make_run(RunStatus.FAILURE)]},
+        release_by_repo={"octocat/a": release},
+    )
+    api.commits_since_error = GitHubUnavailable("compare down")
+    api.usage_error = GitHubUnavailable("usage down")
+    api.failed_jobs_error = RateLimited("jobs")
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    result = await build_overview_uc(api, sessions, cache, hygiene_checks=False)(record)
+
+    assert result.overview.degraded == (
+        Section.RELEASES,
+        Section.CI_USAGE,
+        Section.FAILED_JOBS,
+    )
+
+
+async def test_get_overview_serves_the_last_complete_overview_when_the_refresh_fails():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+    first = await uc(record)
+    cache.expire(record.user.id)
+    api.list_repositories_error = GitHubUnavailable("down")
+
+    second = await uc(record)
+
+    assert second.from_cache is True
+    assert second.overview.stale_reason == StaleReason.GITHUB_UNAVAILABLE
+    assert second.overview.generated_at == first.overview.generated_at
+    assert [r.repository.full_name for r in second.overview.repos] == ["octocat/a"]
+    assert second.overview.pending == ()
+    # The stale copy is served, not re-cached as fresh: the next call tries GitHub again.
+    assert record.user.id not in cache.entries
+
+
+async def test_get_overview_stale_reason_tells_a_rate_limit_apart():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+    await uc(record)
+    api.list_repositories_error = RateLimited("graphql")
+
+    result = await uc(record, force_refresh=True)
+
+    assert result.overview.stale_reason == StaleReason.RATE_LIMITED
+
+
+async def test_get_overview_raises_when_the_refresh_fails_and_nothing_was_ever_cached():
+    api = FakeApi(repos=[make_repo("a")], list_repositories_error=GitHubUnavailable("down"))
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+
+    with pytest.raises(GitHubUnavailable):
+        await build_overview_uc(api, sessions, cache)(record)
+
+
+async def test_get_overview_stale_fallback_can_be_switched_off():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+    await uc(record)
+    api.list_repositories_error = RateLimited("graphql")
+
+    with pytest.raises(RateLimited):
+        await uc(record, force_refresh=True, stale_fallback=False)
+
+
+async def test_get_overview_never_papers_over_a_revoked_token_with_stale_data():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+    await uc(record)
+    api.token_valid = False
+
+    with pytest.raises(AuthenticationError):
+        await uc(record, force_refresh=True)
+    assert sessions.records == {}
+    assert await cache.get_stale(record.user.id) is None
+
+
+async def test_get_overview_does_not_retry_github_within_the_failure_cooldown():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    now = {"t": NOW}
+    uc = GetOverview(
+        api=api,
+        sessions=sessions,
+        ensure_fresh_token=build_ensure_fresh_token(oauth, sessions),
+        cache=cache,
+        cache_ttl_seconds=60,
+        runs_per_repo=5,
+        max_concurrency=2,
+        failure_cooldown=timedelta(seconds=30),
+        clock=lambda: now["t"],
+    )
+    await uc(record)
+    cache.expire(record.user.id)
+    api.list_repositories_error = GitHubUnavailable("down")
+
+    failed = await uc(record)
+    again = await uc(record)
+    assert api.calls == 2  # the second call reused the failure instead of asking GitHub
+    assert failed.overview.stale_reason == again.overview.stale_reason
+    assert again.overview.stale_reason == StaleReason.GITHUB_UNAVAILABLE
+
+    forced = await uc(record, force_refresh=True)
+    assert api.calls == 3  # a forced refresh always tries again
+    assert forced.overview.stale_reason == StaleReason.GITHUB_UNAVAILABLE
+
+    now["t"] = NOW + timedelta(seconds=31)
+    api.list_repositories_error = None
+    fresh = await uc(record)
+    assert api.calls == 4
+    assert fresh.from_cache is False
+    assert fresh.overview.stale_reason is None
+
+
+async def test_get_overview_progressive_returns_placeholder_then_partial_then_complete():
+    api = FakeApi(
+        repos=[make_repo("a"), make_repo("dead", archived=True)],
+        runs={"octocat/a": [make_run(RunStatus.SUCCESS)]},
+        hygiene_by_repo={"octocat/a": make_hygiene_facts()},
+    )
+    api.runs_gate = asyncio.Event()
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+
+    first = await uc(record, wait=False)
+    assert first.overview.pending == tuple(Section)
+    assert first.overview.repos == ()
+    assert first.from_cache is False
+
+    await _settle()
+    partial = await uc(record, wait=False)
+    assert Section.REPOSITORIES not in partial.overview.pending
+    assert Section.CI in partial.overview.pending
+    assert Section.INBOX not in partial.overview.pending
+    assert Section.HYGIENE not in partial.overview.pending
+    by_name = {r.repository.full_name: r for r in partial.overview.repos}
+    assert by_name["octocat/a"].ci.error == PENDING_CI_ERROR
+    assert by_name["octocat/dead"].ci.state == CiState.SKIPPED
+    assert by_name["octocat/a"].hygiene.applicable is True
+    assert api.calls == 1
+
+    api.runs_gate.set()
+    complete = await uc(record)  # wait=True joins the running refresh
+    assert complete.overview.pending == ()
+    assert complete.from_cache is False
+    by_name = {r.repository.full_name: r for r in complete.overview.repos}
+    assert by_name["octocat/a"].ci.state == CiState.PASSING
+    assert cache.entries[record.user.id] == complete.overview
+    assert api.calls == 1
+
+    await _settle()
+    cached = await uc(record, wait=False)
+    assert cached.from_cache is True
+    assert cached.overview == complete.overview
+
+
+async def test_get_overview_progressive_serves_the_fresh_cache_without_a_refresh():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+    await uc(record)
+
+    result = await uc(record, wait=False)
+
+    assert result.from_cache is True
+    assert result.overview.pending == ()
+    assert api.calls == 1
+
+
+async def test_get_overview_progressive_failure_yields_stale_data_without_a_refetch_loop():
+    api = FakeApi(repos=[make_repo("a")])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+    await uc(record)
+    cache.expire(record.user.id)
+    api.list_repositories_error = GitHubUnavailable("down")
+
+    started = await uc(record, wait=False)
+    assert started.overview.pending
+    await _settle()
+    after = await uc(record, wait=False)
+    assert after.overview.stale_reason == StaleReason.GITHUB_UNAVAILABLE
+    assert after.overview.pending == ()
+    assert api.calls == 2
+
+    again = await uc(record, wait=False)
+    assert again.overview.stale_reason == StaleReason.GITHUB_UNAVAILABLE
+    assert api.calls == 2
+
+
+async def test_get_overview_progressive_failure_without_cache_raises_once_settled():
+    api = FakeApi(repos=[make_repo("a")], list_repositories_error=GitHubUnavailable("down"))
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+
+    await uc(record, wait=False)
+    await _settle()
+    with pytest.raises(GitHubUnavailable):
+        await uc(record, wait=False)
+    assert api.calls == 1
+
+
+async def test_get_overview_progressive_revoked_token_raises_and_deletes_the_session():
+    api = FakeApi(repos=[make_repo("a")])
+    api.token_valid = False
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    uc = build_overview_uc(api, sessions, cache)
+
+    await uc(record, wait=False)
+    await _settle()
+    with pytest.raises(AuthenticationError):
+        await uc(record, wait=False)
+    assert sessions.records == {}
+
+
+async def test_get_changes_is_empty_while_the_overview_is_still_pending():
+    api = FakeApi(repos=[make_repo("a", prs=1)])
+    oauth, sessions, cache = FakeOAuth(), FakeSessions(), FakeCache()
+    record = await build_login(oauth, sessions)("code")
+    user_state = FakeUserState()
+    complete = (await build_overview_uc(api, sessions, cache)(record)).overview
+    await MarkSeen(user_state=user_state, clock=clock)(record, complete)
+    api.repos = [make_repo("a", prs=2)]
+    newer = (await build_overview_uc(api, sessions, cache)(record, force_refresh=True)).overview
+
+    settled = await GetChanges(user_state=user_state)(record, newer)
+    in_flight = await GetChanges(user_state=user_state)(
+        record, dataclasses.replace(newer, pending=(Section.CI,))
+    )
+
+    assert settled.since is not None
+    assert in_flight.since is None
+    assert in_flight.new_prs == ()

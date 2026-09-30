@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
@@ -58,7 +58,9 @@ _API_VERSION = "2022-11-28"
 # `rateLimit.cost` of only ~13); splitting it keeps this query small and fast, and isolates
 # hygiene's cost/latency and failure modes so a hygiene hiccup can never take the whole
 # overview down.
-_PAGE_SIZE = 50
+# Halved from 50 in 2026-09: the smaller each page, the less often GitHub's GraphQL edge
+# times out on it, and a page that fails is retried on its own (see `_graphql`).
+_PAGE_SIZE = 25
 _PR_DETAIL_ITEMS = 20
 _ISSUE_DETAIL_ITEMS = 10
 _WORKFLOW_FILE_SUFFIXES = (".yml", ".yaml")
@@ -68,6 +70,11 @@ _HYGIENE_BATCH_SIZE = 25
 # reintroducing the resource-limit problems the split was meant to fix.
 _REFS_PAGE_SIZE = 50
 _RETRYABLE_HTTP_STATUSES = frozenset({502, 503, 504})
+# Attempts per request (transport failures and the statuses above), and the waits between
+# them. GitHub's GraphQL edge answers a heavy query with a bare 502/504 or drops the
+# connection often enough that one immediate failure must not fail a whole refresh.
+_RETRY_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
 # `list_run_durations`: at most two pages of 100 runs (GitHub's REST page-size cap), so at
 # most 200 runs are ever inspected per repository per month.
 _RUN_DURATIONS_PAGE_SIZE = 100
@@ -504,13 +511,53 @@ class GitHubHttpOAuth:
             raise GitHubUnavailable(f"token revocation: HTTP {response.status_code}")
 
 
+Sleep = Callable[[float], Awaitable[None]]
+
+
 class GitHubHttpApi:
     def __init__(
-        self, client: httpx.AsyncClient, *, api_url: str, cache: ConditionalCache | None = None
+        self,
+        client: httpx.AsyncClient,
+        *,
+        api_url: str,
+        cache: ConditionalCache | None = None,
+        sleep: Sleep = asyncio.sleep,
     ) -> None:
         self._client = client
         self._api_url = api_url
         self._cache = cache if cache is not None else ConditionalCache()
+        # Injectable so tests exercise the retry paths without waiting out the backoff.
+        self._sleep = sleep
+
+    async def _send(
+        self,
+        request: Callable[[], Awaitable[httpx.Response]],
+        *,
+        context: str,
+        retry_statuses: frozenset[int] = _RETRYABLE_HTTP_STATUSES,
+    ) -> httpx.Response:
+        """Send one request, retrying a transport failure (timeout, dropped connection) or
+        a status in `retry_statuses` up to `_RETRY_ATTEMPTS` times with backoff.
+
+        Only used for reads; the one write (`rerun_failed_jobs`) is sent exactly once. A
+        transport failure on the last attempt becomes `GitHubUnavailable`; a retryable
+        status on the last attempt is returned for the caller's usual status handling."""
+        for attempt in range(_RETRY_ATTEMPTS):
+            last = attempt + 1 >= _RETRY_ATTEMPTS
+            try:
+                response = await request()
+            except httpx.TransportError as exc:
+                if last:
+                    raise GitHubUnavailable(context) from exc
+                log.warning("%s: %s, retrying", context, type(exc).__name__)
+            except httpx.HTTPError as exc:
+                raise GitHubUnavailable(context) from exc
+            else:
+                if response.status_code not in retry_statuses or last:
+                    return response
+                log.warning("%s: HTTP %d, retrying", context, response.status_code)
+            await self._sleep(_RETRY_BACKOFF_SECONDS[min(attempt, len(_RETRY_BACKOFF_SECONDS) - 1)])
+        raise AssertionError("unreachable")
 
     async def _conditional_get(
         self, token: str, url: str, *, params: dict[str, Any] | None = None, context: str
@@ -530,10 +577,9 @@ class GitHubHttpApi:
         headers = _headers(token)
         if cached is not None:
             headers["If-None-Match"] = cached[0]
-        try:
-            response = await self._client.get(url, params=params, headers=headers)
-        except httpx.HTTPError as exc:
-            raise GitHubUnavailable(context) from exc
+        response = await self._send(
+            lambda: self._client.get(url, params=params, headers=headers), context=context
+        )
         if response.status_code == 304:
             if cached is None:
                 # Cannot happen unless GitHub answers 304 to a request that carried no
@@ -616,7 +662,7 @@ class GitHubHttpApi:
         try:
             nodes = await self._hygiene_nodes_once(token, ids)
         except _RetryableHygieneError:
-            await asyncio.sleep(1)
+            await self._sleep(1)
             return await self._fetch_hygiene_split(token, ids)
         return _hygiene_from_nodes(nodes)
 
@@ -643,17 +689,20 @@ class GitHubHttpApi:
         return hygiene_by_repo, branches_by_repo
 
     async def _hygiene_nodes_once(self, token: str, ids: list[str]) -> list[dict[str, Any]]:
-        try:
-            response = await self._client.post(
+        # Transport failures are retried in place; a 502/503/504 is left to the caller's
+        # split-and-retry, since a smaller batch is the better second attempt for this query.
+        response = await self._send(
+            lambda: self._client.post(
                 f"{self._api_url}/graphql",
                 json={
                     "query": _HYGIENE_QUERY,
                     "variables": {"ids": ids, "refsPageSize": _REFS_PAGE_SIZE},
                 },
                 headers=_headers(token),
-            )
-        except httpx.HTTPError as exc:
-            raise GitHubUnavailable("hygiene graphql request failed") from exc
+            ),
+            context="hygiene graphql request failed",
+            retry_statuses=frozenset(),
+        )
         if response.status_code in _RETRYABLE_HTTP_STATUSES:
             raise _RetryableHygieneError(f"HTTP {response.status_code}")
         _raise_for_status(response, context="hygiene graphql")
@@ -898,37 +947,49 @@ class GitHubHttpApi:
         )
 
     async def _graphql(self, token: str, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-        # The repositories query in particular has grown heavy enough (46 repos, each with
-        # PRs/issues/vulnerability alerts/refs) that GitHub's own GraphQL edge occasionally
-        # times out with a bare 502/503/504 rather than a GraphQL error - the hygiene query
-        # already handles this by splitting its batch, but a plain retry-with-backoff covers
-        # every other caller of this shared helper too. Confirmed live 2026-09-21: 6+
-        # consecutive `list_repositories` calls failed with 502/504 with no retry in between.
-        for attempt in range(3):
-            try:
-                response = await self._client.post(
+        # The repositories query in particular is heavy enough (dozens of repos, each with
+        # PRs/issues/vulnerability alerts/release) that GitHub's GraphQL edge occasionally
+        # answers with a bare 502/503/504, drops the connection, or returns HTTP 200 with
+        # `data: null` and an untyped "Something went wrong while executing your query"
+        # timeout error. `_send` retries the first two; this loop retries the last, which
+        # is just as transient. Confirmed live 2026-09-21: 6+ consecutive
+        # `list_repositories` calls failed with 502/504 with no retry in between.
+        for attempt in range(_RETRY_ATTEMPTS):
+            response = await self._send(
+                lambda: self._client.post(
                     f"{self._api_url}/graphql",
                     json={"query": query, "variables": variables},
                     headers=_headers(token),
-                )
-            except httpx.HTTPError as exc:
-                raise GitHubUnavailable("graphql request failed") from exc
-            if response.status_code in _RETRYABLE_HTTP_STATUSES and attempt < 2:
-                await asyncio.sleep(1 * (attempt + 1))
-                continue
-            break
-        _raise_for_status(response, context="graphql")
-        payload = response.json()
-        errors = payload.get("errors")
-        if errors:
+                ),
+                context="graphql request failed",
+            )
+            _raise_for_status(response, context="graphql")
+            payload = response.json()
+            errors = payload.get("errors")
+            if not errors:
+                return payload["data"]
             types = {e.get("type") for e in errors}
             if "RATE_LIMITED" in types:
                 raise RateLimited("graphql")
             messages = "; ".join(e.get("message", "?") for e in errors)
-            if payload.get("data") is None:
-                raise GitHubUnavailable(f"graphql: {messages}")
-            log.warning("graphql partial errors: %s", messages)
-        return payload["data"]
+            if payload.get("data") is not None:
+                log.warning("graphql partial errors: %s", messages)
+                return payload["data"]
+            if attempt + 1 < _RETRY_ATTEMPTS and _is_transient_graphql_failure(errors):
+                log.warning("graphql: %s, retrying", messages)
+                await self._sleep(
+                    _RETRY_BACKOFF_SECONDS[min(attempt, len(_RETRY_BACKOFF_SECONDS) - 1)]
+                )
+                continue
+            raise GitHubUnavailable(f"graphql: {messages}")
+        raise AssertionError("unreachable")
+
+
+def _is_transient_graphql_failure(errors: list[dict[str, Any]]) -> bool:
+    """GitHub types permanent GraphQL errors (`NOT_FOUND`, `FORBIDDEN`, `INSUFFICIENT_SCOPES`,
+    `MAX_NODE_LIMIT_EXCEEDED`, ...); its execution timeouts and internal errors come without
+    a `type`. Only an all-untyped error list is worth a retry."""
+    return all(not e.get("type") for e in errors)
 
 
 def _pr_checks(node: dict[str, Any]) -> ChecksState | None:

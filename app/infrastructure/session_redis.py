@@ -98,7 +98,14 @@ class RedisSessionRepository:
         )
 
 
+# How long a no-longer-fresh entry stays available to `get_stale` before Redis drops it.
+STALE_RETENTION_SECONDS = 7 * 24 * 3600
+
+
 class RedisOverviewCache:
+    """Two keys per user: the overview itself (kept for `STALE_RETENTION_SECONDS`) and a
+    freshness marker that expires after the TTL given to `set`. `get` requires both."""
+
     def __init__(self, redis: Redis, prefix: str = "ghd:overview:") -> None:
         self._redis = redis
         self._prefix = prefix
@@ -106,16 +113,28 @@ class RedisOverviewCache:
     def _key(self, user_id: int) -> str:
         return f"{self._prefix}{user_id}"
 
+    def _fresh_key(self, user_id: int) -> str:
+        return f"{self._prefix}fresh:{user_id}"
+
     async def get(self, user_id: int) -> Overview | None:
+        if not await self._redis.exists(self._fresh_key(user_id)):
+            return None
+        return await self.get_stale(user_id)
+
+    async def get_stale(self, user_id: int) -> Overview | None:
         raw = await self._redis.get(self._key(user_id))
         return overview_from_dict(json.loads(raw)) if raw else None
 
     async def set(self, user_id: int, overview: Overview, ttl_seconds: int) -> None:
-        if ttl_seconds <= 0:
-            return
         await self._redis.set(
-            self._key(user_id), json.dumps(overview_to_dict(overview)), ex=ttl_seconds
+            self._key(user_id),
+            json.dumps(overview_to_dict(overview)),
+            ex=STALE_RETENTION_SECONDS,
         )
+        if ttl_seconds <= 0:
+            await self._redis.delete(self._fresh_key(user_id))
+            return
+        await self._redis.set(self._fresh_key(user_id), "1", ex=ttl_seconds)
 
     async def invalidate(self, user_id: int) -> None:
-        await self._redis.delete(self._key(user_id))
+        await self._redis.delete(self._key(user_id), self._fresh_key(user_id))
