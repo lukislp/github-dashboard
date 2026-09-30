@@ -172,6 +172,22 @@ async def client():
         yield c
 
 
+async def _no_sleep(_seconds: float) -> None:
+    """Stands in for the adapter's retry backoff so retry tests do not wait it out."""
+
+
+@respx.mock
+async def test_list_repositories_requests_pages_of_25(client):
+    route = respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(
+            200, json=graphql_page([repo_node("a")], has_next=False, cursor=None)
+        )
+    )
+    await GitHubHttpApi(client, api_url=API).list_repositories("tok")
+
+    assert json.loads(route.calls[0].request.content)["variables"]["pageSize"] == 25
+
+
 @respx.mock
 async def test_list_repositories_paginates(client):
     route = respx.post(f"{API}/graphql").mock(
@@ -633,6 +649,22 @@ async def test_fetch_hygiene_degrades_half_that_still_fails_after_retry(client):
     assert set(page.hygiene_by_repo) == {"octocat/a"}
     assert "octocat/b" not in page.hygiene_by_repo
     assert "octocat/b" not in page.branches_by_repo
+
+
+@respx.mock
+async def test_fetch_hygiene_retries_transport_failure_in_place(client):
+    """A timeout is retried with the same batch (no split), unlike a 5xx."""
+    route = respx.post(f"{API}/graphql").mock(
+        side_effect=[
+            httpx.ReadTimeout("slow"),
+            httpx.Response(200, json=hygiene_response([hygiene_node("a", node_id="id1")])),
+        ]
+    )
+    page = await GitHubHttpApi(client, api_url=API, sleep=_no_sleep).fetch_hygiene("tok", ["id1"])
+
+    assert route.call_count == 2
+    assert set(page.hygiene_by_repo) == {"octocat/a"}
+    assert json.loads(route.calls[1].request.content)["variables"]["ids"] == ["id1"]
 
 
 @respx.mock
@@ -1775,3 +1807,139 @@ async def test_list_run_durations_second_call_reuses_cached_body_on_304(client):
     assert route.call_count == 2
     assert route.calls[1].request.headers["if-none-match"] == 'W/"abc"'
     assert second == first == RepoUsage(seconds=5 * 60, runs=1, truncated=False)
+
+
+# -- retries (transport failures, 5xx, transient GraphQL errors) ---------------------------
+
+
+_EMPTY_RUNS = {"workflow_runs": []}
+_EMPTY_PR_PAGE = {
+    "data": {
+        "repository": {
+            "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}
+        }
+    }
+}
+_GRAPHQL_TIMEOUT_ERROR = {
+    "message": (
+        "Something went wrong while executing your query. This may be the result of a "
+        "timeout, or it could be a GitHub bug."
+    )
+}
+
+
+@respx.mock
+async def test_conditional_get_retries_a_transport_failure(client):
+    route = respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        side_effect=[httpx.ReadTimeout("slow"), httpx.Response(200, json=_EMPTY_RUNS)]
+    )
+    runs = await GitHubHttpApi(client, api_url=API, sleep=_no_sleep).list_recent_runs(
+        "tok", "octocat", "a", 5
+    )
+
+    assert runs == []
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_conditional_get_retries_503_up_to_three_attempts_then_fails(client):
+    route = respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        side_effect=[httpx.Response(503), httpx.Response(503), httpx.Response(503)]
+    )
+    with pytest.raises(GitHubUnavailable):
+        await GitHubHttpApi(client, api_url=API, sleep=_no_sleep).list_recent_runs(
+            "tok", "octocat", "a", 5
+        )
+
+    assert route.call_count == 3
+
+
+@respx.mock
+async def test_conditional_get_gives_up_after_three_transport_failures(client):
+    route = respx.get(f"{API}/repos/octocat/a/actions/runs").mock(
+        side_effect=[httpx.ReadTimeout("1"), httpx.ReadTimeout("2"), httpx.ReadTimeout("3")]
+    )
+    with pytest.raises(GitHubUnavailable):
+        await GitHubHttpApi(client, api_url=API, sleep=_no_sleep).list_recent_runs(
+            "tok", "octocat", "a", 5
+        )
+
+    assert route.call_count == 3
+
+
+@respx.mock
+async def test_graphql_retries_untyped_null_data_error(client):
+    """GitHub's execution timeout: HTTP 200, `data: null`, one error without a `type`."""
+    route = respx.post(f"{API}/graphql").mock(
+        side_effect=[
+            httpx.Response(200, json={"data": None, "errors": [_GRAPHQL_TIMEOUT_ERROR]}),
+            httpx.Response(200, json=_EMPTY_PR_PAGE),
+        ]
+    )
+    page = await GitHubHttpApi(client, api_url=API, sleep=_no_sleep).list_repo_items(
+        "tok", "octocat", "a", "pull_requests", None, 50
+    )
+
+    assert route.call_count == 2
+    assert page.pull_requests == ()
+    assert page.next_cursor is None
+
+
+@respx.mock
+async def test_graphql_does_not_retry_a_typed_null_data_error(client):
+    route = respx.post(f"{API}/graphql").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": None, "errors": [{"type": "INSUFFICIENT_SCOPES", "message": "x"}]},
+        )
+    )
+    with pytest.raises(GitHubUnavailable):
+        await GitHubHttpApi(client, api_url=API, sleep=_no_sleep).list_repo_items(
+            "tok", "octocat", "a", "pull_requests", None, 50
+        )
+
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_graphql_retries_a_dropped_connection(client):
+    route = respx.post(f"{API}/graphql").mock(
+        side_effect=[
+            httpx.RemoteProtocolError("Server disconnected"),
+            httpx.Response(200, json=_EMPTY_PR_PAGE),
+        ]
+    )
+    page = await GitHubHttpApi(client, api_url=API, sleep=_no_sleep).list_repo_items(
+        "tok", "octocat", "a", "pull_requests", None, 50
+    )
+
+    assert route.call_count == 2
+    assert page.pull_requests == ()
+
+
+@respx.mock
+async def test_graphql_retries_502_then_succeeds(client):
+    route = respx.post(f"{API}/graphql").mock(
+        side_effect=[
+            httpx.Response(502),
+            httpx.Response(200, json=graphql_page([repo_node("a")], has_next=False, cursor=None)),
+        ]
+    )
+    page = await GitHubHttpApi(client, api_url=API, sleep=_no_sleep).list_repositories("tok")
+
+    assert route.call_count == 2
+    assert [r.full_name for r in page.repositories] == ["octocat/a"]
+
+
+@respx.mock
+async def test_rerun_failed_jobs_502_is_not_retried(client):
+    """The app's one write is sent exactly once: a retry could queue the rerun twice."""
+    route = respx.post(f"{API}/repos/octocat/a/actions/runs/1/rerun-failed-jobs").mock(
+        return_value=httpx.Response(502)
+    )
+    with pytest.raises(GitHubUnavailable):
+        await GitHubHttpApi(client, api_url=API, sleep=_no_sleep).rerun_failed_jobs(
+            "tok", "octocat", "a", 1
+        )
+
+    assert route.call_count == 1

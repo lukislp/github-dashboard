@@ -263,6 +263,7 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
   font-size: 0.92rem;
 }
 .banner--error { border-left-color: var(--critical); }
+.banner--warning { border-left-color: var(--warning); }
 .banner .btn { margin-left: auto; }
 
 /* ---------- KPI strip ---------- */
@@ -344,6 +345,7 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
   border: 1px solid var(--line); border-radius: var(--radius);
   background: var(--surface); color: var(--good-ink); font-size: 0.92rem;
 }
+.inbox-empty--pending { color: var(--muted); }
 
 /* ---------- changes ("since your last visit") ---------- */
 
@@ -502,6 +504,9 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 .run--cancelled, .run--skipped, .run--neutral, .run--stale, .run--unknown, .run--action_required { background: var(--neutral); opacity: 0.55; }
 .run--empty { background: transparent; border: 1px dashed var(--line-strong); opacity: 1; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* Placeholder for a table cell whose section is still being fetched. */
+.cell-pending { display: inline-block; min-width: 28px; color: var(--muted); font-family: var(--font-mono); letter-spacing: 2px; animation: pulse 1.6s ease-in-out infinite; }
 
 .ci__label { display: inline-flex; align-items: center; gap: 5px; font-size: 0.82rem; color: var(--ink-2); white-space: nowrap; }
 .ci__label .icon { width: 12px; height: 12px; }
@@ -710,5 +715,6 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
 
 @media (prefers-reduced-motion: reduce) {
   .run--in_progress, .run--queued { animation: none; }
+  .cell-pending { animation: none; }
   .toggle .icon { transition: none; }
 }

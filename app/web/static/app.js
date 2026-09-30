@@ -5,6 +5,8 @@
   const I18N = window.I18N;
   const t = I18N.t;
   const AUTO_REFRESH_MS = 5 * 60 * 1000;
+  // Interval between polls while the server is still assembling a progressive overview.
+  const POLL_MS = 1500;
 
   const state = {
     data: null,
@@ -672,12 +674,26 @@
       return;
     }
     els.banner.hidden = false;
-    els.banner.className = "banner" + (kind === "error" ? " banner--error" : "");
+    els.banner.className =
+      "banner" + (kind === "error" ? " banner--error" : kind === "warning" ? " banner--warning" : "");
     els.banner.innerHTML =
       `<span>${esc(text)}</span>` +
       (retry ? `<button type="button" class="btn" id="banner-retry">${esc(t("retry"))}</button>` : "");
     const button = $("#banner-retry");
     if (button) button.addEventListener("click", () => load(true));
+  }
+
+  // True while the server is still fetching `section` of a progressive overview.
+  function isPending(section) {
+    return !!(state.data && state.data.pending && state.data.pending.includes(section));
+  }
+
+  function pendingCellMarkup() {
+    return `<span class="cell-pending" title="${esc(t("cell_loading"))}" aria-label="${esc(t("cell_loading"))}">···</span>`;
+  }
+
+  function sectionNames(sections) {
+    return (sections || []).map((name) => t("section_" + name)).join(", ");
   }
 
   function renderKpis() {
@@ -898,6 +914,10 @@
       els.inbox.innerHTML = "";
       return;
     }
+    if (isPending("inbox") || isPending("notifications")) {
+      els.inbox.innerHTML = `<p class="inbox-empty inbox-empty--pending">${esc(t("inbox_loading"))}</p>`;
+      return;
+    }
     const inbox = d.inbox;
     const notifAvailable = d.notifications_available;
     const notifUnread = d.totals.notifications_unread ?? 0;
@@ -1023,7 +1043,7 @@
     if (!changes || changes.since === null) {
       els.changes.hidden = true;
       els.changes.innerHTML = "";
-      if (!state.seenAutoMarked) {
+      if (!state.seenAutoMarked && !(d.pending && d.pending.length)) {
         state.seenAutoMarked = true;
         fetch("/api/seen", {
           method: "POST",
@@ -1194,10 +1214,15 @@
       usage && usage.seconds > 0
         ? `<span class="badge" title="${esc(t(usage.truncated ? "badge_ci_month_title_truncated" : "badge_ci_month_title", { n: I18N.formatNumber(usage.runs) }))}">${esc(formatDuration(usage.seconds))}</span>`
         : "";
+    // Runs, security and release of this repository have not been fetched yet.
+    const ciPending = ci.error === "pending";
     const alertsCell = repo.is_archived
       ? `<span class="num is-zero">–</span>`
-      : alertsCellMarkup(item.security);
-    const hygieneCell = hygieneCellMarkup(item.hygiene);
+      : ciPending
+        ? pendingCellMarkup()
+        : alertsCellMarkup(item.security);
+    const hygieneCell =
+      isPending("hygiene") && !repo.is_archived ? pendingCellMarkup() : hygieneCellMarkup(item.hygiene);
     const longRunning = ci.long_running_count > 0;
     const ciLabel = longRunning
       ? t("ci_running_slow")
@@ -1205,6 +1230,12 @@
         ? `${t("ci_failing")} ×${ci.failed_count}`
         : t("ci_" + ci.state);
     const runsPerRepo = Math.max(ci.runs.length, state.data ? state.data.runs_per_repo || 5 : 5);
+    const ciCell = ciPending
+      ? pendingCellMarkup()
+      : `<div class="ci ci--${esc(ci.state)}">
+            ${ci.state === "skipped" ? "" : runsMarkup(ci.runs, runsPerRepo)}
+            <span class="ci__label ${longRunning ? "ci__label--slow" : ""}">${longRunning ? ICONS.clock : CI_ICON[ci.state] || ""}${esc(ciLabel)}</span>
+          </div>`;
 
     const prs = visiblePrs(repo);
     const prCount = displayedPrCount(repo);
@@ -1231,10 +1262,7 @@
         <td class="col-alerts">${alertsCell}</td>
         <td class="col-hygiene">${hygieneCell}</td>
         <td class="col-ci">
-          <div class="ci ci--${esc(ci.state)}">
-            ${ci.state === "skipped" ? "" : runsMarkup(ci.runs, runsPerRepo)}
-            <span class="ci__label ${longRunning ? "ci__label--slow" : ""}">${longRunning ? ICONS.clock : CI_ICON[ci.state] || ""}${esc(ciLabel)}</span>
-          </div>
+          ${ciCell}
         </td>
         <td class="col-pushed" title="${esc(I18N.formatDateTime(repo.pushed_at))}">
           <div class="pushed__time">${esc(I18N.formatRelative(repo.pushed_at))}</div>
@@ -1465,6 +1493,11 @@
       els.failuresSub.textContent = "";
       return;
     }
+    if (isPending("ci")) {
+      els.failuresSub.textContent = t("failures_loading");
+      els.failures.innerHTML = `<li class="empty">${esc(t("cell_loading"))}</li>`;
+      return;
+    }
     const runsPerRepo = d.runs_per_repo || 5;
     els.failuresSub.textContent = t("failures_sub", { n: d.failures.length, k: runsPerRepo });
     if (!d.failures.length) {
@@ -1497,7 +1530,7 @@
     const parts = [
       t("footer_updated", { time: I18N.formatRelative(d.generated_at) }) +
         " · " +
-        (d.from_cache ? t("footer_cached") : t("footer_live")),
+        (d.stale_reason ? t("footer_stale") : d.from_cache ? t("footer_cached") : t("footer_live")),
     ];
     if (d.rate_limit) {
       parts.push(t("footer_rate", { remaining: I18N.formatNumber(d.rate_limit.remaining), limit: I18N.formatNumber(d.rate_limit.limit) }));
@@ -1542,6 +1575,23 @@
 
   // ---------- data ----------
 
+  // Banner shown once a refresh has finished: the served overview may be an older complete
+  // one (GitHub unavailable / rate limited) or may be missing sections GitHub did not answer for.
+  function showOutcomeBanner(data) {
+    if (data.stale_reason) {
+      const key = data.stale_reason === "rate_limited" ? "stale_rate_limited" : "stale_github";
+      setBanner("error", t(key, { time: I18N.formatDateTime(data.generated_at) }), true);
+    } else if (data.degraded && data.degraded.length) {
+      setBanner("warning", t("degraded_sections", { sections: sectionNames(data.degraded) }), true);
+    } else {
+      setBanner(null);
+    }
+  }
+
+  // Progressive loading: the server answers each request at once with the newest state of the
+  // running refresh and lists the sections still being fetched in `pending`. We render whatever
+  // has arrived (once the repository list is there) and poll every POLL_MS until `pending` is
+  // empty; only then is the outcome (stale / degraded / fine) reported in the banner.
   async function load(force) {
     if (state.loading) return;
     state.loading = true;
@@ -1550,25 +1600,38 @@
     if (!state.data) setBanner("info", t("loading"));
 
     try {
-      const response = await fetch("/api/overview" + (force ? "?refresh=1" : ""), {
-        headers: { Accept: "application/json" },
-        credentials: "same-origin",
-      });
-      if (response.status === 401) {
-        window.location.assign("/login?error=expired");
-        return;
+      let url = force ? "/api/overview?refresh=1&progressive=1" : "/api/overview?progressive=1";
+      for (;;) {
+        const response = await fetch(url, {
+          headers: { Accept: "application/json" },
+          credentials: "same-origin",
+        });
+        if (response.status === 401) {
+          window.location.assign("/login?error=expired");
+          return;
+        }
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          const key = body.error === "rate_limited" ? "err_rate_limited" : "err_github";
+          setBanner("error", t(key), true);
+          return;
+        }
+        const data = await response.json();
+        const pending = data.pending || [];
+        // While the repository list itself is pending the body is only an empty placeholder.
+        if (!pending.includes("repositories")) {
+          data.runs_per_repo = Math.max(...data.repos.map((r) => r.ci.runs.length), 0) || 5;
+          state.data = data;
+          renderAll();
+        }
+        if (!pending.length) {
+          showOutcomeBanner(data);
+          return;
+        }
+        setBanner("info", t("loading_sections", { sections: sectionNames(pending) }));
+        await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+        url = "/api/overview?progressive=1";
       }
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        const key = body.error === "rate_limited" ? "err_rate_limited" : "err_github";
-        setBanner("error", t(key), true);
-        return;
-      }
-      const data = await response.json();
-      data.runs_per_repo = Math.max(...data.repos.map((r) => r.ci.runs.length), 0) || 5;
-      state.data = data;
-      setBanner(null);
-      renderAll();
     } catch (_) {
       setBanner("error", t("err_network"), true);
     } finally {

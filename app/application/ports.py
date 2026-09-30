@@ -247,11 +247,30 @@ class SessionRepository(Protocol):
 
 
 class OverviewCache(Protocol):
-    async def get(self, user_id: int) -> Overview | None: ...
+    """Per-user store of the last complete Overview.
 
-    async def set(self, user_id: int, overview: Overview, ttl_seconds: int) -> None: ...
+    An entry is *fresh* for `ttl_seconds` after `set` and served by `get` as-is until then.
+    After that it is only *stale*: `get` no longer returns it, but `get_stale` still does, so
+    a refresh that fails can fall back to it instead of leaving the user with nothing. Stale
+    entries are kept for a long but bounded time (implementation-defined, days) and dropped
+    by `invalidate`.
+    """
 
-    async def invalidate(self, user_id: int) -> None: ...
+    async def get(self, user_id: int) -> Overview | None:
+        """The cached overview while it is still fresh, else `None`."""
+        ...
+
+    async def get_stale(self, user_id: int) -> Overview | None:
+        """The last complete overview stored, fresh or not, else `None`."""
+        ...
+
+    async def set(self, user_id: int, overview: Overview, ttl_seconds: int) -> None:
+        """Store a complete overview, fresh for `ttl_seconds` (0 = stale right away)."""
+        ...
+
+    async def invalidate(self, user_id: int) -> None:
+        """Drop the entry entirely, fresh and stale alike."""
+        ...
 
 
 class TokenCipher(Protocol):

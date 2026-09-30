@@ -24,6 +24,8 @@ from app.domain.models import (
     Repository,
     RepoUsage,
     RunStatus,
+    Section,
+    StaleReason,
     Totals,
     WorkflowRun,
 )
@@ -81,6 +83,17 @@ def classify_ci(runs: Iterable[WorkflowRun], *, error: str | None = None) -> Rep
 def skipped_ci(reason: str) -> RepoCi:
     """CI placeholder for repositories that were intentionally not queried (e.g. archived)."""
     return RepoCi(CiState.SKIPPED, (), 0, 0, reason)
+
+
+PENDING_CI_ERROR = "pending"
+
+
+def pending_ci() -> RepoCi:
+    """CI placeholder for a repository a progressive refresh has not queried yet.
+
+    Only ever appears in an overview whose `pending` contains `Section.CI`; the UI shows a
+    loading marker instead of "unavailable" for it."""
+    return RepoCi(CiState.UNAVAILABLE, (), 0, 0, PENDING_CI_ERROR)
 
 
 def mark_pr(pr: PullRequest, *, now: datetime, stale_after: timedelta) -> PullRequest:
@@ -147,6 +160,9 @@ def build_overview(
     actions_usage: ActionsUsage = _EMPTY_ACTIONS_USAGE,
     usage_by_repo: Mapping[str, RepoUsage] | None = None,
     usage_since: datetime | None = None,
+    pending: Iterable[Section] = (),
+    degraded: Iterable[Section] = (),
+    stale_reason: StaleReason | None = None,
 ) -> Overview:
     repos: list[RepoOverview] = []
     failures: list[FailedRun] = []
@@ -245,7 +261,16 @@ def build_overview(
         notifications_available=notifications_available,
         actions_usage=actions_usage,
         usage_since=usage_since,
+        pending=_ordered_sections(pending),
+        degraded=_ordered_sections(degraded),
+        stale_reason=stale_reason,
     )
+
+
+def _ordered_sections(sections: Iterable[Section]) -> tuple[Section, ...]:
+    """Deduplicate `sections` into declaration order, so equal sets compare equal."""
+    wanted = set(sections)
+    return tuple(section for section in Section if section in wanted)
 
 
 def _hygiene_average(repos: list[RepoOverview]) -> int:

@@ -2,6 +2,7 @@
 loop itself just sleeps and calls this once per tick, so it is exercised here directly instead
 of waiting on a real sleep."""
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 from app.application.errors import AuthenticationError, GitHubUnavailable, RateLimited
@@ -128,6 +129,31 @@ async def test_refresh_active_sessions_continues_after_github_unavailable():
     await _refresh_active_sessions(container, NOW)
 
     assert api.calls == 2  # both sessions were attempted despite the first one's error
+
+
+async def test_refresh_active_sessions_does_not_hide_github_unavailable_behind_stale_data(
+    caplog,
+):
+    """The warm-up asks for no stale fallback: with a complete overview already cached, a
+    failed refresh must still surface as `GitHubUnavailable` (logged, cycle continues) rather
+    than quietly hand back the old overview as if it had refreshed."""
+    api = FakeApi(repos=[make_repo("a")])
+    cache = FakeCache()
+    container = build_container(api, cache)
+    session_id = await _create_session(container)
+    session = await container.resolve_session(session_id)
+    await container.get_overview(session)  # a complete overview is now cached
+    assert api.calls == 1
+    api.list_repositories_error = GitHubUnavailable("down")
+    container.activity.touch(session_id, 42, NOW)
+
+    with caplog.at_level(logging.WARNING, logger="app.main"):
+        await _refresh_active_sessions(container, NOW)  # must not raise
+
+    assert api.calls == 2
+    assert "background refresh failed user_id=42" in caplog.text
+    assert await cache.get_stale(42) is not None  # the old overview stays available
+    assert container.activity.active(NOW, timedelta(hours=1)) != []  # the session is kept
 
 
 async def test_refresh_active_sessions_survives_an_unexpected_exception():

@@ -15,6 +15,7 @@ from app.application.activity import ActivityTracker
 from app.application.errors import (
     AccessDenied,
     ActionsUnavailable,
+    ApplicationError,
     AuthenticationError,
     GitHubUnavailable,
     PreferencesInvalid,
@@ -27,6 +28,7 @@ from app.application.ports import (
     HygienePage,
     OverviewCache,
     RepoItemPage,
+    RepositoryPage,
     SessionRecord,
     SessionRepository,
     TokenCipher,
@@ -47,7 +49,9 @@ from app.domain.models import (
     RepoSecurity,
     Repository,
     RepoUsage,
+    Section,
     Snapshot,
+    StaleReason,
     WorkflowRun,
 )
 from app.domain.overview import (
@@ -58,6 +62,7 @@ from app.domain.overview import (
     mark_issue,
     mark_pr,
     month_start,
+    pending_ci,
     skipped_ci,
 )
 from app.domain.snapshot import diff_since, snapshot_of
@@ -66,6 +71,7 @@ _EMPTY_ACTIONS_USAGE = ActionsUsage(
     available=False, minutes_used=None, included_minutes=None, paid_minutes_used=None
 )
 _EMPTY_USAGE = RepoUsage(seconds=0, runs=0, truncated=False)
+_EMPTY_INBOX = Inbox((), (), (), ())
 _REPO_ITEMS_LIMIT = 50
 
 _MAX_GROUPS = 30
@@ -255,7 +261,66 @@ class OverviewResult:
 
 
 @dataclass(slots=True)
+class _Refresh:
+    """One in-flight refresh of a user's overview.
+
+    `latest` is the newest partial overview the refresh has published so far (`None` until
+    the repositories page is in); `task` completes with the final, complete overview.
+    """
+
+    started_at: datetime
+    task: asyncio.Task[Overview] = field(init=False)
+    latest: Overview | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Failure:
+    """The last refresh of a user failed at `at` with `error`."""
+
+    at: datetime
+    error: ApplicationError
+
+
+@dataclass(slots=True)
+class _Progress:
+    """Mutable accumulator of one refresh, turned into an Overview by `GetOverview._assemble`
+    every time a part of it lands."""
+
+    pending: set[Section]
+    degraded: set[Section] = field(default_factory=set)
+    ci_by_repo: dict[str, RepoCi] = field(default_factory=dict)
+    security_by_repo: dict[str, RepoSecurity] = field(default_factory=dict)
+    release_by_repo: dict[str, ReleaseInfo | None] = field(default_factory=dict)
+    usage_by_repo: dict[str, RepoUsage] = field(default_factory=dict)
+    hygiene_page: HygienePage = field(default_factory=HygienePage)
+    inbox: Inbox = _EMPTY_INBOX
+    notifications: tuple[Notification, ...] = ()
+    notifications_available: bool = False
+    actions_usage: ActionsUsage = _EMPTY_ACTIONS_USAGE
+
+
+_PER_REPO_SECTIONS = frozenset({Section.CI, Section.SECURITY, Section.RELEASES})
+
+
+@dataclass(slots=True)
 class GetOverview:
+    """Build (or serve) a user's overview.
+
+    A refresh runs as one background task per user and process, in stages: the repositories
+    query first (nothing can be shown before it), then everything else concurrently, each
+    part landing in the overview as soon as it is in. `__call__` with `wait=False` returns
+    right away with the newest state of that task (`Overview.pending` lists what is still
+    missing) so a client can poll and render progressively; with `wait=True` it blocks until
+    the refresh is complete, as the background warm-up and `MarkSeen` need.
+
+    A part GitHub cannot deliver degrades to its empty default and is listed in
+    `Overview.degraded` instead of failing the refresh. Only the repositories query itself
+    (and the token refresh before it) is fatal - and even then the last complete overview is
+    served from the cache with `stale_reason` set, when there is one and `stale_fallback` is
+    on. After such a failure, non-forced calls within `failure_cooldown` reuse that outcome
+    instead of starting another refresh, so a polling client cannot hammer GitHub.
+    """
+
     api: GitHubApi
     sessions: SessionRepository
     ensure_fresh_token: EnsureFreshToken
@@ -270,207 +335,376 @@ class GetOverview:
     max_job_lookups: int = 20
     actions_usage_enabled: bool = True
     ci_usage_enabled: bool = True
+    failure_cooldown: timedelta = timedelta(seconds=30)
     clock: Clock = utc_now
-    _locks: dict[int, asyncio.Lock] = field(default_factory=dict)
+    _refreshes: dict[int, _Refresh] = field(default_factory=dict)
+    _failures: dict[int, _Failure] = field(default_factory=dict)
 
     async def __call__(
-        self, session: SessionRecord, *, force_refresh: bool = False
+        self,
+        session: SessionRecord,
+        *,
+        force_refresh: bool = False,
+        wait: bool = True,
+        stale_fallback: bool = True,
     ) -> OverviewResult:
         user_id = session.user.id
-        if not force_refresh:
+        refresh = self._refreshes.get(user_id)
+        if refresh is None and not force_refresh:
             cached = await self.cache.get(user_id)
             if cached is not None:
                 return OverviewResult(cached, from_cache=True)
+            failure = self._failures.get(user_id)
+            if failure is not None and self.clock() - failure.at < self.failure_cooldown:
+                if not stale_fallback:
+                    raise failure.error
+                return await self._stale_or_raise(user_id, failure.error)
+        if refresh is None:
+            refresh = self._start(session)
+        if wait:
+            return await self._complete(refresh, user_id, stale_fallback=stale_fallback)
+        if refresh.latest is not None:
+            return OverviewResult(refresh.latest, from_cache=False)
+        return OverviewResult(self._placeholder(session), from_cache=False)
 
-        # One in-flight refresh per user in this process; concurrent callers share it.
-        lock = self._locks.setdefault(user_id, asyncio.Lock())
-        async with lock:
-            if not force_refresh:
-                cached = await self.cache.get(user_id)
-                if cached is not None:
-                    return OverviewResult(cached, from_cache=True)
-            try:
-                overview = await self._load(session)
-            except AuthenticationError:
-                await self.sessions.delete(session.id)
-                await self.cache.invalidate(user_id)
+    def _start(self, session: SessionRecord) -> _Refresh:
+        user_id = session.user.id
+        refresh = _Refresh(started_at=self.clock())
+
+        def publish(overview: Overview) -> None:
+            refresh.latest = overview
+
+        refresh.task = asyncio.create_task(self._refresh(session, publish))
+        refresh.task.add_done_callback(lambda _: self._finish(user_id, refresh))
+        self._refreshes[user_id] = refresh
+        return refresh
+
+    def _finish(self, user_id: int, refresh: _Refresh) -> None:
+        if self._refreshes.get(user_id) is refresh:
+            del self._refreshes[user_id]
+        if refresh.task.cancelled():
+            return
+        # Retrieving the exception here also keeps asyncio from logging "exception was never
+        # retrieved" for a progressive refresh nobody awaits.
+        error = refresh.task.exception()
+        if error is None:
+            self._failures.pop(user_id, None)
+        elif isinstance(error, ApplicationError):
+            self._failures[user_id] = _Failure(self.clock(), error)
+
+    async def _complete(
+        self, refresh: _Refresh, user_id: int, *, stale_fallback: bool
+    ) -> OverviewResult:
+        try:
+            # Shielded: a client disconnecting mid-request must not cancel the refresh that
+            # other callers (and the cache) are waiting for.
+            overview = await asyncio.shield(refresh.task)
+        except (RateLimited, GitHubUnavailable) as exc:
+            if not stale_fallback:
                 raise
-            await self.cache.set(user_id, overview, self.cache_ttl_seconds)
-            return OverviewResult(overview, from_cache=False)
+            return await self._stale_or_raise(user_id, exc)
+        return OverviewResult(overview, from_cache=False)
 
-    async def _load(self, session: SessionRecord) -> Overview:
+    async def _stale_or_raise(self, user_id: int, error: ApplicationError) -> OverviewResult:
+        """The last complete overview marked stale, or `error` when there is none (or the
+        error is one no old data may paper over, like a revoked token)."""
+        if not isinstance(error, (RateLimited, GitHubUnavailable)):
+            raise error
+        stale = await self.cache.get_stale(user_id)
+        if stale is None:
+            raise error
+        reason = (
+            StaleReason.RATE_LIMITED
+            if isinstance(error, RateLimited)
+            else StaleReason.GITHUB_UNAVAILABLE
+        )
+        log.warning(
+            "refresh failed user_id=%s, serving stale overview from %s: %s",
+            user_id,
+            stale.generated_at.isoformat(),
+            error,
+        )
+        return OverviewResult(
+            dataclasses.replace(stale, stale_reason=reason, pending=()), from_cache=True
+        )
+
+    def _placeholder(self, session: SessionRecord) -> Overview:
+        """An empty overview with everything pending: what a progressive caller gets while the
+        repositories page is still on its way."""
+        return build_overview(
+            viewer_login=session.user.login,
+            repositories=(),
+            ci_by_repo={},
+            rate_limit=None,
+            now=self.clock(),
+            pending=tuple(Section),
+        )
+
+    async def _refresh(
+        self, session: SessionRecord, publish: Callable[[Overview], None]
+    ) -> Overview:
+        user_id = session.user.id
+        try:
+            overview = await self._load(session, publish)
+        except AuthenticationError:
+            await self.sessions.delete(session.id)
+            await self.cache.invalidate(user_id)
+            raise
+        await self.cache.set(user_id, overview, self.cache_ttl_seconds)
+        publish(overview)
+        return overview
+
+    def _sections_to_fetch(self, page: RepositoryPage) -> set[Section]:
+        live = [r for r in page.repositories if not r.is_archived]
+        sections = {Section.INBOX, Section.NOTIFICATIONS}
+        if live:
+            sections |= {Section.CI, Section.RELEASES}
+            if self.security_alerts:
+                sections.add(Section.SECURITY)
+            if self.hygiene_checks:
+                sections.add(Section.HYGIENE)
+            if self.ci_usage_enabled:
+                sections.add(Section.CI_USAGE)
+        if self.actions_usage_enabled:
+            sections.add(Section.ACTIONS_USAGE)
+        if self.max_job_lookups > 0:
+            sections.add(Section.FAILED_JOBS)
+        return sections
+
+    async def _load(self, session: SessionRecord, publish: Callable[[Overview], None]) -> Overview:
         session, token = await self.ensure_fresh_token(session)
         page = await self.api.list_repositories(token)
         semaphore = asyncio.Semaphore(self.max_concurrency)
         usage_since = month_start(self.clock()) if self.ci_usage_enabled else None
+        progress = _Progress(pending=self._sections_to_fetch(page))
 
-        async def worker(
-            repo: Repository,
-        ) -> tuple[str, RepoCi, RepoSecurity, ReleaseInfo | None, RepoUsage]:
+        def emit() -> None:
+            publish(self._assemble(session, page, progress, usage_since))
+
+        live_repos: list[Repository] = []
+        for repo in page.repositories:
             dependabot, dependabot_total = page.dependabot_by_repo.get(repo.full_name, (None, None))
-            partial_release = page.release_by_repo.get(repo.full_name)
-
+            progress.release_by_repo[repo.full_name] = page.release_by_repo.get(repo.full_name)
             if repo.is_archived:
-                security = RepoSecurity(dependabot, dependabot_total, None, None)
-                return (
-                    repo.full_name,
-                    skipped_ci("archived"),
-                    security,
-                    partial_release,
-                    _EMPTY_USAGE,
+                progress.ci_by_repo[repo.full_name] = skipped_ci("archived")
+                progress.security_by_repo[repo.full_name] = RepoSecurity(
+                    dependabot, dependabot_total, None, None
                 )
-
-            async with semaphore:
-                try:
-                    runs = await self.api.list_recent_runs(
-                        token, repo.owner, repo.name, self.runs_per_repo
-                    )
-                    ci = classify_ci(runs)
-                except AuthenticationError:
-                    raise
-                except ActionsUnavailable as exc:
-                    ci = classify_ci((), error=str(exc) or "unavailable")
-                except RateLimited:
-                    ci = classify_ci((), error="rate_limited")
-                except GitHubUnavailable as exc:
-                    log.warning("runs unavailable repo=%s: %s", repo.full_name, exc)
-                    ci = classify_ci((), error="github_error")
-
-                if self.security_alerts:
-                    try:
-                        code_scanning, secret_scanning = await self.api.fetch_security(
-                            token, repo.owner, repo.name
-                        )
-                    except AuthenticationError:
-                        raise
-                    except (RateLimited, GitHubUnavailable) as exc:
-                        log.warning("security fetch failed repo=%s: %s", repo.full_name, exc)
-                        code_scanning, secret_scanning = None, None
-                else:
-                    code_scanning, secret_scanning = None, None
-                security = RepoSecurity(
-                    dependabot, dependabot_total, code_scanning, secret_scanning
-                )
-
-                release = partial_release
-                if partial_release is not None and repo.default_branch:
-                    try:
-                        ahead_by = await self.api.count_commits_since(
-                            token,
-                            repo.owner,
-                            repo.name,
-                            partial_release.tag,
-                            repo.default_branch,
-                        )
-                    except AuthenticationError:
-                        raise
-                    except (RateLimited, GitHubUnavailable) as exc:
-                        log.warning("release compare failed repo=%s: %s", repo.full_name, exc)
-                        ahead_by = None
-                    release = dataclasses.replace(partial_release, unreleased_commits=ahead_by)
-
-            usage = await self._repo_usage(repo, hygiene_task, token, semaphore, usage_since)
-            return repo.full_name, ci, security, release, usage
-
-        async def inbox() -> Inbox:
-            try:
-                return await self.api.search_inbox(token)
-            except (RateLimited, GitHubUnavailable) as exc:
-                log.warning("inbox search failed: %s", exc)
-                return Inbox((), (), (), ())
-
-        async def notifications() -> tuple[tuple[Notification, ...], bool]:
-            try:
-                result = await self.api.list_notifications(token)
-            except (RateLimited, GitHubUnavailable) as exc:
-                log.warning("notifications fetch failed: %s", exc)
-                return (), False
-            if result is None:
-                return (), False
-            return tuple(result), True
-
-        async def hygiene() -> HygienePage:
-            if not self.hygiene_checks:
-                return HygienePage({}, {})
-            repo_ids = [r.node_id for r in page.repositories if not r.is_archived]
-            if not repo_ids:
-                return HygienePage({}, {})
-            # Runs alongside the per-repo REST work, under the same concurrency limit.
-            # AuthenticationError and RateLimited propagate like everywhere else; any other
-            # failure (GitHubUnavailable) must never take the whole overview down, so it
-            # degrades to "no hygiene/branch data this refresh" instead.
-            async with semaphore:
-                try:
-                    return await self.api.fetch_hygiene(token, repo_ids)
-                except GitHubUnavailable as exc:
-                    log.warning("hygiene fetch failed: %s", exc)
-                    return HygienePage({}, {})
-
-        async def actions_usage() -> ActionsUsage:
-            if not self.actions_usage_enabled:
-                return _EMPTY_ACTIONS_USAGE
-            try:
-                return await self.api.fetch_actions_usage(token, session.user.login)
-            except (RateLimited, GitHubUnavailable) as exc:
-                log.warning("actions usage fetch failed: %s", exc)
-                return _EMPTY_ACTIONS_USAGE
+                progress.usage_by_repo[repo.full_name] = _EMPTY_USAGE
+            else:
+                live_repos.append(repo)
+        emit()
 
         # Started as a Task (not a bare coroutine) so `worker` can `await` it too, without
         # holding its own semaphore permit while doing so - see `_repo_usage`.
-        hygiene_task: asyncio.Task[HygienePage] = asyncio.ensure_future(hygiene())
-
-        (
-            worker_results,
-            inbox_result,
-            (notification_items, notifications_available),
-            hygiene_page,
-            actions_usage_result,
-        ) = await asyncio.gather(
-            asyncio.gather(*(worker(r) for r in page.repositories)),
-            inbox(),
-            notifications(),
-            hygiene_task,
-            actions_usage(),
+        hygiene_task: asyncio.Task[HygienePage] = asyncio.ensure_future(
+            self._hygiene(token, live_repos, progress, semaphore, emit)
         )
-        ci_by_repo: dict[str, RepoCi] = {}
-        security_by_repo: dict[str, RepoSecurity] = {}
-        release_by_repo: dict[str, ReleaseInfo | None] = {}
-        usage_by_repo: dict[str, RepoUsage] = {}
-        for full_name, ci, security, release, usage in worker_results:
-            ci_by_repo[full_name] = ci
-            security_by_repo[full_name] = security
-            release_by_repo[full_name] = release
-            usage_by_repo[full_name] = usage
+        repos_left = len(live_repos)
 
-        ci_by_repo = await self._attach_failed_jobs(ci_by_repo, token=token, semaphore=semaphore)
+        async def worker(repo: Repository) -> None:
+            nonlocal repos_left
+            async with semaphore:
+                await self._repo_details(token, repo, page, progress)
+            repos_left -= 1
+            if repos_left == 0:
+                progress.pending -= _PER_REPO_SECTIONS
+            emit()
+            usage, usage_degraded = await self._repo_usage(
+                repo, hygiene_task, token, semaphore, usage_since
+            )
+            progress.usage_by_repo[repo.full_name] = usage
+            if usage_degraded:
+                progress.degraded.add(Section.CI_USAGE)
 
+        async def workers() -> None:
+            await asyncio.gather(*(worker(r) for r in live_repos))
+            progress.pending -= _PER_REPO_SECTIONS | {Section.CI_USAGE}
+            emit()
+
+        await asyncio.gather(
+            workers(),
+            self._inbox(token, progress, emit),
+            self._notifications(token, progress, emit),
+            hygiene_task,
+            self._actions_usage(token, session, progress, emit),
+        )
+
+        progress.ci_by_repo, failed_jobs_degraded = await self._attach_failed_jobs(
+            progress.ci_by_repo, token=token, semaphore=semaphore
+        )
+        if failed_jobs_degraded:
+            progress.degraded.add(Section.FAILED_JOBS)
+        progress.pending.discard(Section.FAILED_JOBS)
+        return self._assemble(session, page, progress, usage_since)
+
+    def _assemble(
+        self,
+        session: SessionRecord,
+        page: RepositoryPage,
+        progress: _Progress,
+        usage_since: datetime | None,
+    ) -> Overview:
+        ci_by_repo = dict(progress.ci_by_repo)
+        if Section.CI in progress.pending:
+            for repo in page.repositories:
+                ci_by_repo.setdefault(repo.full_name, pending_ci())
         repositories = tuple(
-            _attach_branch_listing(repo, hygiene_page.branches_by_repo.get(repo.full_name))
+            _attach_branch_listing(repo, progress.hygiene_page.branches_by_repo.get(repo.full_name))
             for repo in page.repositories
         )
         hygiene_by_repo: dict[str, RepoHygiene] = {
             full_name: assess_hygiene(facts)
-            for full_name, facts in hygiene_page.hygiene_by_repo.items()
+            for full_name, facts in progress.hygiene_page.hygiene_by_repo.items()
         }
-
         return build_overview(
             viewer_login=session.user.login,
             repositories=repositories,
             ci_by_repo=ci_by_repo,
             rate_limit=page.rate_limit,
-            inbox=inbox_result,
-            security_by_repo=security_by_repo,
-            release_by_repo=release_by_repo,
+            inbox=progress.inbox,
+            security_by_repo=progress.security_by_repo,
+            release_by_repo=progress.release_by_repo,
             hygiene_by_repo=hygiene_by_repo,
-            notifications=notification_items,
-            notifications_available=notifications_available,
-            actions_usage=actions_usage_result,
-            usage_by_repo=usage_by_repo,
+            notifications=progress.notifications,
+            notifications_available=progress.notifications_available,
+            actions_usage=progress.actions_usage,
+            usage_by_repo=progress.usage_by_repo,
             usage_since=usage_since,
             stale_after=self.stale_after,
             long_run_after=self.long_run_after,
             now=self.clock(),
+            pending=progress.pending,
+            degraded=progress.degraded,
         )
+
+    async def _repo_details(
+        self, token: str, repo: Repository, page: RepositoryPage, progress: _Progress
+    ) -> None:
+        """Runs, security alerts and release status of one non-archived repository, each
+        degrading on its own. Called while holding a semaphore permit."""
+        dependabot, dependabot_total = page.dependabot_by_repo.get(repo.full_name, (None, None))
+        partial_release = page.release_by_repo.get(repo.full_name)
+
+        try:
+            runs = await self.api.list_recent_runs(token, repo.owner, repo.name, self.runs_per_repo)
+            ci = classify_ci(runs)
+        except AuthenticationError:
+            raise
+        except ActionsUnavailable as exc:
+            ci = classify_ci((), error=str(exc) or "unavailable")
+        except RateLimited:
+            ci = classify_ci((), error="rate_limited")
+            progress.degraded.add(Section.CI)
+        except GitHubUnavailable as exc:
+            log.warning("runs unavailable repo=%s: %s", repo.full_name, exc)
+            ci = classify_ci((), error="github_error")
+            progress.degraded.add(Section.CI)
+        progress.ci_by_repo[repo.full_name] = ci
+
+        if self.security_alerts:
+            try:
+                code_scanning, secret_scanning = await self.api.fetch_security(
+                    token, repo.owner, repo.name
+                )
+            except AuthenticationError:
+                raise
+            except (RateLimited, GitHubUnavailable) as exc:
+                log.warning("security fetch failed repo=%s: %s", repo.full_name, exc)
+                code_scanning, secret_scanning = None, None
+                progress.degraded.add(Section.SECURITY)
+        else:
+            code_scanning, secret_scanning = None, None
+        progress.security_by_repo[repo.full_name] = RepoSecurity(
+            dependabot, dependabot_total, code_scanning, secret_scanning
+        )
+
+        if partial_release is not None and repo.default_branch:
+            try:
+                ahead_by = await self.api.count_commits_since(
+                    token, repo.owner, repo.name, partial_release.tag, repo.default_branch
+                )
+            except AuthenticationError:
+                raise
+            except (RateLimited, GitHubUnavailable) as exc:
+                log.warning("release compare failed repo=%s: %s", repo.full_name, exc)
+                ahead_by = None
+                progress.degraded.add(Section.RELEASES)
+            progress.release_by_repo[repo.full_name] = dataclasses.replace(
+                partial_release, unreleased_commits=ahead_by
+            )
+
+    async def _inbox(self, token: str, progress: _Progress, emit: Callable[[], None]) -> None:
+        try:
+            progress.inbox = await self.api.search_inbox(token)
+        except (RateLimited, GitHubUnavailable) as exc:
+            log.warning("inbox search failed: %s", exc)
+            progress.degraded.add(Section.INBOX)
+        progress.pending.discard(Section.INBOX)
+        emit()
+
+    async def _notifications(
+        self, token: str, progress: _Progress, emit: Callable[[], None]
+    ) -> None:
+        try:
+            result = await self.api.list_notifications(token)
+        except (RateLimited, GitHubUnavailable) as exc:
+            log.warning("notifications fetch failed: %s", exc)
+            progress.degraded.add(Section.NOTIFICATIONS)
+        else:
+            # `None` means the token lacks the scope: unavailable, not degraded.
+            if result is not None:
+                progress.notifications = tuple(result)
+                progress.notifications_available = True
+        progress.pending.discard(Section.NOTIFICATIONS)
+        emit()
+
+    async def _hygiene(
+        self,
+        token: str,
+        live_repos: list[Repository],
+        progress: _Progress,
+        semaphore: asyncio.Semaphore,
+        emit: Callable[[], None],
+    ) -> HygienePage:
+        """Hygiene facts and branch listings, run alongside the per-repository REST work under
+        the same concurrency limit. A batch the adapter had to drop leaves its repositories
+        out of the page; that, like a failed request, is reported as a degraded section
+        rather than failing the overview. Only `AuthenticationError` propagates."""
+        if not self.hygiene_checks or not live_repos:
+            return progress.hygiene_page
+        async with semaphore:
+            try:
+                progress.hygiene_page = await self.api.fetch_hygiene(
+                    token, [r.node_id for r in live_repos]
+                )
+            except (RateLimited, GitHubUnavailable) as exc:
+                log.warning("hygiene fetch failed: %s", exc)
+                progress.degraded.add(Section.HYGIENE)
+        missing = {r.full_name for r in live_repos} - set(progress.hygiene_page.hygiene_by_repo)
+        if missing and Section.HYGIENE not in progress.degraded:
+            log.warning("hygiene missing for %d repositories this refresh", len(missing))
+            progress.degraded.add(Section.HYGIENE)
+        progress.pending.discard(Section.HYGIENE)
+        emit()
+        return progress.hygiene_page
+
+    async def _actions_usage(
+        self,
+        token: str,
+        session: SessionRecord,
+        progress: _Progress,
+        emit: Callable[[], None],
+    ) -> None:
+        if not self.actions_usage_enabled:
+            return
+        try:
+            progress.actions_usage = await self.api.fetch_actions_usage(token, session.user.login)
+        except (RateLimited, GitHubUnavailable) as exc:
+            log.warning("actions usage fetch failed: %s", exc)
+            progress.degraded.add(Section.ACTIONS_USAGE)
+        progress.pending.discard(Section.ACTIONS_USAGE)
+        emit()
 
     async def _repo_usage(
         self,
@@ -479,8 +713,9 @@ class GetOverview:
         token: str,
         semaphore: asyncio.Semaphore,
         since: datetime | None,
-    ) -> RepoUsage:
-        """CI usage of one non-archived repository for the current calendar month.
+    ) -> tuple[RepoUsage, bool]:
+        """CI usage of one non-archived repository for the current calendar month, and
+        whether the lookup degraded.
 
         Only queried when the repository actually has a CI workflow: with hygiene checks on,
         that fact comes straight out of the hygiene fetch (awaiting the shared `hygiene_task`
@@ -490,38 +725,41 @@ class GetOverview:
         `CI_USAGE` is disabled, in which case nothing is queried at all.
         """
         if since is None:
-            return _EMPTY_USAGE
+            return _EMPTY_USAGE, False
         if self.hygiene_checks:
             hygiene_page = await hygiene_task
             facts = hygiene_page.hygiene_by_repo.get(repo.full_name)
             if facts is None or facts.workflow_file_count <= 0:
-                return _EMPTY_USAGE
+                return _EMPTY_USAGE, False
         async with semaphore:
             try:
                 # Private repositories are the only ones that consume the Actions quota, and
                 # a lower bound is useless when the whole point is "how much am I using". They
                 # are also few, so they get five times the page budget of a public repository.
                 pages = 10 if repo.is_private else 2
-                return await self.api.list_run_durations(token, repo.owner, repo.name, since, pages)
+                usage = await self.api.list_run_durations(
+                    token, repo.owner, repo.name, since, pages
+                )
             except AuthenticationError:
                 raise
             except (RateLimited, GitHubUnavailable) as exc:
                 log.warning("ci usage fetch failed repo=%s: %s", repo.full_name, exc)
-                return _EMPTY_USAGE
+                return _EMPTY_USAGE, True
+        return usage, False
 
     async def _attach_failed_jobs(
         self, ci_by_repo: dict[str, RepoCi], *, token: str, semaphore: asyncio.Semaphore
-    ) -> dict[str, RepoCi]:
+    ) -> tuple[dict[str, RepoCi], bool]:
         """Fetch the failed jobs of the newest `max_job_lookups` failed runs across the whole
         refresh (not per repository), and attach them to the matching `WorkflowRun`s.
 
         A lookup that fails with `RateLimited`/`GitHubUnavailable` (or the run's jobs endpoint
         answering 404/403, already handled by the adapter) simply leaves that run's
-        `failed_jobs` empty; it must never fail the overview. `AuthenticationError` still
-        propagates, like every other GitHub call in this refresh.
+        `failed_jobs` empty and flags the result as degraded; it must never fail the overview.
+        `AuthenticationError` still propagates, like every other GitHub call in this refresh.
         """
         if self.max_job_lookups <= 0:
-            return ci_by_repo
+            return ci_by_repo, False
 
         candidates = [
             (full_name, run)
@@ -532,11 +770,14 @@ class GetOverview:
         candidates.sort(key=lambda pair: pair[1].updated_at, reverse=True)
         selected = candidates[: self.max_job_lookups]
         if not selected:
-            return ci_by_repo
+            return ci_by_repo, False
+
+        degraded = False
 
         async def fetch_one(
             full_name: str, run: WorkflowRun
         ) -> tuple[str, int, tuple[FailedJob, ...]]:
+            nonlocal degraded
             owner, name = full_name.split("/", 1)
             async with semaphore:
                 try:
@@ -546,6 +787,7 @@ class GetOverview:
                         "failed job lookup failed repo=%s run=%s: %s", full_name, run.id, exc
                     )
                     jobs = ()
+                    degraded = True
             return full_name, run.id, jobs
 
         results = await asyncio.gather(*(fetch_one(full_name, run) for full_name, run in selected))
@@ -562,7 +804,7 @@ class GetOverview:
                 for run in ci.runs
             )
             updated[full_name] = dataclasses.replace(ci, runs=runs)
-        return updated
+        return updated, degraded
 
 
 def validate_preferences(prefs: Preferences) -> None:
@@ -632,6 +874,11 @@ class GetChanges:
     user_state: UserStateRepository
 
     async def __call__(self, session: SessionRecord, overview: Overview) -> Changes:
+        """An overview still being refreshed progressively (`pending` non-empty) has nothing
+        to diff yet: an item that has simply not landed would otherwise look gone now and
+        new on the next poll."""
+        if overview.pending:
+            return diff_since(overview, None)
         snapshot = await self.user_state.get_snapshot(session.user.id)
         return diff_since(overview, snapshot)
 

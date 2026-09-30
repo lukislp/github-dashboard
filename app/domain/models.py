@@ -42,6 +42,34 @@ class CiState(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class Section(StrEnum):
+    """The independently fetched parts of an Overview.
+
+    Used by `Overview.pending` (a progressive refresh has not delivered this part yet) and
+    `Overview.degraded` (GitHub could not deliver this part, or not all of it, this refresh).
+    `REPOSITORIES` is the one part every other one depends on: while it is pending there is
+    nothing to show at all, and when it fails the whole refresh fails.
+    """
+
+    REPOSITORIES = "repositories"
+    CI = "ci"
+    SECURITY = "security"
+    RELEASES = "releases"
+    HYGIENE = "hygiene"
+    INBOX = "inbox"
+    NOTIFICATIONS = "notifications"
+    ACTIONS_USAGE = "actions_usage"
+    CI_USAGE = "ci_usage"
+    FAILED_JOBS = "failed_jobs"
+
+
+class StaleReason(StrEnum):
+    """Why an older, complete Overview is being served instead of a fresh one."""
+
+    GITHUB_UNAVAILABLE = "github_unavailable"
+    RATE_LIMITED = "rate_limited"
+
+
 class ReviewDecision(StrEnum):
     """GitHub's aggregated review verdict for a pull request."""
 
@@ -438,6 +466,16 @@ class Overview:
     # the `ci_seconds_month*`/`ci_runs_month` totals were summed over. `None` when `CI_USAGE`
     # is disabled, in which case every repository's `usage` is zero.
     usage_since: datetime | None
+    # Sections a still-running progressive refresh has not delivered yet. Their data in this
+    # overview is the empty default (a repository's CI is `pending_ci()` while `Section.CI`
+    # is here). Empty for a complete overview.
+    pending: tuple[Section, ...] = ()
+    # Sections GitHub could not deliver (fully) in the refresh that produced this overview;
+    # their data is the empty default, not zero. Distinct from a feature being disabled or
+    # unavailable for the account, which is not a degradation.
+    degraded: tuple[Section, ...] = ()
+    # Set when this is an older complete overview served because a fresh refresh failed.
+    stale_reason: StaleReason | None = None
 
 
 @dataclass(frozen=True, slots=True)

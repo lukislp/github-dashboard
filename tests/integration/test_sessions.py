@@ -10,7 +10,13 @@ from app.application.ports import SessionRecord
 from app.domain.codec import user_to_dict
 from app.domain.models import RunStatus
 from app.domain.overview import build_overview, classify_ci
+from app.infrastructure.cache_memory import (
+    STALE_RETENTION_SECONDS as MEMORY_STALE_RETENTION_SECONDS,
+)
 from app.infrastructure.cache_memory import MemoryOverviewCache
+from app.infrastructure.session_redis import (
+    STALE_RETENTION_SECONDS as REDIS_STALE_RETENTION_SECONDS,
+)
 from app.infrastructure.session_redis import RedisOverviewCache, RedisSessionRepository
 from app.infrastructure.session_sqlite import SqliteSessionRepository
 from app.infrastructure.token_fernet import FernetTokenCipher
@@ -215,12 +221,76 @@ async def test_memory_cache_expires():
     assert await cache.get(1) is None
 
 
+async def test_memory_cache_serves_stale_entry_after_ttl_until_retention_ends():
+    clock = {"t": 100.0}
+    cache = MemoryOverviewCache(monotonic=lambda: clock["t"])
+    await cache.set(1, sample_overview(), ttl_seconds=10)
+    assert await cache.get_stale(1) == sample_overview()
+
+    clock["t"] = 111.0
+    assert await cache.get(1) is None
+    assert await cache.get_stale(1) == sample_overview()
+
+    clock["t"] = 100.0 + MEMORY_STALE_RETENTION_SECONDS
+    assert await cache.get_stale(1) is None
+    assert await cache.get(1) is None
+
+
+async def test_memory_cache_invalidate_drops_fresh_and_stale_entry():
+    clock = {"t": 100.0}
+    cache = MemoryOverviewCache(monotonic=lambda: clock["t"])
+    await cache.set(1, sample_overview(), ttl_seconds=10)
+    clock["t"] = 111.0
+    assert await cache.get_stale(1) is not None
+
+    await cache.invalidate(1)
+
+    assert await cache.get(1) is None
+    assert await cache.get_stale(1) is None
+
+
 async def test_redis_cache_roundtrip():
     cache = RedisOverviewCache(fakeredis.aioredis.FakeRedis(decode_responses=True))
     await cache.set(1, sample_overview(), ttl_seconds=30)
     assert await cache.get(1) == sample_overview()
     await cache.invalidate(1)
     assert await cache.get(1) is None
+
+
+async def test_redis_cache_fresh_entry_is_served_by_get_and_get_stale():
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    cache = RedisOverviewCache(redis)
+    await cache.set(1, sample_overview(), ttl_seconds=30)
+
+    assert await cache.get(1) == sample_overview()
+    assert await cache.get_stale(1) == sample_overview()
+    # The freshness marker carries the TTL; the overview itself outlives it.
+    assert 0 < await redis.ttl("ghd:overview:fresh:1") <= 30
+    assert 30 < await redis.ttl("ghd:overview:1") <= REDIS_STALE_RETENTION_SECONDS
+
+
+async def test_redis_cache_serves_stale_entry_once_freshness_has_run_out():
+    cache = RedisOverviewCache(fakeredis.aioredis.FakeRedis(decode_responses=True))
+    await cache.set(1, sample_overview(), ttl_seconds=0)
+
+    assert await cache.get(1) is None
+    assert await cache.get_stale(1) == sample_overview()
+
+
+async def test_redis_cache_invalidate_drops_fresh_and_stale_entry():
+    cache = RedisOverviewCache(fakeredis.aioredis.FakeRedis(decode_responses=True))
+    await cache.set(1, sample_overview(), ttl_seconds=0)
+    assert await cache.get_stale(1) is not None
+
+    await cache.invalidate(1)
+
+    assert await cache.get(1) is None
+    assert await cache.get_stale(1) is None
+
+
+async def test_redis_cache_get_stale_is_none_for_unknown_user():
+    cache = RedisOverviewCache(fakeredis.aioredis.FakeRedis(decode_responses=True))
+    assert await cache.get_stale(99) is None
 
 
 def test_fernet_cipher_roundtrip_and_key_rotation():
