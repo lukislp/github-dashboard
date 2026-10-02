@@ -398,7 +398,7 @@ jobs:
           fi
           git diff --stat
       - name: Sign and push the image tag bump
-        uses: lukislp/ci-workflows/.github/actions/signed-bot-commit@0d352a3fab2ba9099b957c4164be2411f13786e8 # v1.7.12
+        uses: lukislp/ci-workflows/.github/actions/signed-bot-commit@7a0ba9fb414f1f87d1efc30cf512ba8feba8cf72 # v1.7.14
         with:
           signing-key: ${{ secrets.DEPLOY_SIGNING_KEY }}
           committer-name: "github-dashboard-deploy"
