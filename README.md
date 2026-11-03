@@ -7,11 +7,16 @@
 [![License: MIT](https://img.shields.io/github/license/lukislp/github-dashboard)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue)](pyproject.toml)
 [![Docker image](https://img.shields.io/badge/ghcr.io-lukislp%2Fgithub--dashboard-blue)](https://github.com/lukislp/github-dashboard/pkgs/container/github-dashboard)
+[![Built on the GitHub REST API](https://img.shields.io/badge/built%20on-GitHub%20REST%20API-181717?logo=github)](https://docs.github.com/en/rest)
 
 Every repository you can reach on GitHub on one screen: open pull requests, open issues, the last
 five workflow runs of each repository, and the totals across all of them. Multi-user: each person
 signs in with their own GitHub account and sees exactly what that account sees. Nothing is loaded
 without a login.
+
+It is built on the [GitHub REST API](https://docs.github.com/en/rest) (plus one GraphQL query
+for the hygiene checks) and works with any GitHub account; it is an independent project and is
+not affiliated with or endorsed by GitHub.
 
 ![Screenshot of the github-dashboard overview page](docs/screenshot.png)
 
@@ -382,6 +387,13 @@ cosign verify \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/lukislp/github-dashboard:<tag>
 ```
+
+## Support
+
+- **Questions and bugs:** open a [GitHub issue](https://github.com/lukislp/github-dashboard/issues).
+- **Private contact:** [koerber.lukas@t-online.de](mailto:koerber.lukas@t-online.de) for anything
+  that should not be public.
+- **Security problems:** do not open an issue; follow [SECURITY.md](SECURITY.md).
 
 ## Security
 
