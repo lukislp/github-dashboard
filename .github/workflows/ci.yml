@@ -286,56 +286,21 @@ jobs:
       app-id: ${{ secrets.LKTEC_BOT_APP_ID }}
       private-key: ${{ secrets.LKTEC_BOT_PRIVATE_KEY }}
 
-  # Writes the released image tag into the Flux-managed manifests under k8s/ (nothing in the
-  # cluster pushes to this repo, so this is the only way a release reaches the Deployment),
-  # pushing over the SEMANTIC_RELEASE_DEPLOY_KEY deploy key.
-  # The bump waits for the release job, so the tag lands first and the release is never
-  # skipped because the bump's own commit moved the default branch.
+  # The image tag bump of the deploy manifests, committed onto the default branch by the lktec-bot App
+  # (module sync: docs/modules/sync.md in lukislp/lktec-bot; the App is a bypass actor of the branch ruleset
+  # for this one commit, which GitHub signs itself). Flux picks the new tag up from the branch.
   deploy-bump:
-    needs: [get-version, docker-manifest-merge, trivy]
+    needs: [get-version, release, docker-manifest-merge, trivy]
     if: github.event_name == 'push' && needs.get-version.outputs.released == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
     concurrency:
       group: github-dashboard-release-chain
       cancel-in-progress: false
-    permissions:
-      contents: read
-    env:
-      NEXT_VERSION: ${{ needs.get-version.outputs.version }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          fetch-depth: 0
-      # Deploy-key push - the default branch only takes direct pushes
-      # from that key, so this job cannot fall back to GITHUB_TOKEN.
-      - name: Push as the deploy key
-        uses: lukislp/ci-workflows/.github/actions/deploy-key-push@ea532e9b173cf0e512c9d54c18886eebd0b0d1ab # v1.8.24
-        with:
-          deploy-key: ${{ secrets.SEMANTIC_RELEASE_DEPLOY_KEY }}
-          required: "true"
-      - name: Point the manifests at the released image and push
-        run: |
-          set -eu
-          for f in $(grep -rlE 'ghcr\.io/lukislp/github-dashboard:' k8s --include='*.yaml' | grep -v '/flux/'); do
-            sed -i -E "s#(ghcr\.io/lukislp/github-dashboard):[0-9A-Za-z._-]+#\1:${NEXT_VERSION}#g" "$f"
-          done
-          if git diff --quiet; then
-            echo "manifests already reference ${NEXT_VERSION}"
-            exit 0
-          fi
-          git diff --stat
-      - name: Sign and push the image tag bump
-        uses: lukislp/ci-workflows/.github/actions/signed-bot-commit@ea532e9b173cf0e512c9d54c18886eebd0b0d1ab # v1.8.24
-        with:
-          signing-key: ${{ secrets.DEPLOY_SIGNING_KEY }}
-          committer-name: "github-dashboard-deploy"
-          committer-email: "155678024+lukislp@users.noreply.github.com"
-          commit-message: "chore(deploy): image ${{ env.NEXT_VERSION }} [skip ci]"
-          branch: main
-
-# secrets: LKTEC_BOT_APP_ID and LKTEC_BOT_PRIVATE_KEY (the lktec-bot App) cut the release through
-# the API. SEMANTIC_RELEASE_DEPLOY_KEY (repository secret, a write-enabled SSH deploy key) is
-# still required for deploy-bump to push to the protected main branch; without it that job fails
-# on the read-only GITHUB_TOKEN, which cannot push past the branch ruleset.
+    uses: lukislp/lktec-bot/.github/workflows/deploy-bump.yml@38079b17498fcfda986f427fd6258bd32185e7c3 # v0.2.0
+    with:
+      version: ${{ needs.release.outputs.version }}
+      images: 'ghcr\.io/lukislp/github-dashboard'
+      paths: k8s
+      branch: main
+    secrets:
+      app-id: ${{ secrets.LKTEC_BOT_APP_ID }}
+      private-key: ${{ secrets.LKTEC_BOT_PRIVATE_KEY }}
