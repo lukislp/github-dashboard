@@ -1,7 +1,7 @@
 # The dashboard itself: one replica with a Longhorn volume for the SQLite session/preference
 # store, plain HTTP on 8000 behind the shared NGINX Gateway (k8s/05-httproute.yaml).
-# The image tag is rewritten by the CI pipeline's deploy-bump job on every release (over the
-# semantic-release deploy key); Flux only reads this repo.
+# The image tag is rewritten by the CI pipeline's deploy-bump job on every release (over a
+# deploy key); Flux only reads this repo.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

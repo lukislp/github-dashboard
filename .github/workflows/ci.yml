@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 # One queue entry per ref (or per PR number, so successive pushes to the same PR don't queue
-# behind each other) - the whole run (lint/test/get-version/docker/trivy/semantic-release) is a
+# behind each other) - the whole run (lint/test/get-version/docker/trivy/release) is a
 # single atomic unit instead of several jobs independently competing for the same job-level
 # lock. Only PR runs get cancelled by a newer push to the same PR (fast feedback); a
 # push-to-main run is never cancelled mid-flight, so a release can't be interrupted partway
@@ -32,6 +32,7 @@ env:
 # Least-privilege default for GITHUB_TOKEN (CodeQL actions/missing-workflow-permissions):
 # jobs that need more declare it themselves.
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -96,58 +97,22 @@ jobs:
   get-version:
     needs: [lint, test]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # @semantic-release/github's verifyConditions step checks the token has repo push access
-    # (contents: write) even during a dry run - a read-only token fails that check outright.
-    # issues:write/pull-requests:write are NOT needed here: those only get exercised by the
-    # publish/success/fail lifecycle steps, which dry_run: true skips entirely.
-    permissions:
-      contents: write
-    outputs:
-      next_version: ${{ steps.semrel.outputs.new_release_version }}
-      published: ${{ steps.semrel.outputs.new_release_published }}
-    steps:
-      # ref: main (branch tip), NOT the push-event SHA: a "[skip ci]" bump or another merge
-      # can land between the triggering push and this job actually running. semantic-release's
-      # "local branch is behind the remote" guard then analyzes a stale SHA and releases
-      # nothing - the entire release chain skips even though a releasable fix was just merged.
-      # Analyzing the branch tip makes the verdict immune to that race. This also covers the
-      # workflow_dispatch re-run case above: ref: main always resolves to the CURRENT tip
-      # regardless of which run triggered this job.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          ref: main
-      # Ruleset bypass for the release commit: main is protected by a ruleset (pull request +
-      # green test stage) that the GitHub Actions app cannot be a bypass actor for on a
-      # personal repository, so semantic-release pushes over SSH as a write-enabled DEPLOY KEY
-      # instead, which can. No-op while the secret is unset - the push then goes through the
-      # GITHUB_TOKEN https remote exactly as before. Needed in get-version too:
-      # @semantic-release/git's verifyConditions runs `git push --dry-run` even in dry-run mode.
-      - name: Push as the semantic-release deploy key (if configured)
-        uses: lukislp/ci-workflows/.github/actions/deploy-key-push@ea532e9b173cf0e512c9d54c18886eebd0b0d1ab # v1.8.24
-        with:
-          deploy-key: ${{ secrets.SEMANTIC_RELEASE_DEPLOY_KEY }}
-      - id: semrel
-        uses: lukislp/ci-workflows/.github/actions/semantic-release@ea532e9b173cf0e512c9d54c18886eebd0b0d1ab # v1.8.24
-        with:
-          dry-run: true
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: No release needed for this push
-        if: steps.semrel.outputs.new_release_published != 'true'
-        run: |
-          echo "No releasable commits since the last tag (e.g. docs/ci/chore-only) - this is the expected, common case with Conventional Commits, not a failure. docker/trivy/semantic-release below skip themselves via needs.get-version.outputs.published." | tee -a "$GITHUB_STEP_SUMMARY"
+    uses: lukislp/lktec-bot/.github/workflows/release.yml@0c0eccf67f1f06f21fd110626322a92c92e4cb82 # v0.1.1
+    with:
+      dry-run: true
+    secrets:
+      app-id: ${{ secrets.LKTEC_BOT_APP_ID }}
+      private-key: ${{ secrets.LKTEC_BOT_PRIVATE_KEY }}
 
   docker:
     # One native runner per platform instead of a single QEMU-emulated multi-platform build -
     # ubuntu-24.04-arm is a real arm64 GitHub-hosted runner (free for public repos), so that leg
     # runs at native speed. Each leg pushes by digest only; docker-manifest-merge below writes
-    # the actual :latest/:$NEXT_VERSION tags. Runs after semantic-release (not before, see that
+    # the actual :latest/:$NEXT_VERSION tags. Runs after release (not before, see that
     # job) - a build/push failure here never leaves an orphaned, un-tagged GHCR image blocking
     # every future release via the duplicate-tag guard below.
-    needs: [get-version, semantic-release]
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.get-version.outputs.published == 'true'
+    needs: [get-version, release]
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.get-version.outputs.released == 'true'
     strategy:
       fail-fast: true
       matrix:
@@ -164,7 +129,7 @@ jobs:
       contents: read
       packages: write
     env:
-      NEXT_VERSION: ${{ needs.get-version.outputs.next_version }}
+      NEXT_VERSION: ${{ needs.get-version.outputs.version }}
     steps:
       # ref: main to match get-version's analysis target - the artifact stamped with the next
       # version must be built from the same tree that version was computed for, not from an
@@ -215,7 +180,7 @@ jobs:
 
   docker-manifest-merge:
     needs: [get-version, docker]
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.get-version.outputs.published == 'true'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.get-version.outputs.released == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -224,7 +189,7 @@ jobs:
       # OIDC token for Sigstore keyless signing (cosign sign below) - no key material anywhere.
       id-token: write
     env:
-      NEXT_VERSION: ${{ needs.get-version.outputs.next_version }}
+      NEXT_VERSION: ${{ needs.get-version.outputs.version }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -266,7 +231,7 @@ jobs:
 
   trivy:
     needs: [get-version, docker-manifest-merge]
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.get-version.outputs.published == 'true'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.get-version.outputs.released == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -274,7 +239,7 @@ jobs:
       packages: read
       security-events: write
     env:
-      NEXT_VERSION: ${{ needs.get-version.outputs.next_version }}
+      NEXT_VERSION: ${{ needs.get-version.outputs.version }}
     steps:
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -311,60 +276,22 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
-  semantic-release:
+  release:
     # Runs before docker (see that job's comment) - the real tag/release must exist before
     # anything is published under that version.
     needs: [get-version]
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.get-version.outputs.published == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: write
-      issues: write
-      pull-requests: write
-    steps:
-      # ref: main for the same reason as get-version's checkout: the real release must be cut
-      # from the branch tip get-version analyzed, or the "behind the remote" guard trips on the
-      # event SHA whenever another push raced in. The retry below still covers a push landing
-      # DURING this job (i.e. after this checkout, before this job's own push).
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          ref: main
-      - name: Push as the semantic-release deploy key (if configured)
-        uses: lukislp/ci-workflows/.github/actions/deploy-key-push@ea532e9b173cf0e512c9d54c18886eebd0b0d1ab # v1.8.24
-        with:
-          deploy-key: ${{ secrets.SEMANTIC_RELEASE_DEPLOY_KEY }}
-      - id: semrel
-        uses: lukislp/ci-workflows/.github/actions/semantic-release@ea532e9b173cf0e512c9d54c18886eebd0b0d1ab # v1.8.24
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
-      # Retry once for the narrow window where an out-of-band push to main landed between this
-      # job's checkout and its own push.
-      - if: steps.semrel.outcome == 'failure'
-        name: "Diagnose before retrying (expected: an out-of-band push landed since checkout)"
-        run: |
-          git fetch origin main
-          BEFORE_SHA="$(git rev-parse HEAD)"
-          AFTER_SHA="$(git rev-parse origin/main)"
-          if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
-            echo "origin/main moved since checkout ($BEFORE_SHA -> $AFTER_SHA) - this matches the out-of-band-push race this retry is designed for."
-          else
-            echo "::warning::origin/main did NOT move since checkout - this failure is likely NOT the expected out-of-band-push race. Retrying anyway, but check the semantic-release log above for the real cause before assuming this is just a race."
-          fi
-          git checkout -B main origin/main
-      - if: steps.semrel.outcome == 'failure'
-        uses: lukislp/ci-workflows/.github/actions/semantic-release@ea532e9b173cf0e512c9d54c18886eebd0b0d1ab # v1.8.24
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.get-version.outputs.released == 'true'
+    uses: lukislp/lktec-bot/.github/workflows/release.yml@0c0eccf67f1f06f21fd110626322a92c92e4cb82 # v0.1.1
+    secrets:
+      app-id: ${{ secrets.LKTEC_BOT_APP_ID }}
+      private-key: ${{ secrets.LKTEC_BOT_PRIVATE_KEY }}
 
   # Writes the released image tag into the Flux-managed manifests under k8s/ (nothing in the
   # cluster pushes to this repo, so this is the only way a release reaches the Deployment),
-  # pushing over the same deploy key semantic-release uses.
+  # pushing over the SEMANTIC_RELEASE_DEPLOY_KEY deploy key.
   deploy-bump:
     needs: [get-version, docker-manifest-merge, trivy]
-    if: github.event_name == 'push' && needs.get-version.outputs.published == 'true'
+    if: github.event_name == 'push' && needs.get-version.outputs.released == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
@@ -373,15 +300,15 @@ jobs:
     permissions:
       contents: read
     env:
-      NEXT_VERSION: ${{ needs.get-version.outputs.next_version }}
+      NEXT_VERSION: ${{ needs.get-version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
-      # Same deploy-key push as the release jobs - the default branch only takes direct pushes
+      # Deploy-key push - the default branch only takes direct pushes
       # from that key, so this job cannot fall back to GITHUB_TOKEN.
-      - name: Push as the semantic-release deploy key
+      - name: Push as the deploy key
         uses: lukislp/ci-workflows/.github/actions/deploy-key-push@ea532e9b173cf0e512c9d54c18886eebd0b0d1ab # v1.8.24
         with:
           deploy-key: ${{ secrets.SEMANTIC_RELEASE_DEPLOY_KEY }}
@@ -406,7 +333,7 @@ jobs:
           commit-message: "chore(deploy): image ${{ env.NEXT_VERSION }} [skip ci]"
           branch: main
 
-# secrets: SEMANTIC_RELEASE_DEPLOY_KEY (repository secret, a write-enabled SSH deploy key) is
-# required for get-version/semantic-release/deploy-bump to push to the protected main branch.
-# Without it those steps no-op and fall back to the read-only GITHUB_TOKEN, which cannot push
-# past the branch ruleset.
+# secrets: LKTEC_BOT_APP_ID and LKTEC_BOT_PRIVATE_KEY (the lktec-bot App) cut the release through
+# the API. SEMANTIC_RELEASE_DEPLOY_KEY (repository secret, a write-enabled SSH deploy key) is
+# still required for deploy-bump to push to the protected main branch; without it that job fails
+# on the read-only GITHUB_TOKEN, which cannot push past the branch ruleset.
