@@ -373,8 +373,9 @@ PYTHONPATH=. python fuzz/fuzz_parsers.py -max_total_time=60
 
 ## Releases and images
 
-Versions are cut by [semantic-release](https://semantic-release.gitbook.io/) from
-[Conventional Commit](https://www.conventionalcommits.org/) messages on `main` - see
+Versions are cut by the [lktec-bot](https://github.com/lukislp/lktec-bot) App's release module from
+[Conventional Commit](https://www.conventionalcommits.org/) messages on `main` (rules in
+`.github/lktec-bot.yml`) - see
 [the Releases page](https://github.com/lukislp/github-dashboard/releases) for the generated
 history. Each release publishes a multi-arch
 (`linux/amd64` + `linux/arm64`) image to `ghcr.io/lukislp/github-dashboard`, tagged `latest` and
