@@ -289,6 +289,8 @@ jobs:
   # Writes the released image tag into the Flux-managed manifests under k8s/ (nothing in the
   # cluster pushes to this repo, so this is the only way a release reaches the Deployment),
   # pushing over the SEMANTIC_RELEASE_DEPLOY_KEY deploy key.
+  # The bump waits for the release job, so the tag lands first and the release is never
+  # skipped because the bump's own commit moved the default branch.
   deploy-bump:
     needs: [get-version, docker-manifest-merge, trivy]
     if: github.event_name == 'push' && needs.get-version.outputs.released == 'true'
