@@ -33,6 +33,7 @@ from app.domain.codec import (
     user_to_dict,
 )
 from app.domain.models import Preferences
+from app.domain.scorecard import detail_to_dict, summary_to_dict
 from app.web.container import Container
 from app.web.deps import ContainerDep, SameOriginDep, SessionDep
 from app.web.routes_auth import clear_session_cookie
@@ -303,3 +304,41 @@ async def list_items(
             "next_cursor": page.next_cursor,
         }
     )
+
+
+@router.get("/scorecards")
+async def scorecards(container: ContainerDep, session: SessionDep) -> JSONResponse:
+    """OpenSSF Scorecard summary of every public repository in the viewer's last complete
+    overview, keyed by `owner/name`. Private repositories are never looked up. Empty while
+    no complete overview exists yet, or when the feature is off."""
+    if session is None:
+        return _unauthorized()
+    scores = container.get_scorecards
+    if not scores.active:
+        return JSONResponse({"enabled": False, "scorecards": {}})
+    overview = await container.cache.get_stale(session.user.id)
+    names = (
+        sorted(r.repository.full_name for r in overview.repos if not r.repository.is_private)
+        if overview is not None
+        else []
+    )
+    lookups = await scores.lookup_many(names)
+    return JSONResponse(
+        {"enabled": True, "scorecards": {n: summary_to_dict(lookups[n]) for n in names}},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/repos/{owner}/{name}/scorecard")
+async def repo_scorecard(
+    owner: str, name: str, container: ContainerDep, session: SessionDep
+) -> JSONResponse:
+    """The full Scorecard breakdown of one repository, checks ordered weakest first."""
+    if session is None:
+        return _unauthorized()
+    if not _OWNER_OR_NAME_RE.match(owner) or not _OWNER_OR_NAME_RE.match(name):
+        return _invalid_repository()
+    if not container.get_scorecards.active:
+        return JSONResponse({"error": "scorecards_disabled"}, status_code=404)
+    lookup = await container.get_scorecards.lookup(owner, name)
+    return JSONResponse(detail_to_dict(owner, name, lookup), headers={"Cache-Control": "no-store"})

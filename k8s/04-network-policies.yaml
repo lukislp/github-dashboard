@@ -57,11 +57,14 @@ spec:
   podSelector: {}
   policyTypes: ["Egress"]
 ---
-# The dashboard's only outbound traffic is GitHub over HTTPS: the OAuth dance against
-# github.com/login/oauth/*, the REST/GraphQL calls against api.github.com, and the avatar CDN
-# (avatars.githubusercontent.com). All of those are Cloudflare-fronted anycast addresses that
-# change without notice, so the destination stays 0.0.0.0/0 and the port is the restriction -
-# same trade-off claude-queue's api-egress makes for the Anthropic API.
+# The dashboard's only outbound traffic is HTTPS: the OAuth dance against
+# github.com/login/oauth/*, the REST/GraphQL calls against api.github.com, the avatar CDN
+# (avatars.githubusercontent.com), and the OpenSSF Scorecard API (api.securityscorecards.dev,
+# public scores of public repositories, fetched server side - the browser only talks to this app).
+# The GitHub hosts are Cloudflare-fronted anycast addresses that change without notice, and
+# NetworkPolicy has no FQDN rule, so the destination stays 0.0.0.0/0 and the port is the
+# restriction - same trade-off claude-queue's api-egress makes for the Anthropic API. The
+# Scorecard host is covered by this same TCP/443 rule, so no policy change is needed for it.
 # Everything else the app needs is local: the session/preference store is SQLite on the PVC
 # (DB_PATH=/data/sessions.db), and automountServiceAccountToken is false, so it never talks to
 # the Kubernetes API server either.

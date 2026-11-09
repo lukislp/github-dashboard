@@ -41,3 +41,8 @@ class PreferencesInvalid(ValueError):
     def __init__(self, detail: str) -> None:
         super().__init__(detail)
         self.detail = detail
+
+
+class ScorecardUnavailable(ApplicationError):
+    """The OpenSSF Scorecard API was unreachable, answered with an error, or sent something
+    that is not a Scorecard result. Never shown as an error: the score is just "unknown"."""

@@ -37,6 +37,8 @@ class Settings:
     max_job_lookups: int
     actions_usage: bool
     ci_usage: bool
+    scorecards: bool
+    scorecard_api_url: str
 
     @property
     def callback_url(self) -> str:
@@ -126,4 +128,8 @@ class Settings:
             max_job_lookups=integer("MAX_JOB_LOOKUPS", 20, minimum=0),
             actions_usage=boolean("ACTIONS_USAGE", True),
             ci_usage=boolean("CI_USAGE", True),
+            scorecards=boolean("SCORECARDS", True),
+            scorecard_api_url=(
+                env.get("SCORECARD_API_URL", "").strip() or "https://api.securityscorecards.dev"
+            ).rstrip("/"),
         )

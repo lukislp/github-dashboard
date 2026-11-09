@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 
 from app.domain.models import Overview
+from app.domain.scorecard import ScorecardLookup
 
 # How long a no-longer-fresh entry stays available to `get_stale` before it is dropped.
 STALE_RETENTION_SECONDS = 7 * 24 * 3600
@@ -46,3 +47,30 @@ class MemoryOverviewCache:
 
     async def invalidate(self, user_id: int) -> None:
         self._entries.pop(user_id, None)
+
+
+class MemoryScorecardCache:
+    """In-process ScorecardCache with TTL and a size bound (oldest entry out first)."""
+
+    def __init__(
+        self, max_entries: int = 5000, monotonic: Callable[[], float] = time.monotonic
+    ) -> None:
+        self._entries: dict[str, tuple[float, ScorecardLookup]] = {}
+        self._max_entries = max_entries
+        self._monotonic = monotonic
+
+    async def get(self, key: str) -> ScorecardLookup | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        fresh_until, lookup = entry
+        if fresh_until <= self._monotonic():
+            self._entries.pop(key, None)
+            return None
+        return lookup
+
+    async def set(self, key: str, lookup: ScorecardLookup, ttl_seconds: int) -> None:
+        self._entries.pop(key, None)
+        self._entries[key] = (self._monotonic() + max(0, ttl_seconds), lookup)
+        while len(self._entries) > self._max_entries:
+            self._entries.pop(next(iter(self._entries)))

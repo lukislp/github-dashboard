@@ -40,6 +40,7 @@ from app.domain.models import (
     User,
     WorkflowRun,
 )
+from app.domain.scorecard import Scorecard, ScorecardCheck
 
 NOW = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)
 
@@ -544,3 +545,45 @@ class FakeUserState:
 
     async def set_snapshot(self, user_id: int, snapshot: Snapshot) -> None:
         self.snapshots[user_id] = snapshot
+
+
+def make_scorecard(
+    score: float = 7.6, checks: tuple[ScorecardCheck, ...] | None = None
+) -> Scorecard:
+    return Scorecard(
+        score=score,
+        scanned_at="2026-11-08T03:00:00Z",
+        version="v5.1.0",
+        checks=checks
+        if checks is not None
+        else (
+            ScorecardCheck("Pinned-Dependencies", 10, "all pinned", (), "https://d/pin", "Pins"),
+            ScorecardCheck("Fuzzing", 0, "no fuzzer", ("Warn: none",), "https://d/fuzz", "Fuzz"),
+            ScorecardCheck("Packaging", -1, "no packaging", (), None, None),
+            ScorecardCheck("Branch-Protection", 5, "partial", (), "https://d/bp", "BP"),
+        ),
+    )
+
+
+class FakeScorecardApi:
+    """Scorecard source: `results` maps lower-case `owner/name` to a Scorecard or an exception
+    to raise. Unlisted repositories were never scored (None)."""
+
+    def __init__(self, results: dict[str, Scorecard | Exception] | None = None) -> None:
+        self.results = results or {}
+        self.calls: list[str] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    async def fetch(self, owner: str, name: str) -> Scorecard | None:
+        self.calls.append(f"{owner}/{name}")
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(0)
+            result = self.results.get(f"{owner}/{name}".lower())
+            if isinstance(result, Exception):
+                raise result
+            return result
+        finally:
+            self.in_flight -= 1

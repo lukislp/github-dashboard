@@ -20,6 +20,7 @@ from app.application.errors import (
     GitHubUnavailable,
     PreferencesInvalid,
     RateLimited,
+    ScorecardUnavailable,
 )
 from app.application.ports import (
     BranchListing,
@@ -29,6 +30,8 @@ from app.application.ports import (
     OverviewCache,
     RepoItemPage,
     RepositoryPage,
+    ScorecardApi,
+    ScorecardCache,
     SessionRecord,
     SessionRepository,
     TokenCipher,
@@ -65,6 +68,9 @@ from app.domain.overview import (
     pending_ci,
     skipped_ci,
 )
+from app.domain.scorecard import NOT_SCORED as NOT_SCORED_SCORECARD
+from app.domain.scorecard import UNKNOWN as UNKNOWN_SCORECARD
+from app.domain.scorecard import ScorecardLookup, ScorecardState
 from app.domain.snapshot import diff_since, snapshot_of
 
 _EMPTY_ACTIONS_USAGE = ActionsUsage(
@@ -991,3 +997,62 @@ class ListRepoItems:
             ),
             issues=tuple(mark_issue(i, now=now, stale_after=self.stale_after) for i in page.issues),
         )
+
+
+# Scorecard re-scans a repository at most a few times a day, so six hours loses nothing.
+SCORECARD_TTL_SECONDS = 6 * 3600
+# A failed lookup is remembered briefly so a Scorecard outage costs one request per repository
+# per interval instead of one per page load.
+SCORECARD_FAILURE_TTL_SECONDS = 300
+
+
+@dataclass(slots=True)
+class GetScorecards:
+    """OpenSSF Scorecard lookups for public repositories, cached for every viewer alike.
+
+    Never raises: anything that goes wrong becomes `ScorecardState.UNKNOWN`. With `enabled`
+    false (switched off, or no adapter) nothing is asked and everything is unknown.
+    """
+
+    api: ScorecardApi | None
+    cache: ScorecardCache
+    enabled: bool = True
+    ttl_seconds: int = SCORECARD_TTL_SECONDS
+    failure_ttl_seconds: int = SCORECARD_FAILURE_TTL_SECONDS
+    max_concurrency: int = 6
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and self.api is not None
+
+    async def lookup(self, owner: str, name: str) -> ScorecardLookup:
+        if self.api is None or not self.enabled:
+            return UNKNOWN_SCORECARD
+        key = f"{owner}/{name}".lower()
+        cached = await self.cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            card = await self.api.fetch(owner, name)
+        except ScorecardUnavailable:
+            log.warning("scorecard unavailable repo=%s/%s", owner, name)
+            await self.cache.set(key, UNKNOWN_SCORECARD, self.failure_ttl_seconds)
+            return UNKNOWN_SCORECARD
+        result = (
+            NOT_SCORED_SCORECARD
+            if card is None
+            else ScorecardLookup(ScorecardState.SCORED, scorecard=card)
+        )
+        await self.cache.set(key, result, self.ttl_seconds)
+        return result
+
+    async def lookup_many(self, full_names: list[str]) -> dict[str, ScorecardLookup]:
+        """Lookups for `owner/name` strings, a bounded number in flight at once."""
+        gate = asyncio.Semaphore(self.max_concurrency)
+
+        async def one(full_name: str) -> tuple[str, ScorecardLookup]:
+            owner, _, name = full_name.partition("/")
+            async with gate:
+                return full_name, await self.lookup(owner, name)
+
+        return dict(await asyncio.gather(*(one(n) for n in full_names)))
