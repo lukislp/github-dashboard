@@ -31,11 +31,29 @@ not affiliated with or endorsed by GitHub.
 - **CI time this month**, split into private and public, per repository and as account totals;
   measured by timing the runs ourselves, because GitHub's own Actions billing endpoints refuse
   to answer for this app (see "Actions time" below).
+- **OpenSSF Scorecard** score next to every public repository (see below).
 - UI in English and German (toggle in the header), light and dark mode follow the system.
 
 **When is a repository "failing"?** When at least one of its last `RUNS_PER_REPO` (default 5)
 workflow runs concluded with `failure`, `timed_out` or `startup_failure`, regardless of branch.
 The five runs are drawn as a small history strip in the table; hover shows workflow and result.
+
+### OpenSSF Scorecard
+
+Every public repository shows its [OpenSSF Scorecard](https://scorecard.dev) score (0-10) as a
+small chip next to the language and star count, coloured by band: 8 and above good, 6 and above
+middling, below that weak. A click opens the full breakdown: the overall score, when the
+repository was scanned, and one row per check (weakest first) with a 0-10 bar or `n/a`, the
+check's own explanation, its detail lines (collapsed) and a link to the check's documentation,
+plus a link to the same result on scorecard.dev.
+
+The data comes from the public API at `api.securityscorecards.dev` (no token). The browser never
+talks to it: the server fetches each result with a 5 second timeout and keeps it in memory for
+six hours (Scorecard re-scans a repository at most a few times a day), shared by every viewer.
+A repository Scorecard has never scored shows "no score"; if Scorecard cannot be reached the chip
+shows a dash and the rest of the page is unaffected. Private repositories are never looked up.
+The pod needs outbound HTTPS to that host (`k8s/04-network-policies.yaml` already allows port 443
+outbound). Set `SCORECARDS=false` to switch the feature off.
 
 ### Repository hygiene
 
@@ -215,6 +233,8 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> SECRET_KEY
 | `MAX_JOB_LOOKUPS` | no | `20` | Failed runs (newest first, across the whole refresh) whose failed jobs/steps are looked up per refresh (minimum `0`, `0` disables the feature) |
 | `ACTIONS_USAGE` | no | `true` | Fetch GitHub Actions billing usage for the signed-in user (`true`/`false`/`1`/`0`); skipped entirely when `false` |
 | `CI_USAGE` | no | `true` | Measure each repository's wall-clock Actions time for the current calendar month (`true`/`false`/`1`/`0`, see "Actions time"); skipped entirely when `false` |
+| `SCORECARDS` | no | `true` | Show the OpenSSF Scorecard score of public repositories (`true`/`false`/`1`/`0`, see "OpenSSF Scorecard"); when `false` nothing is requested from Scorecard |
+| `SCORECARD_API_URL` | no | `https://api.securityscorecards.dev` | Base URL of the Scorecard API |
 | `DB_PATH` | no | `./data/sessions.db` | SQLite session store (single replica) |
 | `REDIS_URL` | no | | Redis for sessions and cache (multiple replicas) |
 
@@ -307,7 +327,7 @@ app/
   application/     use cases (CompleteLogin, GetOverview, GetChanges, SavePreferences…), the
                    in-memory session-activity tracker feeding the background refresh, and ports
   infrastructure/  adapters: GitHub HTTP (GraphQL + REST, with a conditional-request ETag
-                   cache), SQLite/Redis sessions and user state, memory/Redis overview cache,
+                   cache), OpenSSF Scorecard HTTP with an in-memory TTL cache, SQLite/Redis sessions and user state, memory/Redis overview cache,
                    Fernet cipher, settings from env
   web/             FastAPI routers (incl. /api/preferences, /api/seen), composition root
                    (container.py), templates, static assets

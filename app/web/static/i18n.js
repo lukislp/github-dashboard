@@ -268,6 +268,26 @@
       expand: "Show details",
       collapse: "Hide details",
       just_now: "just now",
+      scorecard_title: "OpenSSF Scorecard",
+      scorecard_chip_prefix: "OSSF",
+      scorecard_chip_title: "OpenSSF Scorecard – show how the score is made up",
+      scorecard_chip_label: "OpenSSF Scorecard {score} out of 10, show how the score is made up",
+      scorecard_none: "no score",
+      scorecard_none_title: "OpenSSF Scorecard has not scored this repository yet.",
+      scorecard_unknown: "–",
+      scorecard_unknown_title: "The OpenSSF Scorecard is not available right now.",
+      scorecard_loading: "Loading the breakdown…",
+      scorecard_error: "The breakdown could not be loaded. Please try again later.",
+      scorecard_overall: "Overall score",
+      scorecard_scanned: "Scanned {date}",
+      scorecard_version: "Scorecard {version}",
+      scorecard_na: "n/a",
+      scorecard_check_score: "{score} / 10",
+      scorecard_details: "Details ({n})",
+      scorecard_docs: "How this check works",
+      scorecard_open_viewer: "Open on scorecard.dev",
+      scorecard_close: "Close",
+      scorecard_source: "Weakest checks first. Source: api.securityscorecards.dev",
     },
     de: {
       refresh: "Neu laden",
@@ -531,6 +551,26 @@
       run_in_progress: "in Arbeit",
       run_queued: "wartend",
       run_unknown: "unbekannt",
+      scorecard_title: "OpenSSF Scorecard",
+      scorecard_chip_prefix: "OSSF",
+      scorecard_chip_title: "OpenSSF Scorecard – zeigt, wie sich der Wert zusammensetzt",
+      scorecard_chip_label: "OpenSSF Scorecard {score} von 10, zeigt, wie sich der Wert zusammensetzt",
+      scorecard_none: "kein Wert",
+      scorecard_none_title: "OpenSSF Scorecard hat dieses Repository noch nicht bewertet.",
+      scorecard_unknown: "–",
+      scorecard_unknown_title: "Die OpenSSF Scorecard ist gerade nicht verfügbar.",
+      scorecard_loading: "Lade die Aufschlüsselung…",
+      scorecard_error: "Die Aufschlüsselung konnte nicht geladen werden. Bitte später erneut versuchen.",
+      scorecard_overall: "Gesamtwert",
+      scorecard_scanned: "Geprüft am {date}",
+      scorecard_version: "Scorecard {version}",
+      scorecard_na: "n/a",
+      scorecard_check_score: "{score} / 10",
+      scorecard_details: "Details ({n})",
+      scorecard_docs: "So funktioniert diese Prüfung",
+      scorecard_open_viewer: "Auf scorecard.dev öffnen",
+      scorecard_close: "Schließen",
+      scorecard_source: "Schwächste Prüfungen zuerst. Quelle: api.securityscorecards.dev",
       expand: "Details anzeigen",
       collapse: "Details ausblenden",
       just_now: "gerade eben",
@@ -620,8 +660,12 @@
     );
   }
 
-  function formatNumber(n) {
-    return new Intl.NumberFormat(lang).format(n);
+  function formatNumber(n, fractionDigits) {
+    const options =
+      fractionDigits === undefined
+        ? undefined
+        : { minimumFractionDigits: fractionDigits, maximumFractionDigits: fractionDigits };
+    return new Intl.NumberFormat(lang, options).format(n);
   }
 
   // Day-and-month / month-only labels for the "since 1 September" / "in September" style

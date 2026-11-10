@@ -27,6 +27,7 @@ from app.domain.models import (
     User,
     WorkflowRun,
 )
+from app.domain.scorecard import Scorecard, ScorecardLookup
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,3 +293,23 @@ class UserStateRepository(Protocol):
     async def get_snapshot(self, user_id: int) -> Snapshot | None: ...
 
     async def set_snapshot(self, user_id: int, snapshot: Snapshot) -> None: ...
+
+
+class ScorecardApi(Protocol):
+    """Source of OpenSSF Scorecard results (public data, no credentials)."""
+
+    async def fetch(self, owner: str, name: str) -> Scorecard | None:
+        """The latest Scorecard result of a public repository, or `None` when it has never
+        been scored. Raises `ScorecardUnavailable` on any transport or format problem."""
+        ...
+
+
+class ScorecardCache(Protocol):
+    """Shared (not per-user) store of Scorecard lookups, keyed by `owner/name` in lower case.
+
+    The data is public and identical for every viewer, so one entry serves everybody. Entries
+    expire after the TTL given to `set`; there is no stale fallback."""
+
+    async def get(self, key: str) -> ScorecardLookup | None: ...
+
+    async def set(self, key: str, lookup: ScorecardLookup, ttl_seconds: int) -> None: ...

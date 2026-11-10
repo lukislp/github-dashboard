@@ -30,7 +30,13 @@
     // Kept at the top level (not per-render) so collapsing and re-expanding a row, or any
     // unrelated re-render, never loses what was already paged in.
     moreItems: new Map(),
+    // OpenSSF Scorecard summaries by "owner/name" ({state, score?, band?}); filled after each
+    // complete overview by loadScorecards(). Empty when the feature is off or not loaded yet.
+    scorecards: {},
   };
+
+  // What the Scorecard dialog currently shows, kept so a language switch can repaint it.
+  let scorecardView = null;
 
   // Working copy of the groups being edited in the "Manage groups" dialog; rebuilt on open,
   // discarded on cancel/close. Kept separate from state.data.preferences so Cancel is free.
@@ -63,6 +69,7 @@
     group: $("#filter-group"),
     manageGroups: $("#manage-groups"),
     groupsDialog: $("#groups-dialog"),
+    scorecardDialog: $("#scorecard-dialog"),
     attention: $("#filter-attention"),
     favorites: $("#filter-favorites"),
     archived: $("#filter-archived"),
@@ -203,6 +210,145 @@
       <span class="meter meter--${tone}"><span class="meter__fill" data-width="${hygiene.score}"></span></span>
       <span class="mono">${esc(I18N.formatNumber(hygiene.score))}</span>
     </span>`;
+  }
+
+  // ---------- OpenSSF Scorecard ----------
+
+  function scoreText(score) {
+    return I18N.formatNumber(Math.round(score * 10) / 10, 1);
+  }
+
+  // The chip in the repository's meta line: a button that opens the breakdown for a scored
+  // repository, a quiet label for one that has no score (or none right now). Nothing before the
+  // summaries have arrived, and nothing for repositories the server did not look up.
+  function scoreChipMarkup(fullName) {
+    const entry = state.scorecards[fullName];
+    if (!entry) return "";
+    if (entry.state === "scored") {
+      const text = scoreText(entry.score);
+      return `<button type="button" class="score-chip score-chip--${esc(entry.band)}" data-score-repo="${esc(fullName)}" aria-haspopup="dialog" title="${esc(t("scorecard_chip_title"))}" aria-label="${esc(t("scorecard_chip_label", { score: text }))}"><span class="score-chip__label" aria-hidden="true">${esc(t("scorecard_chip_prefix"))}</span><span class="score-chip__value">${esc(text)}</span></button>`;
+    }
+    const none = entry.state === "none";
+    return `<span class="score-chip score-chip--idle" title="${esc(t(none ? "scorecard_none_title" : "scorecard_unknown_title"))}"><span class="score-chip__label">${esc(t("scorecard_chip_prefix"))}</span><span class="score-chip__value">${esc(t(none ? "scorecard_none" : "scorecard_unknown"))}</span></span>`;
+  }
+
+  async function loadScorecards() {
+    try {
+      const response = await fetch("/api/scorecards", {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      });
+      if (!response.ok) return;
+      const body = await response.json();
+      state.scorecards = body.scorecards || {};
+      renderTable();
+    } catch (_) {
+      // The score is optional; a failure just leaves the chips out.
+    }
+  }
+
+  // Per-check bars are sized via CSSOM, like the hygiene meters: the CSP forbids inline styles.
+  function sizeMeters(root) {
+    root.querySelectorAll(".meter__fill[data-width]").forEach((fill) => {
+      const raw = Number(fill.dataset.width);
+      fill.style.width = (Number.isFinite(raw) ? Math.max(0, Math.min(100, raw)) : 0) + "%";
+    });
+  }
+
+  function scorecardCheckMarkup(check) {
+    const applicable = check.score >= 0;
+    const score = applicable
+      ? `<span class="check__bar"><span class="meter meter--${esc(check.band)}"><span class="meter__fill" data-width="${check.score * 10}"></span></span><span class="mono check__score">${esc(t("scorecard_check_score", { score: check.score }))}</span></span>`
+      : `<span class="mono check__score check__score--na">${esc(t("scorecard_na"))}</span>`;
+    const details = check.details.length
+      ? `<details class="check__details"><summary>${esc(t("scorecard_details", { n: check.details.length }))}</summary><ul>${check.details.map((d) => `<li>${esc(d)}</li>`).join("")}</ul></details>`
+      : "";
+    const doc = check.doc_url
+      ? `<a class="more" href="${esc(check.doc_url)}" target="_blank" rel="noopener"${check.doc_short ? ` title="${esc(check.doc_short)}"` : ""}>${esc(t("scorecard_docs"))}</a>`
+      : "";
+    return `<li class="check${applicable ? "" : " check--na"}">
+      <div class="check__head"><span class="check__name">${esc(check.name)}</span>${score}</div>
+      ${check.reason ? `<p class="check__reason">${esc(check.reason)}</p>` : ""}
+      ${details}${doc}
+    </li>`;
+  }
+
+  function scorecardDialogMarkup(view) {
+    const { fullName, data, status } = view;
+    let body;
+    if (status === "loading") {
+      body = `<p class="dialog__empty">${esc(t("scorecard_loading"))}</p>`;
+    } else if (status === "error") {
+      body = `<p class="dialog__error">${esc(t("scorecard_error"))}</p>`;
+    } else if (data.state !== "scored") {
+      body = `<p class="dialog__empty">${esc(t(data.state === "none" ? "scorecard_none_title" : "scorecard_unknown_title"))}</p>`;
+    } else {
+      const meta = [
+        data.scanned_at ? t("scorecard_scanned", { date: I18N.formatDateTime(data.scanned_at) }) : "",
+        data.version ? t("scorecard_version", { version: data.version }) : "",
+      ].filter(Boolean);
+      body = `<div class="scorecard-summary">
+          <span class="score-big score-big--${esc(data.band)}">${esc(scoreText(data.score))}<span class="score-big__max">/10</span></span>
+          <div><div class="scorecard-summary__label">${esc(t("scorecard_overall"))}</div>
+          <div class="scorecard-summary__meta">${esc(meta.join(" · "))}</div></div>
+        </div>
+        <ul class="checks">${data.checks.map(scorecardCheckMarkup).join("")}</ul>`;
+    }
+    const viewer =
+      data && data.viewer_url
+        ? `<a class="btn btn--quiet" href="${esc(data.viewer_url)}" target="_blank" rel="noopener">${esc(t("scorecard_open_viewer"))}</a>`
+        : "";
+    return `<div class="dialog__form">
+      <div class="dialog__head"><h2 id="scorecard-title">${esc(t("scorecard_title"))} <span class="dialog__sub mono">${esc(fullName)}</span></h2></div>
+      <div class="dialog__body">${body}</div>
+      <div class="dialog__foot">
+        <span class="dialog__source">${esc(t("scorecard_source"))}</span>
+        ${viewer}
+        <button type="button" class="btn btn--primary" id="scorecard-close">${esc(t("scorecard_close"))}</button>
+      </div>
+    </div>`;
+  }
+
+  function paintScorecardDialog() {
+    const dlg = els.scorecardDialog;
+    if (!dlg || !scorecardView) return;
+    dlg.innerHTML = scorecardDialogMarkup(scorecardView);
+    sizeMeters(dlg);
+    const close = $("#scorecard-close");
+    if (close) close.addEventListener("click", () => dlg.close());
+  }
+
+  async function openScorecardDialog(fullName) {
+    const dlg = els.scorecardDialog;
+    if (!dlg) return;
+    const [owner, name] = fullName.split("/");
+    const view = { fullName, data: null, status: "loading" };
+    scorecardView = view;
+    paintScorecardDialog();
+    dlg.showModal();
+    try {
+      const response = await fetch(
+        `/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/scorecard`,
+        { headers: { Accept: "application/json" }, credentials: "same-origin" }
+      );
+      if (!response.ok) throw new Error(String(response.status));
+      view.data = await response.json();
+      view.status = "ok";
+    } catch (_) {
+      view.status = "error";
+    }
+    if (scorecardView === view && dlg.open) paintScorecardDialog();
+  }
+
+  // Hand focus back to the chip that opened the dialog; the table may have been re-rendered
+  // meanwhile, so look the chip up again instead of trusting the old element.
+  function onScorecardDialogClose() {
+    const repo = scorecardView && scorecardView.fullName;
+    scorecardView = null;
+    const chip = [...els.rows.querySelectorAll(".score-chip[data-score-repo]")].find(
+      (el) => el.dataset.scoreRepo === repo
+    );
+    if (chip) chip.focus();
   }
 
   function severityBreakdown(counts) {
@@ -1198,6 +1344,7 @@
       ? `<span class="lang"><span class="lang__dot" data-color="${esc(repo.language_color || "")}"></span>${esc(repo.language)}</span>`
       : "";
     const stars = repo.stars ? `<span class="mono">★ ${esc(I18N.formatNumber(repo.stars))}</span>` : "";
+    const scoreChip = repo.is_private ? "" : scoreChipMarkup(repo.full_name);
     const unreleasedCommits = item.release ? item.release.unreleased_commits : null;
     const unreleasedBadge =
       unreleasedCommits > 0
@@ -1255,7 +1402,7 @@
             ${newTag}
             ${badges.join("")}
           </div>
-          <div class="repo-meta">${favoriteStar}${lang}${stars}${unreleasedBadge}${branchesBadge}${ciUsageBadge}</div>
+          <div class="repo-meta">${favoriteStar}${lang}${stars}${scoreChip}${unreleasedBadge}${branchesBadge}${ciUsageBadge}</div>
         </td>
         <td class="col-num"><span class="num-cell"><span class="num ${prCount ? "is-hot" : "is-zero"}">${prCount}</span>${dots}</span></td>
         <td class="col-num"><span class="num ${repo.open_issue_count ? "is-hot" : "is-zero"}">${repo.open_issue_count}</span></td>
@@ -1602,6 +1749,7 @@
     }
     if (!pending.length) {
       showOutcomeBanner(data);
+      loadScorecards();
       return true;
     }
     setBanner("info", t("loading_sections", { sections: sectionNames(pending) }));
@@ -1826,6 +1974,7 @@
       renderGroupSummary();
     });
     els.manageGroups.addEventListener("click", () => openGroupsDialog());
+    if (els.scorecardDialog) els.scorecardDialog.addEventListener("close", onScorecardDialogClose);
     for (const [key, el] of [
       ["attention", els.attention],
       ["favorites", els.favorites],
@@ -1860,6 +2009,12 @@
         toggleFavorite(starButton.dataset.repo);
         return;
       }
+      const scoreButton = event.target.closest(".score-chip[data-score-repo]");
+      if (scoreButton) {
+        event.stopPropagation();
+        openScorecardDialog(scoreButton.dataset.scoreRepo);
+        return;
+      }
       const rerunButton = event.target.closest(".rerun-btn");
       if (rerunButton) {
         // Stopped so the document-level listener below does not immediately cancel the
@@ -1886,7 +2041,10 @@
     // window (the button's own handler above stops its click from reaching here).
     document.addEventListener("click", cancelActiveConfirm);
 
-    document.addEventListener("langchange", renderAll);
+    document.addEventListener("langchange", () => {
+      renderAll();
+      paintScorecardDialog();
+    });
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden && state.data) {
         const age = Date.now() - Date.parse(state.data.generated_at);

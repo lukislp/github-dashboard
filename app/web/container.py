@@ -12,6 +12,7 @@ from app.application.ports import (
     GitHubApi,
     GitHubOAuth,
     OverviewCache,
+    ScorecardApi,
     SessionRepository,
     TokenCipher,
     UserStateRepository,
@@ -23,6 +24,7 @@ from app.application.use_cases import (
     GetChanges,
     GetOverview,
     GetPreferences,
+    GetScorecards,
     ListRepoItems,
     Logout,
     MarkSeen,
@@ -30,8 +32,9 @@ from app.application.use_cases import (
     ResolveSession,
     SavePreferences,
 )
-from app.infrastructure.cache_memory import MemoryOverviewCache
+from app.infrastructure.cache_memory import MemoryOverviewCache, MemoryScorecardCache
 from app.infrastructure.github_http import GitHubHttpApi, GitHubHttpOAuth
+from app.infrastructure.scorecard_http import ScorecardHttpApi
 from app.infrastructure.session_sqlite import SqliteSessionRepository
 from app.infrastructure.settings import Settings
 from app.infrastructure.token_fernet import FernetTokenCipher
@@ -60,6 +63,7 @@ class Container:
     get_changes: GetChanges
     rerun_failed_jobs: RerunFailedJobs
     list_repo_items: ListRepoItems
+    get_scorecards: GetScorecards
     _closables: list[object]
 
     @classmethod
@@ -109,6 +113,7 @@ class Container:
             cache=cache,
             cipher=cipher,
             user_state=user_state,
+            scorecard_api=ScorecardHttpApi(http, api_url=settings.scorecard_api_url),
         )._with_closables(closables)
 
     @classmethod
@@ -122,6 +127,7 @@ class Container:
         cache: OverviewCache,
         cipher: TokenCipher,
         user_state: UserStateRepository,
+        scorecard_api: ScorecardApi | None = None,
     ) -> Container:
         """Build the use cases from explicit adapters (used by tests with fakes)."""
         activity = ActivityTracker()
@@ -173,6 +179,11 @@ class Container:
                 api=api,
                 ensure_fresh_token=EnsureFreshToken(oauth=oauth, sessions=sessions, cipher=cipher),
                 stale_after=timedelta(days=settings.stale_days),
+            ),
+            get_scorecards=GetScorecards(
+                api=scorecard_api,
+                cache=MemoryScorecardCache(),
+                enabled=settings.scorecards,
             ),
             _closables=[],
         )

@@ -671,6 +671,60 @@ svg.icon { width: 1em; height: 1em; fill: currentColor; flex: none; }
   background: var(--surface); color: var(--ink); font: inherit; font-size: 0.88rem;
 }
 
+/* ---------- OpenSSF Scorecard ---------- */
+
+.score-chip {
+  display: inline-flex; align-items: baseline; gap: 5px;
+  font-family: var(--font-mono); font-size: 0.72rem; line-height: 1.4;
+  padding: 1px 7px; border-radius: var(--radius-sm);
+  border: 1px solid var(--line-strong); background: transparent; color: var(--ink-2);
+}
+.score-chip__label { color: var(--muted); letter-spacing: 0.04em; }
+.score-chip__value { font-weight: 500; font-variant-numeric: tabular-nums; }
+button.score-chip { cursor: pointer; font-family: var(--font-mono); }
+button.score-chip:hover { border-color: currentColor; }
+button.score-chip:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 2px; }
+.score-chip--good { background: var(--good-soft); color: var(--good-ink); border-color: transparent; }
+.score-chip--warning { background: var(--warning-soft); color: var(--warning-ink); border-color: transparent; }
+.score-chip--critical { background: var(--critical-soft); color: var(--critical-ink); border-color: transparent; }
+.score-chip--idle { color: var(--muted); border-style: dashed; }
+
+.dialog--wide { max-width: 760px; }
+.dialog__sub { font-size: 0.82rem; font-weight: 400; color: var(--muted); margin-left: 6px; }
+.dialog__foot .dialog__source { margin-right: auto; align-self: center; font-size: 0.78rem; color: var(--muted); }
+
+.scorecard-summary { display: flex; align-items: center; gap: 16px; }
+.score-big { font-family: var(--font-mono); font-size: 2.4rem; font-weight: 500; line-height: 1; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.score-big__max { font-size: 0.95rem; color: var(--muted); margin-left: 2px; letter-spacing: 0; }
+.score-big--good { color: var(--good-ink); }
+.score-big--warning { color: var(--warning-ink); }
+.score-big--critical { color: var(--critical-ink); }
+.scorecard-summary__label { font-weight: 600; }
+.scorecard-summary__meta { color: var(--muted); font-size: 0.82rem; }
+
+.checks { list-style: none; margin: 0; padding: 0; display: grid; border-top: 1px solid var(--line); }
+.check { padding: 10px 0; border-bottom: 1px solid var(--line); display: grid; gap: 4px; min-width: 0; }
+.check__head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.check__name { font-family: var(--font-mono); font-size: 0.86rem; font-weight: 500; overflow-wrap: anywhere; }
+.check__bar { display: inline-flex; align-items: center; gap: 10px; }
+.check__bar .meter { width: 120px; }
+.check__score { font-size: 0.8rem; min-width: 3.6em; text-align: right; color: var(--ink-2); }
+.check__score--na { color: var(--muted); }
+.check--na .check__name { color: var(--muted); }
+.check__reason { margin: 0; font-size: 0.86rem; color: var(--ink-2); overflow-wrap: anywhere; }
+.check__details { font-size: 0.8rem; color: var(--muted); }
+.check__details summary { cursor: pointer; width: fit-content; }
+.check__details summary:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 2px; }
+.check__details ul { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 2px; font-family: var(--font-mono); font-size: 0.76rem; overflow-wrap: anywhere; }
+.check .more { color: var(--muted); font-size: 0.8rem; width: fit-content; }
+.check .more:hover { color: var(--ink); }
+
+@media (max-width: 640px) {
+  .check__bar .meter { width: 80px; }
+  .dialog__foot { flex-wrap: wrap; }
+  .dialog__foot .dialog__source { flex: 1 0 100%; }
+}
+
 /* ---------- responsive ---------- */
 
 @media (max-width: 960px) {
